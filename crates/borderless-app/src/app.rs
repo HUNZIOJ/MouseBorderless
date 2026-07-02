@@ -265,7 +265,7 @@ impl eframe::App for BorderlessApp {
                 if self.config.controller.transport_mode == TransportMode::Kcp
                     || self.config.agent.transport_mode == TransportMode::Kcp
                 {
-                    ui.label("KCP uses TCP for reliable control and UDP for pointer updates.");
+                    ui.label("KCP uses UDP for reliable control and a separate UDP port for pointer updates.");
                 }
 
                 ui.separator();
