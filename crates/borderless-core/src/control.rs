@@ -183,7 +183,10 @@ mod tests {
             panic!("expected return to local control, got {output:?}");
         };
 
-        assert_eq!(state.observe_local_pointer(return_point), ControlOutput::None);
+        assert_eq!(
+            state.observe_local_pointer(return_point),
+            ControlOutput::None
+        );
     }
 
     #[test]

@@ -95,7 +95,10 @@ mod tests {
     #[test]
     fn pressed_state_tracks_keyboard_and_mouse_buttons() {
         let mut pressed = PressedState::default();
-        pressed.apply(&InputEvent::Key(KeyEvent { vk_code: 0x41, pressed: true }));
+        pressed.apply(&InputEvent::Key(KeyEvent {
+            vk_code: 0x41,
+            pressed: true,
+        }));
         pressed.apply(&InputEvent::MouseButton(MouseButtonEvent {
             button: MouseButton::Left,
             pressed: true,
@@ -104,7 +107,10 @@ mod tests {
         assert!(pressed.keys.contains(&0x41));
         assert!(pressed.mouse_buttons.contains(&MouseButton::Left));
 
-        pressed.apply(&InputEvent::Key(KeyEvent { vk_code: 0x41, pressed: false }));
+        pressed.apply(&InputEvent::Key(KeyEvent {
+            vk_code: 0x41,
+            pressed: false,
+        }));
         pressed.apply(&InputEvent::MouseButton(MouseButtonEvent {
             button: MouseButton::Left,
             pressed: false,
