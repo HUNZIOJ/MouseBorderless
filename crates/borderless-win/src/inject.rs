@@ -9,10 +9,11 @@ use borderless_core::{
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-        MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+        VIRTUAL_KEY,
     },
     WindowsAndMessaging::{XBUTTON1, XBUTTON2},
 };
@@ -75,7 +76,7 @@ fn build_inputs(event: &InputEvent, pressed: &mut PressedState, desktop: Rect) -
                 x,
                 y,
                 0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             )]
         }
         InputEvent::MouseWheel(event) => vec![mouse_wheel_input(event)],
@@ -109,11 +110,15 @@ fn send_inputs(inputs: &[INPUT]) -> anyhow::Result<()> {
     if sent as usize == inputs.len() {
         Ok(())
     } else {
-        Err(anyhow!(
-            "SendInput sent {sent} of {} input events",
-            inputs.len()
-        ))
+        Err(send_input_mismatch_error(sent, inputs.len()))
     }
+}
+
+fn send_input_mismatch_error(sent: u32, expected: usize) -> anyhow::Error {
+    anyhow!(
+        "SendInput sent {sent} of {expected} input events; last Windows error: {}",
+        windows::core::Error::from_win32()
+    )
 }
 
 fn normalize(point: Point, desktop: Rect) -> (i32, i32) {
@@ -134,11 +139,14 @@ fn normalize_axis(value: i32, start: i32, len: i32) -> i32 {
 }
 
 fn key_input(event: &KeyEvent) -> INPUT {
-    let flags = if event.pressed {
+    let mut flags = if event.pressed {
         KEYBD_EVENT_FLAGS(0)
     } else {
         KEYEVENTF_KEYUP
     };
+    if is_extended_vk(event.vk_code) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
 
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -152,6 +160,13 @@ fn key_input(event: &KeyEvent) -> INPUT {
             },
         },
     }
+}
+
+fn is_extended_vk(vk_code: u16) -> bool {
+    matches!(
+        vk_code,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0x6F | 0x90 | 0xA3 | 0xA5
+    )
 }
 
 fn mouse_button_input(event: &MouseButtonEvent) -> INPUT {
@@ -201,7 +216,10 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: MOUSE_EVENT_FLAGS) -> I
 mod tests {
     use super::*;
     use borderless_core::input_event::{
-        InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveDeltaEvent,
+        InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseMoveDeltaEvent,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_VIRTUALDESK,
     };
 
     #[test]
@@ -251,6 +269,102 @@ mod tests {
         assert!(delta.is_empty());
         assert!(pressed.keys.contains(&0x41));
         assert!(pressed.mouse_buttons.contains(&MouseButton::Left));
+    }
+
+    #[test]
+    fn absolute_mouse_move_targets_virtual_desktop() {
+        let desktop = Rect::new(-1920, 0, 3840, 1080);
+        let mut pressed = PressedState::default();
+
+        let inputs = build_inputs(
+            &InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: -10, y: 10 }),
+            &mut pressed,
+            desktop,
+        );
+
+        assert_eq!(inputs.len(), 1);
+        let flags = unsafe { inputs[0].Anonymous.mi.dwFlags };
+        assert_ne!(flags.0 & MOUSEEVENTF_VIRTUALDESK.0, 0);
+    }
+
+    #[test]
+    fn keyboard_input_marks_extended_keys() {
+        let arrow_down = key_input(&KeyEvent {
+            vk_code: 0x25,
+            pressed: true,
+        });
+        let arrow_up = key_input(&KeyEvent {
+            vk_code: 0x25,
+            pressed: false,
+        });
+        let regular_key = key_input(&KeyEvent {
+            vk_code: 0x41,
+            pressed: true,
+        });
+
+        let arrow_down_flags = unsafe { arrow_down.Anonymous.ki.dwFlags };
+        let arrow_up_flags = unsafe { arrow_up.Anonymous.ki.dwFlags };
+        let regular_flags = unsafe { regular_key.Anonymous.ki.dwFlags };
+
+        assert_ne!(
+            arrow_down_flags.0 & KEYEVENTF_EXTENDEDKEY.0,
+            0,
+            "left arrow key-down must be marked as extended"
+        );
+        assert_ne!(
+            arrow_up_flags.0 & KEYEVENTF_EXTENDEDKEY.0,
+            0,
+            "left arrow key-up must be marked as extended"
+        );
+        assert_eq!(regular_flags.0 & KEYEVENTF_EXTENDEDKEY.0, 0);
+    }
+
+    #[test]
+    fn mouse_buttons_include_x_button_data() {
+        let x1_down = mouse_button_input(&MouseButtonEvent {
+            button: MouseButton::X1,
+            pressed: true,
+        });
+        let x2_up = mouse_button_input(&MouseButtonEvent {
+            button: MouseButton::X2,
+            pressed: false,
+        });
+
+        let x1 = unsafe { x1_down.Anonymous.mi };
+        let x2 = unsafe { x2_up.Anonymous.mi };
+
+        assert_eq!(x1.dwFlags, MOUSEEVENTF_XDOWN);
+        assert_eq!(x1.mouseData, u32::from(XBUTTON1));
+        assert_eq!(x2.dwFlags, MOUSEEVENTF_XUP);
+        assert_eq!(x2.mouseData, u32::from(XBUTTON2));
+    }
+
+    #[test]
+    fn mouse_wheel_inputs_preserve_axis_and_delta() {
+        let vertical = mouse_wheel_input(&MouseWheelEvent {
+            delta: -120,
+            horizontal: false,
+        });
+        let horizontal = mouse_wheel_input(&MouseWheelEvent {
+            delta: 240,
+            horizontal: true,
+        });
+
+        let vertical_input = unsafe { vertical.Anonymous.mi };
+        let horizontal_input = unsafe { horizontal.Anonymous.mi };
+
+        assert_eq!(vertical_input.dwFlags, MOUSEEVENTF_WHEEL);
+        assert_eq!(vertical_input.mouseData, (-120i32) as u32);
+        assert_eq!(horizontal_input.dwFlags, MOUSEEVENTF_HWHEEL);
+        assert_eq!(horizontal_input.mouseData, 240);
+    }
+
+    #[test]
+    fn send_input_mismatch_error_includes_win32_context() {
+        let message = send_input_mismatch_error(0, 1).to_string();
+
+        assert!(message.contains("SendInput sent 0 of 1 input events"));
+        assert!(message.contains("last Windows error"));
     }
 
     #[test]
