@@ -1,6 +1,6 @@
 use crate::{
     kcp_transport::{KcpFramedReader, KcpFramedTransport, KcpFramedWriter},
-    latest_pointer::{send_pointer, source_matches_peer, LatestPointerState, PointerPacket},
+    latest_pointer::{send_pointer, source_matches_peer, LatestPointerSession, PointerPacket},
     tcp_transport::{TcpFramedReader, TcpFramedTransport, TcpFramedWriter},
     transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
 };
@@ -86,6 +86,7 @@ async fn run_kcp_server(
 ) -> anyhow::Result<()> {
     emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
     let listener = KcpFramedTransport::bind(&settings.peer_addr()).await?;
+    let mut pointer_session = LatestPointerSession::default();
 
     loop {
         tokio::select! {
@@ -100,7 +101,16 @@ async fn run_kcp_server(
                         mode: settings.mode,
                     },
                 );
-                if run_kcp_connection(accepted.transport, peer, &settings, &events, commands).await? {
+                if run_kcp_connection(
+                    accepted.transport,
+                    peer,
+                    &settings,
+                    &events,
+                    commands,
+                    &mut pointer_session,
+                )
+                .await?
+                {
                     return Ok(());
                 }
                 emit(&events, ConnectionEvent::Disconnected(peer_display));
@@ -172,13 +182,13 @@ async fn run_kcp_connection(
     settings: &TransportSettings,
     events: &UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
+    pointer_session: &mut LatestPointerSession,
 ) -> anyhow::Result<bool> {
-    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
     let pointer_socket = UdpSocket::bind(settings.pointer_addr()?).await?;
-    let pointer_target = SocketAddr::new(peer.ip(), settings.pointer_port).to_string();
-    let mut pointer_state = LatestPointerState::default();
-    let mut pointer_sequence = 1;
+    let pointer_peer = kcp_pointer_peer(peer, settings);
+    let pointer_target = pointer_peer.to_string();
     let mut pointer_buf = [0u8; 64];
+    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
 
     loop {
         tokio::select! {
@@ -191,12 +201,7 @@ async fn run_kcp_connection(
                         }
                     }
                     Some(ConnectionCommand::SendLatestPointer { x, y }) => {
-                        let packet = PointerPacket {
-                            sequence: pointer_sequence,
-                            x,
-                            y,
-                        };
-                        pointer_sequence += 1;
+                        let packet = pointer_session.next_packet(x, y);
                         if let Err(err) = send_pointer(&pointer_socket, &pointer_target, packet).await {
                             emit(events, ConnectionEvent::Error(err.to_string()));
                         }
@@ -210,10 +215,10 @@ async fn run_kcp_connection(
             received = pointer_socket.recv_from(&mut pointer_buf) => {
                 match received {
                     Ok((len, source)) => {
-                        if source_matches_peer(source, peer) {
+                        if source_matches_peer(source, pointer_peer) {
                             match PointerPacket::decode(&pointer_buf[..len]) {
                                 Ok(packet) => {
-                                    if let Some((x, y)) = pointer_state.accept(packet) {
+                                    if let Some((x, y)) = pointer_session.accept(packet) {
                                         emit(
                                             events,
                                             ConnectionEvent::LatestPointer {
@@ -250,6 +255,10 @@ async fn run_kcp_connection(
 
 fn latest_pointer_as_reliable(x: i32, y: i32) -> WireMessage {
     WireMessage::Input(InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x, y }))
+}
+
+fn kcp_pointer_peer(peer: SocketAddr, settings: &TransportSettings) -> SocketAddr {
+    SocketAddr::new(peer.ip(), settings.pointer_port)
 }
 
 async fn wait_after_disconnect_backoff(
@@ -412,6 +421,8 @@ fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use borderless_core::config::TransportMode;
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
@@ -435,14 +446,12 @@ mod tests {
         );
 
         command_tx.send(ConnectionCommand::Stop).unwrap();
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
-            )
-            .await
-            .unwrap()
-        );
+        assert!(timeout(
+            Duration::from_millis(100),
+            wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -451,13 +460,27 @@ mod tests {
 
         command_tx.send(ConnectionCommand::Stop).unwrap();
 
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
-            )
-            .await
-            .unwrap()
+        assert!(timeout(
+            Duration::from_millis(100),
+            wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
+        )
+        .await
+        .unwrap());
+    }
+
+    #[test]
+    fn kcp_pointer_peer_uses_reliable_peer_ip_and_configured_pointer_port() {
+        let settings = TransportSettings {
+            mode: TransportMode::Kcp,
+            host: "127.0.0.1".to_string(),
+            reliable_port: 24800,
+            pointer_port: 24801,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 49152);
+
+        assert_eq!(
+            kcp_pointer_peer(peer, &settings),
+            SocketAddr::new(peer.ip(), settings.pointer_port)
         );
     }
 }

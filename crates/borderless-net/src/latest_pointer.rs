@@ -62,6 +62,37 @@ impl LatestPointerState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LatestPointerSession {
+    inbound: LatestPointerState,
+    next_sequence: u64,
+}
+
+impl Default for LatestPointerSession {
+    fn default() -> Self {
+        Self {
+            inbound: LatestPointerState::default(),
+            next_sequence: 1,
+        }
+    }
+}
+
+impl LatestPointerSession {
+    pub(crate) fn next_packet(&mut self, x: i32, y: i32) -> PointerPacket {
+        let packet = PointerPacket {
+            sequence: self.next_sequence,
+            x,
+            y,
+        };
+        self.next_sequence += 1;
+        packet
+    }
+
+    pub(crate) fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
+        self.inbound.accept(packet)
+    }
+}
+
 pub async fn send_pointer(
     socket: &UdpSocket,
     target: &str,
@@ -81,7 +112,7 @@ pub async fn send_pointer(
 }
 
 pub(crate) fn source_matches_peer(source: SocketAddr, peer: SocketAddr) -> bool {
-    source.ip() == peer.ip()
+    source == peer
 }
 
 #[cfg(test)]
@@ -178,13 +209,37 @@ mod tests {
     }
 
     #[test]
-    fn source_filter_accepts_only_same_peer_ip() {
+    fn source_filter_accepts_only_exact_peer_socket_addr() {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 24800);
         let same_ip_different_port =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 24801);
         let different_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24801);
 
-        assert!(source_matches_peer(same_ip_different_port, peer));
+        assert!(source_matches_peer(peer, peer));
+        assert!(!source_matches_peer(same_ip_different_port, peer));
         assert!(!source_matches_peer(different_ip, peer));
+    }
+
+    #[test]
+    fn pointer_session_sequence_continues_above_persistent_receive_state_after_reconnect() {
+        let mut session = LatestPointerSession::default();
+
+        for sequence in 1..=50 {
+            let packet = session.next_packet(sequence, sequence * 10);
+            assert_eq!(packet.sequence, sequence as u64);
+        }
+
+        assert_eq!(
+            session.accept(PointerPacket {
+                sequence: 50,
+                x: 100,
+                y: 200,
+            }),
+            Some((100, 200))
+        );
+
+        let post_reconnect = session.next_packet(51, 510);
+        assert_eq!(post_reconnect.sequence, 51);
+        assert_eq!(session.accept(post_reconnect), Some((51, 510)));
     }
 }

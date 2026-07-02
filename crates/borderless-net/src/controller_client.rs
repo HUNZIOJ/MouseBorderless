@@ -1,6 +1,6 @@
 use crate::{
     kcp_transport::{KcpFramedReader, KcpFramedTransport, KcpFramedWriter},
-    latest_pointer::{send_pointer, source_matches_peer, LatestPointerState, PointerPacket},
+    latest_pointer::{send_pointer, source_matches_peer, LatestPointerSession, PointerPacket},
     tcp_transport::{TcpFramedReader, TcpFramedTransport, TcpFramedWriter},
     transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
 };
@@ -9,7 +9,10 @@ use borderless_core::{
     input_event::{InputEvent, MouseMoveAbsEvent},
     protocol::WireMessage,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -27,57 +30,117 @@ enum ReliableDriverEvent {
     Error(String),
 }
 
+enum ConnectAttempt<T> {
+    Connected(T),
+    Failed(String),
+    Stopped,
+}
+
 pub async fn run_controller_client(
     settings: TransportSettings,
     events: UnboundedSender<ConnectionEvent>,
     mut commands: UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<()> {
     emit(&events, ConnectionEvent::Waiting);
+    let mut pointer_session = LatestPointerSession::default();
 
     loop {
         let peer = settings.peer_addr();
         emit(&events, ConnectionEvent::Connecting(peer.clone()));
 
-        let stopped = match settings.mode {
-            TransportMode::Tcp => match TcpFramedTransport::connect(&peer).await {
-                Ok(transport) => {
-                    emit(
-                        &events,
-                        ConnectionEvent::Connected {
-                            peer: peer.clone(),
-                            mode: settings.mode,
-                        },
-                    );
-                    run_tcp_connection(transport, &events, &mut commands).await?
+        let wait_after_disconnect = match settings.mode {
+            TransportMode::Tcp => {
+                match connect_or_stop(TcpFramedTransport::connect(&peer), &mut commands).await {
+                    ConnectAttempt::Connected(transport) => {
+                        emit(
+                            &events,
+                            ConnectionEvent::Connected {
+                                peer: peer.clone(),
+                                mode: settings.mode,
+                            },
+                        );
+                        if run_tcp_connection(transport, &events, &mut commands).await? {
+                            return Ok(());
+                        }
+                        true
+                    }
+                    ConnectAttempt::Failed(error) => {
+                        emit(&events, ConnectionEvent::Error(error));
+                        if wait_before_reconnect(&mut commands).await {
+                            return Ok(());
+                        }
+                        false
+                    }
+                    ConnectAttempt::Stopped => return Ok(()),
                 }
-                Err(err) => {
-                    emit(&events, ConnectionEvent::Error(err.to_string()));
-                    wait_before_reconnect(&mut commands).await
+            }
+            TransportMode::Kcp => {
+                match connect_or_stop(KcpFramedTransport::connect(&peer), &mut commands).await {
+                    ConnectAttempt::Connected(transport) => {
+                        emit(
+                            &events,
+                            ConnectionEvent::Connected {
+                                peer: peer.clone(),
+                                mode: settings.mode,
+                            },
+                        );
+                        if run_kcp_connection(
+                            transport,
+                            &settings,
+                            &events,
+                            &mut commands,
+                            &mut pointer_session,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        true
+                    }
+                    ConnectAttempt::Failed(error) => {
+                        emit(&events, ConnectionEvent::Error(error));
+                        if wait_before_reconnect(&mut commands).await {
+                            return Ok(());
+                        }
+                        false
+                    }
+                    ConnectAttempt::Stopped => return Ok(()),
                 }
-            },
-            TransportMode::Kcp => match KcpFramedTransport::connect(&peer).await {
-                Ok(transport) => {
-                    emit(
-                        &events,
-                        ConnectionEvent::Connected {
-                            peer: peer.clone(),
-                            mode: settings.mode,
-                        },
-                    );
-                    run_kcp_connection(transport, &settings, &events, &mut commands).await?
-                }
-                Err(err) => {
-                    emit(&events, ConnectionEvent::Error(err.to_string()));
-                    wait_before_reconnect(&mut commands).await
-                }
-            },
+            }
         };
 
-        if stopped {
+        emit(&events, ConnectionEvent::Disconnected(peer));
+        if wait_after_disconnect && wait_before_reconnect(&mut commands).await {
             return Ok(());
         }
+    }
+}
 
-        emit(&events, ConnectionEvent::Disconnected(peer));
+async fn connect_or_stop<T, F>(
+    connect: F,
+    commands: &mut UnboundedReceiver<ConnectionCommand>,
+) -> ConnectAttempt<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(connect);
+
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                return match result {
+                    Ok(transport) => ConnectAttempt::Connected(transport),
+                    Err(err) => ConnectAttempt::Failed(err.to_string()),
+                };
+            }
+            command = commands.recv() => {
+                match command {
+                    Some(ConnectionCommand::Stop) | None => return ConnectAttempt::Stopped,
+                    Some(ConnectionCommand::SendReliable(_))
+                    | Some(ConnectionCommand::SendLatestPointer { .. }) => {}
+                }
+            }
+        }
     }
 }
 
@@ -133,14 +196,13 @@ async fn run_kcp_connection(
     settings: &TransportSettings,
     events: &UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
+    pointer_session: &mut LatestPointerSession,
 ) -> anyhow::Result<bool> {
-    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
     let pointer_socket = UdpSocket::bind(pointer_bind_addr(settings)?).await?;
     let pointer_peer = settings.pointer_addr()?;
     let pointer_target = settings.pointer_addr_string();
-    let mut pointer_state = LatestPointerState::default();
-    let mut pointer_sequence = 1;
     let mut pointer_buf = [0u8; 64];
+    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
 
     loop {
         tokio::select! {
@@ -153,12 +215,7 @@ async fn run_kcp_connection(
                         }
                     }
                     Some(ConnectionCommand::SendLatestPointer { x, y }) => {
-                        let packet = PointerPacket {
-                            sequence: pointer_sequence,
-                            x,
-                            y,
-                        };
-                        pointer_sequence += 1;
+                        let packet = pointer_session.next_packet(x, y);
                         if let Err(err) = send_pointer(&pointer_socket, &pointer_target, packet).await {
                             emit(events, ConnectionEvent::Error(err.to_string()));
                         }
@@ -188,7 +245,7 @@ async fn run_kcp_connection(
                         if source_matches_peer(source, pointer_peer) {
                             match PointerPacket::decode(&pointer_buf[..len]) {
                                 Ok(packet) => {
-                                    if let Some((x, y)) = pointer_state.accept(packet) {
+                                    if let Some((x, y)) = pointer_session.accept(packet) {
                                         emit(
                                             events,
                                             ConnectionEvent::LatestPointer {
@@ -381,8 +438,8 @@ mod tests {
     use super::*;
     use crate::{kcp_transport::KcpFramedTransport, latest_pointer::send_pointer};
     use borderless_core::config::TransportMode;
-    use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
+    use tokio::{net::TcpListener, sync::mpsc};
 
     #[tokio::test]
     async fn reconnect_delay_ignores_send_commands_until_delay_expires() {
@@ -408,17 +465,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kcp_controller_receives_fresh_latest_pointer_packets_on_configured_port() {
-        let listener = KcpFramedTransport::bind("127.0.0.1:0").await.unwrap();
+    async fn connect_or_stop_stops_while_connect_is_pending() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+
+        let result = timeout(
+            Duration::from_millis(100),
+            connect_or_stop(
+                std::future::pending::<anyhow::Result<()>>(),
+                &mut command_rx,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, ConnectAttempt::Stopped));
+    }
+
+    #[tokio::test]
+    async fn connect_or_stop_ignores_send_commands_while_connect_is_pending() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        command_tx
+            .send(ConnectionCommand::SendLatestPointer { x: 1, y: 2 })
+            .unwrap();
+
+        let delayed = timeout(
+            Duration::from_millis(100),
+            connect_or_stop(
+                std::future::pending::<anyhow::Result<()>>(),
+                &mut command_rx,
+            ),
+        )
+        .await;
+
+        assert!(
+            delayed.is_err(),
+            "send command interrupted the pending connect attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_waits_after_live_disconnect_before_reconnecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let reliable_port = listener.local_addr().unwrap().port();
         let pointer_port = unused_udp_port().await;
-        let _server = tokio::spawn(async move {
-            let _accepted = KcpFramedTransport::accept(&listener).await.unwrap();
-            std::future::pending::<()>().await;
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
         });
 
         let settings = TransportSettings {
-            mode: TransportMode::Kcp,
+            mode: TransportMode::Tcp,
             host: "127.0.0.1".to_string(),
             reliable_port,
             pointer_port,
@@ -428,8 +524,48 @@ mod tests {
         let controller = tokio::spawn(run_controller_client(settings, event_tx, command_rx));
 
         wait_for_connected(&mut event_rx).await;
+        wait_for_disconnected(&mut event_rx).await;
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reconnect = timeout(
+            Duration::from_millis(100),
+            wait_for_connecting(&mut event_rx),
+        )
+        .await;
+        assert!(
+            reconnect.is_err(),
+            "controller attempted reconnect without live-disconnect backoff"
+        );
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        controller.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kcp_controller_receives_fresh_latest_pointer_packets_on_configured_port() {
+        let listener = KcpFramedTransport::bind("127.0.0.2:0").await.unwrap();
+        let reliable_port = listener.local_addr().unwrap().port();
+        let pointer_port = unused_udp_port().await;
+        let _server = tokio::spawn(async move {
+            let _accepted = KcpFramedTransport::accept(&listener).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let settings = TransportSettings {
+            mode: TransportMode::Kcp,
+            host: "127.0.0.2".to_string(),
+            reliable_port,
+            pointer_port,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let controller = tokio::spawn(run_controller_client(settings, event_tx, command_rx));
+
+        wait_for_connected(&mut event_rx).await;
+
+        let sender = UdpSocket::bind(format!("127.0.0.2:{pointer_port}"))
+            .await
+            .unwrap();
         let target = format!("127.0.0.1:{pointer_port}");
         for packet in [
             PointerPacket {
@@ -490,6 +626,32 @@ mod tests {
             {
                 ConnectionEvent::Connected { .. } => return,
                 ConnectionEvent::Error(error) => panic!("unexpected connection error: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_disconnected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
+        loop {
+            match timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ConnectionEvent::Disconnected(_) => return,
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_connecting(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
+        loop {
+            match timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ConnectionEvent::Connecting(_) => return,
                 _ => {}
             }
         }
