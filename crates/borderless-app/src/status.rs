@@ -24,6 +24,10 @@ pub struct AppStatus {
     pub average_rtt_ms: Option<u64>,
     pub stale_pointer_packets: u64,
     pub latest_pointer_sequence: Option<u64>,
+    pub clipboard_enabled: bool,
+    pub last_clipboard_format: Option<String>,
+    pub last_clipboard_bytes: Option<u64>,
+    pub clipboard_ignored_reason: Option<String>,
     pub events: VecDeque<String>,
 }
 
@@ -35,6 +39,10 @@ impl AppStatus {
         self.average_rtt_ms = None;
         self.stale_pointer_packets = 0;
         self.latest_pointer_sequence = None;
+        self.clipboard_enabled = false;
+        self.last_clipboard_format = None;
+        self.last_clipboard_bytes = None;
+        self.clipboard_ignored_reason = None;
     }
 
     pub fn record_rtt(&mut self, rtt_ms: u64) {
@@ -84,6 +92,10 @@ mod tests {
             average_rtt_ms: Some(20),
             stale_pointer_packets: 3,
             latest_pointer_sequence: Some(99),
+            clipboard_enabled: true,
+            last_clipboard_format: Some("text".to_string()),
+            last_clipboard_bytes: Some(12),
+            clipboard_ignored_reason: Some("too large".to_string()),
             ..AppStatus::default()
         };
 
@@ -95,6 +107,10 @@ mod tests {
         assert_eq!(status.average_rtt_ms, None);
         assert_eq!(status.stale_pointer_packets, 0);
         assert_eq!(status.latest_pointer_sequence, None);
+        assert!(!status.clipboard_enabled);
+        assert_eq!(status.last_clipboard_format, None);
+        assert_eq!(status.last_clipboard_bytes, None);
+        assert_eq!(status.clipboard_ignored_reason, None);
     }
 
     #[test]

@@ -236,6 +236,26 @@ impl BorderlessApp {
                         ui.label("Stale pointer packets");
                         ui.label(self.status.stale_pointer_packets.to_string());
                         ui.end_row();
+
+                        ui.label("Clipboard enabled");
+                        ui.label(if self.status.clipboard_enabled {
+                            "yes"
+                        } else {
+                            "no"
+                        });
+                        ui.end_row();
+
+                        ui.label("Clipboard format");
+                        ui.label(option_text(self.status.last_clipboard_format.as_deref()));
+                        ui.end_row();
+
+                        ui.label("Clipboard bytes");
+                        ui.label(option_number(self.status.last_clipboard_bytes));
+                        ui.end_row();
+
+                        ui.label("Clipboard ignored");
+                        ui.label(option_text(self.status.clipboard_ignored_reason.as_deref()));
+                        ui.end_row();
                     });
             });
     }

@@ -9,11 +9,15 @@ use std::{
 };
 
 use borderless_core::{
+    clipboard::{ClipboardEnvelope, ClipboardPayload},
     config::{AppConfig, Role, TransportMode},
     control::{ControlMode, ControlOutput, ControlState},
     geometry::{Point, Rect},
     input_event::{InputEvent, MouseMoveAbsEvent},
-    protocol::{Heartbeat, Hello, WireMessage, PROTOCOL_VERSION},
+    protocol::{
+        encode_frame, Heartbeat, Hello, ProtocolError, WireMessage, MAX_PAYLOAD_LEN,
+        PROTOCOL_VERSION,
+    },
 };
 use borderless_net::{
     agent_server::run_agent_server,
@@ -21,6 +25,7 @@ use borderless_net::{
     transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
 };
 use borderless_win::{
+    clipboard::{write_clipboard, ClipboardEvent, ClipboardMonitor, ClipboardReadOptions},
     hooks::{HookEvent, HookManager, SuppressionMode},
     inject::{move_local_pointer_to, InputInjector},
     monitor::virtual_desktop_rect,
@@ -41,6 +46,8 @@ const STALE_POINTER_EMIT_INTERVAL_MILLIS: u64 = 1_000;
 const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_MOVE_COALESCE_LOG_THRESHOLD: u64 = 100;
 const REMOTE_MOVE_COALESCE_LOG_WINDOW_MILLIS: u64 = 1_000;
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CLIPBOARD_PEER_NOT_CONNECTED_REASON: &str = "clipboard sync skipped: peer is not connected";
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
@@ -191,6 +198,10 @@ enum SessionUpdate {
     Log(String),
     Rtt(u64),
     RunState(RunState),
+    ClipboardQueued { format: String, bytes: u64 },
+    ClipboardWritten { format: String, bytes: u64 },
+    ClipboardIgnored(String),
+    ClipboardError(String),
 }
 
 async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Sender<RuntimeEvent>) {
@@ -396,6 +407,7 @@ fn start_agent_session(
     tasks.push(tokio::spawn(async move {
         run_agent_event_pump(
             session_id,
+            config,
             local_desktop,
             connection_events_rx,
             pump_commands,
@@ -435,8 +447,12 @@ async fn run_controller_event_pump(
     let mut heartbeat = HeartbeatTracker::default();
     let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
     let mut hook_interval = interval(HOOK_POLL_INTERVAL);
+    let mut clipboard_interval = interval(CLIPBOARD_POLL_INTERVAL);
+    let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
+    let mut clipboard_transport_ready = false;
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     hook_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -465,6 +481,18 @@ async fn run_controller_event_pump(
                     session_id,
                 );
             }
+            _ = clipboard_interval.tick(), if clipboard_runtime.is_some() => {
+                if let Some(clipboard) = &clipboard_runtime {
+                    drain_clipboard_events(
+                        &clipboard.events,
+                        &config,
+                        &connection_commands,
+                        &updates,
+                        session_id,
+                        clipboard_transport_ready,
+                    );
+                }
+            }
             command = session_commands.recv() => {
                 if matches!(command, Some(SessionCommand::Stop) | None) {
                     set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
@@ -476,6 +504,7 @@ async fn run_controller_event_pump(
                             session_id,
                         );
                     }
+                    stop_clipboard_runtime(clipboard_runtime.take(), &updates, session_id);
                     break;
                 }
             }
@@ -484,6 +513,7 @@ async fn run_controller_event_pump(
                     break;
                 };
 
+                let readiness_event = event.clone();
                 handle_controller_connection_event(
                     event,
                     &config,
@@ -496,10 +526,16 @@ async fn run_controller_event_pump(
                     session_id,
                     &mut heartbeat,
                 );
+                clipboard_transport_ready = controller_clipboard_transport_ready_after_event(
+                    clipboard_transport_ready,
+                    &readiness_event,
+                    &control_state,
+                );
             }
         }
     }
 
+    stop_clipboard_runtime(clipboard_runtime.take(), &updates, session_id);
     set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
     remote_control_active.store(false, Ordering::SeqCst);
 }
@@ -558,6 +594,22 @@ fn handle_controller_connection_event(
         ConnectionEvent::Message(WireMessage::Heartbeat(message)) => {
             handle_heartbeat_message(message, heartbeat, connection_commands, updates, session_id);
         }
+        ConnectionEvent::Message(WireMessage::ClipboardOffer(envelope)) => {
+            handle_remote_clipboard_message(
+                WireMessage::ClipboardOffer(envelope),
+                config,
+                updates,
+                session_id,
+            );
+        }
+        ConnectionEvent::Message(WireMessage::ClipboardData(envelope)) => {
+            handle_remote_clipboard_message(
+                WireMessage::ClipboardData(envelope),
+                config,
+                updates,
+                session_id,
+            );
+        }
         ConnectionEvent::Message(WireMessage::Error(error)) => {
             apply_controller_recovery_action(
                 recovery_action,
@@ -582,13 +634,30 @@ fn handle_controller_connection_event(
         | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Input(_))
         | ConnectionEvent::Message(WireMessage::ReleaseAll)
-        | ConnectionEvent::Message(WireMessage::ClipboardOffer(_))
-        | ConnectionEvent::Message(WireMessage::ClipboardData(_))
         | ConnectionEvent::Message(WireMessage::FileTransferOffer(_))
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
         | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
         | ConnectionEvent::Message(WireMessage::DragDropStart(_))
         | ConnectionEvent::Message(WireMessage::DragDropCancel { .. }) => {}
+    }
+}
+
+fn controller_clipboard_transport_ready_after_event(
+    current: bool,
+    event: &ConnectionEvent,
+    control_state: &Option<ControlState>,
+) -> bool {
+    match event {
+        ConnectionEvent::Message(WireMessage::Hello(hello)) => {
+            hello.protocol_version == PROTOCOL_VERSION && control_state.is_some()
+        }
+        ConnectionEvent::Waiting
+        | ConnectionEvent::Connecting(_)
+        | ConnectionEvent::Connected { .. }
+        | ConnectionEvent::Disconnected(_)
+        | ConnectionEvent::Error(_)
+        | ConnectionEvent::Message(WireMessage::Error(_)) => false,
+        _ => current,
     }
 }
 
@@ -998,6 +1067,7 @@ fn return_local_pointer_target(output: &ControlOutput) -> Option<Point> {
 
 async fn run_agent_event_pump(
     session_id: u64,
+    config: AppConfig,
     local_desktop: Rect,
     mut connection_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
@@ -1006,12 +1076,29 @@ async fn run_agent_event_pump(
 ) {
     let mut injector: Option<InputInjector> = None;
     let mut heartbeat = HeartbeatTracker::default();
+    let mut clipboard_interval = interval(CLIPBOARD_POLL_INTERVAL);
+    let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
+    let mut clipboard_transport_ready = false;
+    clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = clipboard_interval.tick(), if clipboard_runtime.is_some() => {
+                if let Some(clipboard) = &clipboard_runtime {
+                    drain_clipboard_events(
+                        &clipboard.events,
+                        &config,
+                        &connection_commands,
+                        &updates,
+                        session_id,
+                        clipboard_transport_ready,
+                    );
+                }
+            }
             command = session_commands.recv() => {
                 if matches!(command, Some(SessionCommand::Stop) | None) {
                     release_agent_input(&mut injector, &updates, session_id, false);
+                    stop_clipboard_runtime(clipboard_runtime.take(), &updates, session_id);
                     break;
                 }
             }
@@ -1020,8 +1107,10 @@ async fn run_agent_event_pump(
                     break;
                 };
 
+                let readiness_event = event.clone();
                 handle_agent_connection_event(
                     event,
+                    &config,
                     local_desktop,
                     &mut injector,
                     &connection_commands,
@@ -1029,15 +1118,21 @@ async fn run_agent_event_pump(
                     session_id,
                     &mut heartbeat,
                 );
+                clipboard_transport_ready = agent_clipboard_transport_ready_after_event(
+                    clipboard_transport_ready,
+                    &readiness_event,
+                );
             }
         }
     }
 
+    stop_clipboard_runtime(clipboard_runtime.take(), &updates, session_id);
     release_agent_input(&mut injector, &updates, session_id, false);
 }
 
 fn handle_agent_connection_event(
     event: ConnectionEvent,
+    config: &AppConfig,
     local_desktop: Rect,
     injector: &mut Option<InputInjector>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
@@ -1082,6 +1177,22 @@ fn handle_agent_connection_event(
         ConnectionEvent::Message(WireMessage::Heartbeat(message)) => {
             handle_heartbeat_message(message, heartbeat, connection_commands, updates, session_id);
         }
+        ConnectionEvent::Message(WireMessage::ClipboardOffer(envelope)) => {
+            handle_remote_clipboard_message(
+                WireMessage::ClipboardOffer(envelope),
+                config,
+                updates,
+                session_id,
+            );
+        }
+        ConnectionEvent::Message(WireMessage::ClipboardData(envelope)) => {
+            handle_remote_clipboard_message(
+                WireMessage::ClipboardData(envelope),
+                config,
+                updates,
+                session_id,
+            );
+        }
         ConnectionEvent::Message(WireMessage::Error(error)) => {
             send_session_update(updates, session_id, SessionUpdate::Error(error));
         }
@@ -1093,13 +1204,23 @@ fn handle_agent_connection_event(
         | ConnectionEvent::Connecting(_)
         | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Hello(_))
-        | ConnectionEvent::Message(WireMessage::ClipboardOffer(_))
-        | ConnectionEvent::Message(WireMessage::ClipboardData(_))
         | ConnectionEvent::Message(WireMessage::FileTransferOffer(_))
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
         | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
         | ConnectionEvent::Message(WireMessage::DragDropStart(_))
         | ConnectionEvent::Message(WireMessage::DragDropCancel { .. }) => {}
+    }
+}
+
+fn agent_clipboard_transport_ready_after_event(current: bool, event: &ConnectionEvent) -> bool {
+    match event {
+        ConnectionEvent::Connected { .. } => true,
+        ConnectionEvent::Waiting
+        | ConnectionEvent::Connecting(_)
+        | ConnectionEvent::Disconnected(_)
+        | ConnectionEvent::Error(_)
+        | ConnectionEvent::Message(WireMessage::Error(_)) => false,
+        _ => current,
     }
 }
 
@@ -1193,6 +1314,435 @@ fn set_hook_suppression(hook_manager: &Arc<Mutex<HookManager>>, suppression_mode
     }
 }
 
+struct ClipboardRuntime {
+    monitor: ClipboardMonitor,
+    events: Receiver<ClipboardEvent>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardSendDecision {
+    Send { format: &'static str, bytes: u64 },
+    Ignore(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteClipboardMessageAction {
+    Write {
+        envelope: ClipboardEnvelope,
+        format: &'static str,
+        bytes: u64,
+    },
+    Ignore(String),
+}
+
+#[cfg(test)]
+enum ClipboardStatusUpdate<'a> {
+    Queued(&'a ClipboardPayload),
+    Ignored(String),
+    Error(String),
+}
+
+fn start_clipboard_runtime(
+    config: &AppConfig,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) -> Option<ClipboardRuntime> {
+    if !clipboard_enabled(config) {
+        return None;
+    }
+
+    let (sender, events) = unbounded();
+    match ClipboardMonitor::start_with_options(sender, clipboard_read_options(config)) {
+        Ok(monitor) => {
+            send_session_update(
+                updates,
+                session_id,
+                SessionUpdate::Log("clipboard monitor started".to_string()),
+            );
+            Some(ClipboardRuntime { monitor, events })
+        }
+        Err(error) => {
+            send_session_update(
+                updates,
+                session_id,
+                SessionUpdate::ClipboardError(format!("clipboard monitor failed: {error}")),
+            );
+            None
+        }
+    }
+}
+
+fn stop_clipboard_runtime(
+    clipboard: Option<ClipboardRuntime>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) {
+    let Some(clipboard) = clipboard else {
+        return;
+    };
+
+    if let Err(error) = clipboard.monitor.stop() {
+        send_session_update(
+            updates,
+            session_id,
+            SessionUpdate::ClipboardError(format!("clipboard monitor stop failed: {error}")),
+        );
+    }
+}
+
+fn drain_clipboard_events(
+    receiver: &Receiver<ClipboardEvent>,
+    config: &AppConfig,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+    clipboard_transport_ready: bool,
+) {
+    while let Ok(event) = receiver.try_recv() {
+        handle_clipboard_event(
+            event,
+            config,
+            connection_commands,
+            updates,
+            session_id,
+            clipboard_transport_ready,
+        );
+    }
+}
+
+fn handle_clipboard_event(
+    event: ClipboardEvent,
+    config: &AppConfig,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+    clipboard_transport_ready: bool,
+) {
+    match event {
+        ClipboardEvent::Changed(envelope) => {
+            if !clipboard_transport_ready {
+                send_session_update(
+                    updates,
+                    session_id,
+                    SessionUpdate::ClipboardIgnored(
+                        CLIPBOARD_PEER_NOT_CONNECTED_REASON.to_string(),
+                    ),
+                );
+                return;
+            }
+
+            match clipboard_data_send_decision(config, &envelope) {
+                ClipboardSendDecision::Send { format, bytes } => {
+                    if connection_commands
+                        .send(ConnectionCommand::SendReliable(WireMessage::ClipboardData(
+                            envelope,
+                        )))
+                        .is_ok()
+                    {
+                        send_session_update(
+                            updates,
+                            session_id,
+                            SessionUpdate::ClipboardQueued {
+                                format: format.to_string(),
+                                bytes,
+                            },
+                        );
+                    } else {
+                        send_session_update(
+                            updates,
+                            session_id,
+                            SessionUpdate::ClipboardError(
+                                "clipboard send failed: connection command channel closed"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                ClipboardSendDecision::Ignore(reason) => {
+                    send_session_update(
+                        updates,
+                        session_id,
+                        SessionUpdate::ClipboardIgnored(reason),
+                    );
+                }
+            }
+        }
+        ClipboardEvent::Ignored(reason) => {
+            send_session_update(updates, session_id, SessionUpdate::ClipboardIgnored(reason));
+        }
+        ClipboardEvent::Error(error) => {
+            send_session_update(updates, session_id, SessionUpdate::ClipboardError(error));
+        }
+    }
+}
+
+fn handle_remote_clipboard_message(
+    message: WireMessage,
+    config: &AppConfig,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) {
+    match remote_clipboard_message_action(config, message) {
+        RemoteClipboardMessageAction::Write {
+            envelope,
+            format,
+            bytes,
+        } => match write_clipboard(&envelope.payload) {
+            Ok(()) => {
+                send_session_update(
+                    updates,
+                    session_id,
+                    SessionUpdate::ClipboardWritten {
+                        format: format.to_string(),
+                        bytes,
+                    },
+                );
+            }
+            Err(error) => {
+                send_session_update(
+                    updates,
+                    session_id,
+                    SessionUpdate::ClipboardError(format!("clipboard write failed: {error}")),
+                );
+            }
+        },
+        RemoteClipboardMessageAction::Ignore(reason) => {
+            send_session_update(updates, session_id, SessionUpdate::ClipboardIgnored(reason));
+        }
+    }
+}
+
+fn remote_clipboard_message_action(
+    config: &AppConfig,
+    message: WireMessage,
+) -> RemoteClipboardMessageAction {
+    let WireMessage::ClipboardData(envelope) = message else {
+        return RemoteClipboardMessageAction::Ignore(
+            "clipboard offer ignored: data message required".to_string(),
+        );
+    };
+
+    match clipboard_data_write_decision(config, &envelope) {
+        ClipboardSendDecision::Send { format, bytes } => RemoteClipboardMessageAction::Write {
+            envelope,
+            format,
+            bytes,
+        },
+        ClipboardSendDecision::Ignore(reason) => RemoteClipboardMessageAction::Ignore(reason),
+    }
+}
+
+fn clipboard_enabled(config: &AppConfig) -> bool {
+    config.sharing.clipboard_text
+        || config.sharing.clipboard_html
+        || config.sharing.clipboard_images
+        || config.sharing.file_copy_paste
+}
+
+fn clipboard_read_options(config: &AppConfig) -> ClipboardReadOptions {
+    ClipboardReadOptions {
+        text: config.sharing.clipboard_text,
+        html: config.sharing.clipboard_html,
+        images: config.sharing.clipboard_images,
+        files: config.sharing.file_copy_paste,
+        max_bytes: config
+            .sharing
+            .max_clipboard_bytes
+            .min(MAX_PAYLOAD_LEN as u64),
+    }
+}
+
+fn clipboard_payload_format(payload: &ClipboardPayload) -> &'static str {
+    match payload {
+        ClipboardPayload::UnicodeText(_) => "text",
+        ClipboardPayload::Html(_) => "html",
+        ClipboardPayload::ImagePng(_) => "png",
+        ClipboardPayload::ImageDib(_) => "dib",
+        ClipboardPayload::Files(_) => "files",
+    }
+}
+
+fn clipboard_wire_bytes(payload: &ClipboardPayload) -> u64 {
+    match payload {
+        ClipboardPayload::UnicodeText(value) | ClipboardPayload::Html(value) => {
+            value.as_bytes().len() as u64
+        }
+        ClipboardPayload::ImagePng(bytes) | ClipboardPayload::ImageDib(bytes) => bytes.len() as u64,
+        ClipboardPayload::Files(offer) => clipboard_file_path_metadata_bytes(offer),
+    }
+}
+
+fn clipboard_file_path_metadata_bytes(offer: &borderless_core::clipboard::RemoteFileOffer) -> u64 {
+    // Task 19 sends CF_HDROP-style path-list metadata only; file contents move on later bulk paths.
+    offer.files.iter().fold(0u64, |total, file| {
+        total.saturating_add(file.relative_path.as_bytes().len() as u64)
+    })
+}
+
+fn clipboard_send_decision(
+    config: &AppConfig,
+    payload: &ClipboardPayload,
+) -> ClipboardSendDecision {
+    if let Some(reason) = clipboard_disabled_reason(config, payload) {
+        return ClipboardSendDecision::Ignore(reason);
+    }
+
+    let format = clipboard_payload_format(payload);
+    let bytes = clipboard_wire_bytes(payload);
+    let limit = config.sharing.max_clipboard_bytes;
+    if bytes > limit {
+        ClipboardSendDecision::Ignore(format!(
+            "clipboard {format} is {bytes} bytes, limit is {limit}"
+        ))
+    } else {
+        ClipboardSendDecision::Send { format, bytes }
+    }
+}
+
+fn clipboard_data_send_decision(
+    config: &AppConfig,
+    envelope: &ClipboardEnvelope,
+) -> ClipboardSendDecision {
+    clipboard_protocol_decision(
+        config,
+        envelope,
+        WireMessage::ClipboardData(envelope.clone()),
+    )
+}
+
+fn clipboard_data_write_decision(
+    config: &AppConfig,
+    envelope: &ClipboardEnvelope,
+) -> ClipboardSendDecision {
+    clipboard_protocol_decision(
+        config,
+        envelope,
+        WireMessage::ClipboardData(envelope.clone()),
+    )
+}
+
+fn clipboard_protocol_decision(
+    config: &AppConfig,
+    envelope: &ClipboardEnvelope,
+    message: WireMessage,
+) -> ClipboardSendDecision {
+    match clipboard_send_decision(config, &envelope.payload) {
+        ClipboardSendDecision::Send { format, bytes } => match encode_frame(0, &message) {
+            Ok(_) => ClipboardSendDecision::Send { format, bytes },
+            Err(error) => {
+                ClipboardSendDecision::Ignore(clipboard_protocol_ignored_reason(format, error))
+            }
+        },
+        ClipboardSendDecision::Ignore(reason) => ClipboardSendDecision::Ignore(reason),
+    }
+}
+
+fn clipboard_protocol_ignored_reason(format: &'static str, error: ProtocolError) -> String {
+    match error {
+        ProtocolError::PayloadTooLarge { max, actual } => format!(
+            "clipboard {format} encoded message is too large: {actual} bytes, protocol limit is {max}"
+        ),
+        error => format!("clipboard {format} encoded message cannot be sent: {error}"),
+    }
+}
+
+fn clipboard_disabled_reason(config: &AppConfig, payload: &ClipboardPayload) -> Option<String> {
+    match payload {
+        ClipboardPayload::UnicodeText(_) if !config.sharing.clipboard_text => {
+            Some("clipboard text sharing is disabled".to_string())
+        }
+        ClipboardPayload::Html(_) if !config.sharing.clipboard_html => {
+            Some("clipboard html sharing is disabled".to_string())
+        }
+        ClipboardPayload::ImagePng(_) | ClipboardPayload::ImageDib(_)
+            if !config.sharing.clipboard_images =>
+        {
+            Some("clipboard image sharing is disabled".to_string())
+        }
+        ClipboardPayload::Files(_) if !config.sharing.file_copy_paste => {
+            Some("clipboard file copy/paste is disabled".to_string())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn apply_clipboard_status_update(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    update: ClipboardStatusUpdate<'_>,
+) {
+    match update {
+        ClipboardStatusUpdate::Queued(payload) => {
+            apply_clipboard_queued_status(
+                status,
+                events,
+                clipboard_payload_format(payload).to_string(),
+                clipboard_wire_bytes(payload),
+            );
+        }
+        ClipboardStatusUpdate::Ignored(reason) => {
+            apply_clipboard_ignored_status(status, events, reason);
+        }
+        ClipboardStatusUpdate::Error(error) => {
+            apply_clipboard_error_status(status, events, error);
+        }
+    }
+
+    emit_status(events, status);
+}
+
+fn apply_clipboard_queued_status(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    format: String,
+    bytes: u64,
+) {
+    status.last_clipboard_format = Some(format.clone());
+    status.last_clipboard_bytes = Some(bytes);
+    status.clipboard_ignored_reason = None;
+    emit_log(
+        status,
+        events,
+        format!("clipboard queued: {format} ({bytes} bytes)"),
+    );
+}
+
+fn apply_clipboard_written_status(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    format: String,
+    bytes: u64,
+) {
+    status.last_clipboard_format = Some(format.clone());
+    status.last_clipboard_bytes = Some(bytes);
+    status.clipboard_ignored_reason = None;
+    emit_log(
+        status,
+        events,
+        format!("clipboard written: {format} ({bytes} bytes)"),
+    );
+}
+
+fn apply_clipboard_ignored_status(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    reason: String,
+) {
+    status.clipboard_ignored_reason = Some(reason.clone());
+    emit_log(status, events, format!("clipboard ignored: {reason}"));
+}
+
+fn apply_clipboard_error_status(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    error: String,
+) {
+    status.last_error = Some(error.clone());
+    status.clipboard_ignored_reason = Some(error.clone());
+    emit_log(status, events, format!("clipboard error: {error}"));
+}
+
 fn send_session_update(
     sender: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -1205,6 +1755,7 @@ fn prepare_running_status(status: &mut AppStatus, config: &AppConfig, run_state:
     status.reset_runtime_fields();
     status.run_state = run_state;
     status.transport_mode = Some(runtime_transport_mode(config));
+    status.clipboard_enabled = clipboard_enabled(config);
 }
 
 fn prepare_stopped_status(status: &mut AppStatus) {
@@ -1258,6 +1809,22 @@ fn apply_session_update(
                 status.run_state = run_state;
                 status_changed = true;
             }
+        }
+        SessionUpdate::ClipboardQueued { format, bytes } => {
+            apply_clipboard_queued_status(status, events, format, bytes);
+            status_changed = true;
+        }
+        SessionUpdate::ClipboardWritten { format, bytes } => {
+            apply_clipboard_written_status(status, events, format, bytes);
+            status_changed = true;
+        }
+        SessionUpdate::ClipboardIgnored(reason) => {
+            apply_clipboard_ignored_status(status, events, reason);
+            status_changed = true;
+        }
+        SessionUpdate::ClipboardError(error) => {
+            apply_clipboard_error_status(status, events, error);
+            status_changed = true;
         }
     }
 
@@ -1471,7 +2038,9 @@ mod tests {
     };
 
     use borderless_core::{
+        clipboard::{ClipboardChangeId, ClipboardEnvelope, ClipboardPayload},
         config::{RemotePosition, Role, TransportMode},
+        file_transfer::FileManifestEntry,
         input_event::{InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseWheelEvent},
         protocol::WireMessage,
     };
@@ -1554,6 +2123,430 @@ mod tests {
             &ConnectionEvent::Message(WireMessage::ReleaseAll),
         );
         assert_eq!(status.run_state, RunState::Error);
+    }
+
+    #[test]
+    fn clipboard_enabled_tracks_any_clipboard_sharing_flag() {
+        let mut config = AppConfig::default();
+        config.sharing.clipboard_text = false;
+        config.sharing.clipboard_html = false;
+        config.sharing.clipboard_images = false;
+        config.sharing.file_copy_paste = false;
+
+        assert!(!clipboard_enabled(&config));
+
+        config.sharing.clipboard_html = true;
+        assert!(clipboard_enabled(&config));
+    }
+
+    #[test]
+    fn clipboard_payload_format_names_are_human_readable() {
+        assert_eq!(
+            clipboard_payload_format(&ClipboardPayload::UnicodeText("hi".to_string())),
+            "text"
+        );
+        assert_eq!(
+            clipboard_payload_format(&ClipboardPayload::Html("<b>hi</b>".to_string())),
+            "html"
+        );
+        assert_eq!(
+            clipboard_payload_format(&ClipboardPayload::ImagePng(vec![1, 2, 3])),
+            "png"
+        );
+        assert_eq!(
+            clipboard_payload_format(&ClipboardPayload::ImageDib(vec![1, 2, 3])),
+            "dib"
+        );
+        assert_eq!(
+            clipboard_payload_format(&ClipboardPayload::Files(
+                borderless_core::clipboard::RemoteFileOffer {
+                    transfer_id: Default::default(),
+                    files: vec![FileManifestEntry::file("a.txt", 4)],
+                },
+            )),
+            "files"
+        );
+    }
+
+    #[test]
+    fn clipboard_send_decision_enforces_enabled_formats_and_size_limit() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = 4;
+        config.sharing.clipboard_html = false;
+
+        assert_eq!(
+            clipboard_send_decision(&config, &ClipboardPayload::UnicodeText("four".to_string())),
+            ClipboardSendDecision::Send {
+                format: "text",
+                bytes: 4
+            }
+        );
+        assert_eq!(
+            clipboard_send_decision(
+                &config,
+                &ClipboardPayload::UnicodeText("too large".to_string()),
+            ),
+            ClipboardSendDecision::Ignore("clipboard text is 9 bytes, limit is 4".to_string())
+        );
+        assert_eq!(
+            clipboard_send_decision(&config, &ClipboardPayload::Html("<b>x</b>".to_string())),
+            ClipboardSendDecision::Ignore("clipboard html sharing is disabled".to_string())
+        );
+    }
+
+    #[test]
+    fn clipboard_file_path_metadata_size_ignores_future_content_size() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = 64;
+        let payload = ClipboardPayload::Files(borderless_core::clipboard::RemoteFileOffer {
+            transfer_id: Default::default(),
+            files: vec![FileManifestEntry::file("small-path.txt", u64::MAX)],
+        });
+
+        assert_eq!(
+            clipboard_send_decision(&config, &payload),
+            ClipboardSendDecision::Send {
+                format: "files",
+                bytes: 14
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_data_larger_than_protocol_limit_is_ignored_before_enqueue() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = (32 * 1024 * 1024) as u64;
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::ImagePng(vec![
+                0;
+                borderless_core::protocol::MAX_PAYLOAD_LEN
+            ]),
+        };
+
+        assert!(matches!(
+            clipboard_data_send_decision(&config, &envelope),
+            ClipboardSendDecision::Ignore(reason)
+                if reason.contains("clipboard png encoded message is too large")
+                    && reason.contains("protocol limit")
+        ));
+    }
+
+    #[test]
+    fn clipboard_data_larger_than_protocol_limit_is_ignored_before_write_status() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = (32 * 1024 * 1024) as u64;
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::ImagePng(vec![
+                0;
+                borderless_core::protocol::MAX_PAYLOAD_LEN
+            ]),
+        };
+
+        assert!(matches!(
+            clipboard_data_write_decision(&config, &envelope),
+            ClipboardSendDecision::Ignore(reason)
+                if reason.contains("clipboard png encoded message is too large")
+                    && reason.contains("protocol limit")
+        ));
+    }
+
+    #[test]
+    fn clipboard_event_does_not_enqueue_oversized_protocol_data() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = (32 * 1024 * 1024) as u64;
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::ImagePng(vec![
+                0;
+                borderless_core::protocol::MAX_PAYLOAD_LEN
+            ]),
+        };
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, updates_rx) = unbounded();
+
+        handle_clipboard_event(
+            ClipboardEvent::Changed(envelope),
+            &config,
+            &connection_commands_tx,
+            &updates_tx,
+            7,
+            true,
+        );
+
+        assert!(connection_commands_rx.try_recv().is_err());
+        assert!(updates_rx.try_iter().any(|update| {
+            matches!(
+                update.update,
+                SessionUpdate::ClipboardIgnored(reason)
+                    if reason.contains("clipboard png encoded message is too large")
+            )
+        }));
+    }
+
+    #[test]
+    fn clipboard_event_without_transport_ready_is_ignored_before_enqueue() {
+        let config = AppConfig::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("waiting".to_string()),
+        };
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, updates_rx) = unbounded();
+
+        handle_clipboard_event(
+            ClipboardEvent::Changed(envelope),
+            &config,
+            &connection_commands_tx,
+            &updates_tx,
+            7,
+            false,
+        );
+
+        assert!(connection_commands_rx.try_recv().is_err());
+        assert!(updates_rx.try_iter().any(|update| {
+            matches!(
+                update.update,
+                SessionUpdate::ClipboardIgnored(reason)
+                    if reason == "clipboard sync skipped: peer is not connected"
+            )
+        }));
+    }
+
+    #[test]
+    fn clipboard_event_with_transport_ready_enqueues_data_and_reports_queued() {
+        let config = AppConfig::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("ready".to_string()),
+        };
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, updates_rx) = unbounded();
+
+        handle_clipboard_event(
+            ClipboardEvent::Changed(envelope.clone()),
+            &config,
+            &connection_commands_tx,
+            &updates_tx,
+            7,
+            true,
+        );
+
+        assert_eq!(
+            connection_commands_rx.try_recv(),
+            Ok(ConnectionCommand::SendReliable(WireMessage::ClipboardData(
+                envelope
+            )))
+        );
+        assert!(updates_rx.try_iter().any(|update| {
+            matches!(
+                update.update,
+                SessionUpdate::ClipboardQueued { format, bytes }
+                    if format == "text" && bytes == 5
+            )
+        }));
+    }
+
+    #[test]
+    fn remote_clipboard_offer_is_ignored_instead_of_written_as_data() {
+        let config = AppConfig::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("offer".to_string()),
+        };
+
+        assert_eq!(
+            remote_clipboard_message_action(&config, WireMessage::ClipboardOffer(envelope)),
+            RemoteClipboardMessageAction::Ignore(
+                "clipboard offer ignored: data message required".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn remote_clipboard_data_is_selected_for_local_write() {
+        let config = AppConfig::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("data".to_string()),
+        };
+
+        assert_eq!(
+            remote_clipboard_message_action(&config, WireMessage::ClipboardData(envelope.clone())),
+            RemoteClipboardMessageAction::Write {
+                envelope,
+                format: "text",
+                bytes: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn controller_clipboard_transport_ready_waits_for_valid_hello_and_resets() {
+        let config = AppConfig::default();
+        let local_desktop = Rect::new(0, 0, 100, 100);
+        let remote_desktop = Rect::new(100, 0, 100, 100);
+        let valid_hello = ConnectionEvent::Message(WireMessage::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            desktop: remote_desktop,
+        }));
+        let invalid_hello = ConnectionEvent::Message(WireMessage::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION + 1,
+            desktop: remote_desktop,
+        }));
+        let control_state = Some(ControlState::new(
+            local_desktop,
+            remote_desktop,
+            config.controller.remote_position.clone(),
+            config.edge_trigger_px,
+        ));
+
+        assert!(!controller_clipboard_transport_ready_after_event(
+            false,
+            &valid_hello,
+            &None,
+        ));
+        assert!(controller_clipboard_transport_ready_after_event(
+            false,
+            &valid_hello,
+            &control_state,
+        ));
+        assert!(!controller_clipboard_transport_ready_after_event(
+            true,
+            &invalid_hello,
+            &control_state,
+        ));
+        assert!(!controller_clipboard_transport_ready_after_event(
+            true,
+            &ConnectionEvent::Disconnected("agent".to_string()),
+            &control_state,
+        ));
+    }
+
+    #[test]
+    fn agent_clipboard_transport_ready_follows_connection_state() {
+        assert!(agent_clipboard_transport_ready_after_event(
+            false,
+            &ConnectionEvent::Connected {
+                peer: "controller".to_string(),
+                mode: TransportMode::Tcp,
+            },
+        ));
+        assert!(agent_clipboard_transport_ready_after_event(
+            true,
+            &ConnectionEvent::Message(WireMessage::ReleaseAll),
+        ));
+        assert!(!agent_clipboard_transport_ready_after_event(
+            true,
+            &ConnectionEvent::Waiting,
+        ));
+        assert!(!agent_clipboard_transport_ready_after_event(
+            true,
+            &ConnectionEvent::Error("closed".to_string()),
+        ));
+    }
+
+    #[test]
+    fn clipboard_data_under_protocol_limit_still_sends() {
+        let config = AppConfig::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("small".to_string()),
+        };
+
+        assert_eq!(
+            clipboard_data_send_decision(&config, &envelope),
+            ClipboardSendDecision::Send {
+                format: "text",
+                bytes: 5
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_monitor_options_follow_sharing_config_and_size_limit() {
+        let mut config = AppConfig::default();
+        config.sharing.clipboard_text = true;
+        config.sharing.clipboard_html = false;
+        config.sharing.clipboard_images = false;
+        config.sharing.file_copy_paste = true;
+        config.sharing.max_clipboard_bytes = 1234;
+
+        let options = clipboard_read_options(&config);
+
+        assert!(options.text);
+        assert!(!options.html);
+        assert!(!options.images);
+        assert!(options.files);
+        assert_eq!(options.max_bytes, 1234);
+    }
+
+    #[test]
+    fn clipboard_monitor_options_cap_size_at_protocol_payload_limit() {
+        let mut config = AppConfig::default();
+        config.sharing.max_clipboard_bytes = (32 * 1024 * 1024) as u64;
+
+        let options = clipboard_read_options(&config);
+
+        assert_eq!(
+            options.max_bytes,
+            borderless_core::protocol::MAX_PAYLOAD_LEN as u64
+        );
+    }
+
+    #[test]
+    fn clipboard_status_updates_record_queued_and_ignored_events() {
+        let (events_tx, events_rx) = unbounded();
+        let mut status = AppStatus::default();
+        let envelope = ClipboardEnvelope {
+            change_id: ClipboardChangeId::new(Default::default(), 1),
+            payload: ClipboardPayload::UnicodeText("hello".to_string()),
+        };
+
+        apply_clipboard_status_update(
+            &mut status,
+            &events_tx,
+            ClipboardStatusUpdate::Queued(&envelope.payload),
+        );
+
+        assert_eq!(status.last_clipboard_format.as_deref(), Some("text"));
+        assert_eq!(status.last_clipboard_bytes, Some(5));
+        assert_eq!(status.clipboard_ignored_reason, None);
+        assert!(status
+            .events
+            .iter()
+            .any(|message| message == "clipboard queued: text (5 bytes)"));
+
+        apply_clipboard_status_update(
+            &mut status,
+            &events_tx,
+            ClipboardStatusUpdate::Ignored("too large".to_string()),
+        );
+
+        assert_eq!(
+            status.clipboard_ignored_reason.as_deref(),
+            Some("too large")
+        );
+        assert!(status
+            .events
+            .iter()
+            .any(|message| message == "clipboard ignored: too large"));
+
+        apply_clipboard_status_update(
+            &mut status,
+            &events_tx,
+            ClipboardStatusUpdate::Error("clipboard busy".to_string()),
+        );
+
+        assert_eq!(status.last_error.as_deref(), Some("clipboard busy"));
+        assert_eq!(
+            status.clipboard_ignored_reason.as_deref(),
+            Some("clipboard busy")
+        );
+        assert!(events_rx
+            .try_iter()
+            .any(|event| matches!(event, RuntimeEvent::Status(status) if status.last_clipboard_bytes == Some(5))));
     }
 
     #[test]
@@ -1876,11 +2869,13 @@ mod tests {
     fn agent_disconnect_release_logs_released_pressed_input() {
         let (connection_commands_tx, _connection_commands_rx) = mpsc::unbounded_channel();
         let (updates_tx, updates_rx) = unbounded();
+        let config = AppConfig::default();
         let mut injector = Some(InputInjector::new(Rect::new(0, 0, 1920, 1080)));
         let mut heartbeat = HeartbeatTracker::default();
 
         handle_agent_connection_event(
             ConnectionEvent::Disconnected("controller".to_string()),
+            &config,
             Rect::new(0, 0, 1920, 1080),
             &mut injector,
             &connection_commands_tx,
@@ -2001,6 +2996,10 @@ mod tests {
             TransportMode::Kcp => unused_udp_port(),
         };
         config.agent.pointer_port = unused_udp_port();
+        config.sharing.clipboard_text = false;
+        config.sharing.clipboard_html = false;
+        config.sharing.clipboard_images = false;
+        config.sharing.file_copy_paste = false;
         config
     }
 
