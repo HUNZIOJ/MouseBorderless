@@ -263,6 +263,7 @@ async fn run_kcp_connection(
                         if source_matches_peer(source, pointer_peer) {
                             match PointerPacket::decode(&pointer_buf[..len]) {
                                 Ok(packet) => {
+                                    let stale_before = pointer_session.stale_pointer_packets();
                                     if let Some((x, y)) = pointer_session.accept(packet) {
                                         emit(
                                             events,
@@ -272,6 +273,16 @@ async fn run_kcp_connection(
                                                 sequence: packet.sequence,
                                             },
                                         );
+                                    } else {
+                                        let stale_after = pointer_session.stale_pointer_packets();
+                                        if stale_after > stale_before {
+                                            emit(
+                                                events,
+                                                ConnectionEvent::StalePointerPackets {
+                                                    count: stale_after,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                                 Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
@@ -627,6 +638,10 @@ mod tests {
             }
         );
         assert_eq!(
+            next_stale_pointer_packets(&mut event_rx).await,
+            ConnectionEvent::StalePointerPackets { count: 1 }
+        );
+        assert_eq!(
             next_latest_pointer(&mut event_rx).await,
             ConnectionEvent::LatestPointer {
                 x: 500,
@@ -729,6 +744,22 @@ mod tests {
                 .unwrap()
             {
                 event @ ConnectionEvent::LatestPointer { .. } => return event,
+                ConnectionEvent::Error(error) => panic!("unexpected connection error: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    async fn next_stale_pointer_packets(
+        event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>,
+    ) -> ConnectionEvent {
+        loop {
+            match timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                event @ ConnectionEvent::StalePointerPackets { .. } => return event,
                 ConnectionEvent::Error(error) => panic!("unexpected connection error: {error}"),
                 _ => {}
             }

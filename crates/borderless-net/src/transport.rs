@@ -9,6 +9,7 @@ pub enum ConnectionEvent {
     Disconnected(String),
     Message(WireMessage),
     LatestPointer { x: i32, y: i32, sequence: u64 },
+    StalePointerPackets { count: u64 },
     Error(String),
 }
 

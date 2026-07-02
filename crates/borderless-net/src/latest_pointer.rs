@@ -55,11 +55,13 @@ pub struct LatestPointerState {
     current_session_id: Option<u128>,
     retired_session_ids: BTreeSet<u128>,
     latest_sequence: u64,
+    stale_pointer_packets: u64,
 }
 
 impl LatestPointerState {
     pub fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
         if self.retired_session_ids.contains(&packet.session_id) {
+            self.record_stale_packet();
             return None;
         }
 
@@ -72,11 +74,20 @@ impl LatestPointerState {
         }
 
         if packet.sequence <= self.latest_sequence {
+            self.record_stale_packet();
             return None;
         }
 
         self.latest_sequence = packet.sequence;
         Some((packet.x, packet.y))
+    }
+
+    pub fn stale_pointer_packets(&self) -> u64 {
+        self.stale_pointer_packets
+    }
+
+    fn record_stale_packet(&mut self) {
+        self.stale_pointer_packets = self.stale_pointer_packets.saturating_add(1);
     }
 
     fn retire_current_session(&mut self) {
@@ -125,6 +136,10 @@ impl LatestPointerSession {
     pub(crate) fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
         self.inbound.accept(packet)
     }
+
+    pub(crate) fn stale_pointer_packets(&self) -> u64 {
+        self.inbound.stale_pointer_packets()
+    }
 }
 
 pub async fn send_pointer(
@@ -168,6 +183,7 @@ mod tests {
             }),
             Some((100, 200))
         );
+        assert_eq!(state.stale_pointer_packets(), 0);
         assert_eq!(
             state.accept(PointerPacket {
                 session_id: 7,
@@ -177,6 +193,7 @@ mod tests {
             }),
             None
         );
+        assert_eq!(state.stale_pointer_packets(), 1);
         assert_eq!(
             state.accept(PointerPacket {
                 session_id: 7,
@@ -186,6 +203,7 @@ mod tests {
             }),
             Some((500, 600))
         );
+        assert_eq!(state.stale_pointer_packets(), 1);
     }
 
     #[test]
@@ -243,6 +261,7 @@ mod tests {
             }),
             None
         );
+        assert_eq!(state.stale_pointer_packets(), 1);
     }
 
     #[test]
@@ -304,6 +323,7 @@ mod tests {
         }
 
         assert_eq!(accepted, [(10, 100, 200), (11, 500, 600)]);
+        assert_eq!(state.stale_pointer_packets(), 1);
     }
 
     #[test]
@@ -373,6 +393,7 @@ mod tests {
             }),
             None
         );
+        assert_eq!(session.stale_pointer_packets(), 1);
         assert_eq!(
             session.accept(PointerPacket {
                 session_id: 8,

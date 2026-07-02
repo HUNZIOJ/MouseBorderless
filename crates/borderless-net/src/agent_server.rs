@@ -236,6 +236,7 @@ async fn run_kcp_connection(
                         if source_matches_peer(source, pointer_peer) {
                             match PointerPacket::decode(&pointer_buf[..len]) {
                                 Ok(packet) => {
+                                    let stale_before = pointer_session.stale_pointer_packets();
                                     if let Some((x, y)) = pointer_session.accept(packet) {
                                         emit(
                                             events,
@@ -245,6 +246,16 @@ async fn run_kcp_connection(
                                                 sequence: packet.sequence,
                                             },
                                         );
+                                    } else {
+                                        let stale_after = pointer_session.stale_pointer_packets();
+                                        if stale_after > stale_before {
+                                            emit(
+                                                events,
+                                                ConnectionEvent::StalePointerPackets {
+                                                    count: stale_after,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                                 Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),

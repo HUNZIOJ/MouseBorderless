@@ -34,6 +34,7 @@ use crate::status::{AppStatus, RunState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const MAX_OUTSTANDING_HEARTBEATS: usize = 8;
+const STALE_POINTER_LOG_INTERVAL_MILLIS: u64 = 1_000;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
@@ -145,6 +146,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
     let (updates_tx, updates_rx) = unbounded();
     let mut active: Option<ActiveRuntime> = None;
     let mut status = AppStatus::default();
+    let mut stale_pointer_log_gate = StalePointerLogGate::default();
     let mut next_session_id: u64 = 1;
 
     loop {
@@ -160,6 +162,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             session.stop();
                         }
 
+                        stale_pointer_log_gate.reset();
                         prepare_running_status(&mut status, &config, RunState::Connecting);
                         emit_log(&mut status, &events_tx, "starting runtime");
                         emit_status(&events_tx, &status);
@@ -172,6 +175,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
+                                    &mut stale_pointer_log_gate,
                                 );
                             })
                             .ok();
@@ -181,6 +185,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             session.stop();
                         }
 
+                        stale_pointer_log_gate.reset();
                         prepare_stopped_status(&mut status);
                         emit_log(&mut status, &events_tx, "runtime stopped");
                         emit_status(&events_tx, &status);
@@ -190,6 +195,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             session.stop();
                         }
 
+                        stale_pointer_log_gate.reset();
                         prepare_running_status(&mut status, &config, RunState::Reconnecting);
                         emit_log(&mut status, &events_tx, "reconnecting runtime");
                         emit_status(&events_tx, &status);
@@ -202,6 +208,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
+                                    &mut stale_pointer_log_gate,
                                 );
                             })
                             .ok();
@@ -217,7 +224,12 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                     .as_ref()
                     .is_some_and(|session| session.session_id == update.session_id)
                 {
-                    apply_session_update(&mut status, &events_tx, update.update);
+                    apply_session_update(
+                        &mut status,
+                        &events_tx,
+                        update.update,
+                        &mut stale_pointer_log_gate,
+                    );
                 }
             }
         }
@@ -474,6 +486,7 @@ fn handle_controller_connection_event(
         | ConnectionEvent::Connecting(_)
         | ConnectionEvent::Connected { .. }
         | ConnectionEvent::LatestPointer { .. }
+        | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Input(_))
         | ConnectionEvent::Message(WireMessage::ReleaseAll) => {}
     }
@@ -713,6 +726,7 @@ fn handle_agent_connection_event(
         }
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
+        | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Hello(_)) => {}
     }
 }
@@ -833,6 +847,7 @@ fn apply_session_update(
     status: &mut AppStatus,
     events: &Sender<RuntimeEvent>,
     update: SessionUpdate,
+    stale_pointer_log_gate: &mut StalePointerLogGate,
 ) {
     let mut status_changed = false;
 
@@ -840,7 +855,13 @@ fn apply_session_update(
         SessionUpdate::Connection(event) => {
             status_changed = connection_event_updates_status(&event);
             apply_connection_event_to_status(status, &event);
-            if let Some(message) = connection_event_log(&event) {
+            let log_message = match &event {
+                ConnectionEvent::StalePointerPackets { count } => {
+                    stale_pointer_log_gate.maybe_log(*count, now_millis())
+                }
+                _ => connection_event_log(&event),
+            };
+            if let Some(message) = log_message {
                 emit_log(status, events, message);
             }
         }
@@ -883,6 +904,9 @@ fn apply_connection_event_to_status(status: &mut AppStatus, event: &ConnectionEv
         ConnectionEvent::LatestPointer { sequence, .. } => {
             status.latest_pointer_sequence = Some(*sequence);
         }
+        ConnectionEvent::StalePointerPackets { count } => {
+            status.stale_pointer_packets = *count;
+        }
         ConnectionEvent::Error(error) => {
             status.run_state = RunState::Error;
             status.last_error = Some(error.clone());
@@ -903,6 +927,7 @@ fn connection_event_updates_status(event: &ConnectionEvent) -> bool {
             | ConnectionEvent::Connected { .. }
             | ConnectionEvent::Disconnected(_)
             | ConnectionEvent::LatestPointer { .. }
+            | ConnectionEvent::StalePointerPackets { .. }
             | ConnectionEvent::Error(_)
             | ConnectionEvent::Message(WireMessage::Error(_))
     )
@@ -916,7 +941,9 @@ fn connection_event_log(event: &ConnectionEvent) -> Option<String> {
         ConnectionEvent::Disconnected(peer) => Some(format!("disconnected {peer}")),
         ConnectionEvent::Error(error) => Some(format!("connection error: {error}")),
         ConnectionEvent::Message(WireMessage::Error(error)) => Some(format!("peer error: {error}")),
-        ConnectionEvent::Message(_) | ConnectionEvent::LatestPointer { .. } => None,
+        ConnectionEvent::Message(_)
+        | ConnectionEvent::LatestPointer { .. }
+        | ConnectionEvent::StalePointerPackets { .. } => None,
     }
 }
 
@@ -979,6 +1006,35 @@ impl HeartbeatTracker {
             .position(|outstanding| *outstanding == sent_millis)?;
         self.outstanding.remove(index);
         now_millis.checked_sub(sent_millis)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StalePointerLogGate {
+    last_logged_count: u64,
+    last_logged_at_millis: Option<u64>,
+}
+
+impl StalePointerLogGate {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn maybe_log(&mut self, count: u64, now_millis: u64) -> Option<String> {
+        if count == self.last_logged_count {
+            return None;
+        }
+
+        if let Some(last_logged_at_millis) = self.last_logged_at_millis {
+            let elapsed = now_millis.saturating_sub(last_logged_at_millis);
+            if elapsed < STALE_POINTER_LOG_INTERVAL_MILLIS {
+                return None;
+            }
+        }
+
+        self.last_logged_count = count;
+        self.last_logged_at_millis = Some(now_millis);
+        Some(format!("KCP UDP stale pointer packets: {count}"))
     }
 }
 
@@ -1063,6 +1119,14 @@ mod tests {
             },
         );
         assert_eq!(status.latest_pointer_sequence, Some(99));
+        apply_connection_event_to_status(
+            &mut status,
+            &ConnectionEvent::StalePointerPackets { count: 4 },
+        );
+        assert_eq!(status.stale_pointer_packets, 4);
+        assert!(connection_event_updates_status(
+            &ConnectionEvent::StalePointerPackets { count: 4 }
+        ));
 
         apply_connection_event_to_status(&mut status, &ConnectionEvent::Error("boom".to_string()));
         assert_eq!(status.run_state, RunState::Error);
@@ -1073,6 +1137,28 @@ mod tests {
             &ConnectionEvent::Message(WireMessage::ReleaseAll),
         );
         assert_eq!(status.run_state, RunState::Error);
+    }
+
+    #[test]
+    fn stale_pointer_log_gate_logs_count_changes_at_most_once_per_second() {
+        let mut gate = StalePointerLogGate::default();
+
+        assert_eq!(
+            gate.maybe_log(1, 1_000),
+            Some("KCP UDP stale pointer packets: 1".to_string())
+        );
+        assert_eq!(gate.maybe_log(2, 1_500), None);
+        assert_eq!(gate.maybe_log(2, 1_999), None);
+        assert_eq!(
+            gate.maybe_log(2, 2_000),
+            Some("KCP UDP stale pointer packets: 2".to_string())
+        );
+        assert_eq!(gate.maybe_log(3, 2_500), None);
+        assert_eq!(
+            gate.maybe_log(3, 3_000),
+            Some("KCP UDP stale pointer packets: 3".to_string())
+        );
+        assert_eq!(gate.maybe_log(3, 4_000), None);
     }
 
     #[test]
