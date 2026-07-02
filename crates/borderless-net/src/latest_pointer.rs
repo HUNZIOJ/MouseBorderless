@@ -2,12 +2,14 @@ use anyhow::{anyhow, ensure};
 use bytes::{Buf, BufMut, BytesMut};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
+use uuid::Uuid;
 
 const POINTER_MAGIC: u32 = 0x4250_5452;
-const POINTER_LEN: usize = 4 + 8 + 4 + 4;
+const POINTER_LEN: usize = 4 + 16 + 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PointerPacket {
+    pub session_id: u128,
     pub sequence: u64,
     pub x: i32,
     pub y: i32,
@@ -17,6 +19,7 @@ impl PointerPacket {
     pub fn encode(self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(POINTER_LEN);
         buf.put_u32(POINTER_MAGIC);
+        buf.put_u128(self.session_id);
         buf.put_u64(self.sequence);
         buf.put_i32(self.x);
         buf.put_i32(self.y);
@@ -39,6 +42,7 @@ impl PointerPacket {
         );
 
         Ok(Self {
+            session_id: raw.get_u128(),
             sequence: raw.get_u64(),
             x: raw.get_i32(),
             y: raw.get_i32(),
@@ -48,11 +52,17 @@ impl PointerPacket {
 
 #[derive(Clone, Debug, Default)]
 pub struct LatestPointerState {
+    current_session_id: Option<u128>,
     latest_sequence: u64,
 }
 
 impl LatestPointerState {
     pub fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
+        if self.current_session_id != Some(packet.session_id) {
+            self.current_session_id = Some(packet.session_id);
+            self.latest_sequence = 0;
+        }
+
         if packet.sequence <= self.latest_sequence {
             return None;
         }
@@ -65,6 +75,7 @@ impl LatestPointerState {
 #[derive(Clone, Debug)]
 pub(crate) struct LatestPointerSession {
     inbound: LatestPointerState,
+    outbound_session_id: u128,
     next_sequence: u64,
 }
 
@@ -72,6 +83,7 @@ impl Default for LatestPointerSession {
     fn default() -> Self {
         Self {
             inbound: LatestPointerState::default(),
+            outbound_session_id: Uuid::new_v4().as_u128(),
             next_sequence: 1,
         }
     }
@@ -80,6 +92,7 @@ impl Default for LatestPointerSession {
 impl LatestPointerSession {
     pub(crate) fn next_packet(&mut self, x: i32, y: i32) -> PointerPacket {
         let packet = PointerPacket {
+            session_id: self.outbound_session_id,
             sequence: self.next_sequence,
             x,
             y,
@@ -127,6 +140,7 @@ mod tests {
 
         assert_eq!(
             state.accept(PointerPacket {
+                session_id: 7,
                 sequence: 10,
                 x: 100,
                 y: 200,
@@ -135,6 +149,7 @@ mod tests {
         );
         assert_eq!(
             state.accept(PointerPacket {
+                session_id: 7,
                 sequence: 9,
                 x: 300,
                 y: 400,
@@ -143,6 +158,7 @@ mod tests {
         );
         assert_eq!(
             state.accept(PointerPacket {
+                session_id: 7,
                 sequence: 11,
                 x: 500,
                 y: 600,
@@ -152,8 +168,33 @@ mod tests {
     }
 
     #[test]
+    fn new_pointer_session_accepts_sequence_one_after_previous_high_sequence() {
+        let mut state = LatestPointerState::default();
+
+        assert_eq!(
+            state.accept(PointerPacket {
+                session_id: 7,
+                sequence: 900,
+                x: 100,
+                y: 200,
+            }),
+            Some((100, 200))
+        );
+        assert_eq!(
+            state.accept(PointerPacket {
+                session_id: 8,
+                sequence: 1,
+                x: 300,
+                y: 400,
+            }),
+            Some((300, 400))
+        );
+    }
+
+    #[test]
     fn pointer_packet_round_trips() {
         let packet = PointerPacket {
+            session_id: 123_456_789,
             sequence: 42,
             x: -10,
             y: 900,
@@ -171,16 +212,19 @@ mod tests {
 
         for packet in [
             PointerPacket {
+                session_id: 7,
                 sequence: 10,
                 x: 100,
                 y: 200,
             },
             PointerPacket {
+                session_id: 7,
                 sequence: 9,
                 x: 300,
                 y: 400,
             },
             PointerPacket {
+                session_id: 7,
                 sequence: 11,
                 x: 500,
                 y: 600,
@@ -231,6 +275,7 @@ mod tests {
 
         assert_eq!(
             session.accept(PointerPacket {
+                session_id: 1,
                 sequence: 50,
                 x: 100,
                 y: 200,

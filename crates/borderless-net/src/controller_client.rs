@@ -569,16 +569,19 @@ mod tests {
         let target = format!("127.0.0.1:{pointer_port}");
         for packet in [
             PointerPacket {
+                session_id: 7,
                 sequence: 10,
                 x: 100,
                 y: 200,
             },
             PointerPacket {
+                session_id: 7,
                 sequence: 9,
                 x: 300,
                 y: 400,
             },
             PointerPacket {
+                session_id: 7,
                 sequence: 11,
                 x: 500,
                 y: 600,
