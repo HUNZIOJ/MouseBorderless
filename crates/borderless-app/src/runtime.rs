@@ -5,7 +5,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::status::{AppStatus, RunState};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RuntimeCommand {
     Start(AppConfig),
     Stop,
@@ -124,6 +124,14 @@ mod tests {
                 RuntimeEvent::Status(status) if status.run_state == RunState::Reconnecting
             )
         }));
+    }
+
+    #[test]
+    fn runtime_command_is_cloneable() {
+        let command = RuntimeCommand::Start(AppConfig::default());
+        let cloned = command.clone();
+
+        assert!(matches!(cloned, RuntimeCommand::Start(_)));
     }
 
     fn wait_for_events(runtime: &RuntimeHandle, count: usize) -> Vec<RuntimeEvent> {

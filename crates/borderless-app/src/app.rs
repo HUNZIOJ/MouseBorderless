@@ -275,6 +275,7 @@ impl eframe::App for BorderlessApp {
                 }
 
                 if ui.button("Start").clicked() {
+                    self.save_config();
                     self.runtime
                         .send(RuntimeCommand::Start(self.config.clone()));
                 }
