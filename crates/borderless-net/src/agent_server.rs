@@ -1,7 +1,7 @@
 use crate::{
-    kcp_transport::{KcpFramedTransport, KcpListener},
-    latest_pointer::{send_pointer, LatestPointerState, PointerPacket},
-    tcp_transport::TcpFramedTransport,
+    kcp_transport::{KcpFramedReader, KcpFramedTransport, KcpFramedWriter},
+    latest_pointer::{send_pointer, source_matches_peer, LatestPointerState, PointerPacket},
+    tcp_transport::{TcpFramedReader, TcpFramedTransport, TcpFramedWriter},
     transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
 };
 use borderless_core::{
@@ -9,10 +9,22 @@ use borderless_core::{
     input_event::{InputEvent, MouseMoveAbsEvent},
     protocol::WireMessage,
 };
+use std::net::SocketAddr;
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
 };
+
+enum ReliableDriverCommand {
+    Send(WireMessage),
+    Stop,
+}
+
+enum ReliableDriverEvent {
+    Frame(WireMessage),
+    Error(String),
+}
 
 pub async fn run_agent_server(
     settings: TransportSettings,
@@ -71,19 +83,20 @@ async fn run_kcp_server(
     loop {
         tokio::select! {
             accepted = KcpFramedTransport::accept(&listener) => {
-                let transport = accepted?;
-                let peer = listener_addr(&listener);
+                let accepted = accepted?;
+                let peer = accepted.peer;
+                let peer_display = peer.to_string();
                 emit(
                     &events,
                     ConnectionEvent::Connected {
-                        peer: peer.clone(),
+                        peer: peer_display.clone(),
                         mode: settings.mode,
                     },
                 );
-                if run_kcp_connection(transport, &settings, &events, commands).await? {
+                if run_kcp_connection(accepted.transport, peer, &settings, &events, commands).await? {
                     return Ok(());
                 }
-                emit(&events, ConnectionEvent::Disconnected(peer));
+                emit(&events, ConnectionEvent::Disconnected(peer_display));
                 emit(&events, ConnectionEvent::Waiting);
             }
             command = commands.recv() => {
@@ -96,37 +109,46 @@ async fn run_kcp_server(
 }
 
 async fn run_tcp_connection(
-    mut transport: TcpFramedTransport,
+    transport: TcpFramedTransport,
     events: &UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<bool> {
+    let (driver_tx, driver, mut driver_events) = spawn_tcp_driver(transport);
+
     loop {
         tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(ConnectionCommand::SendReliable(message)) => {
-                        if let Err(err) = transport.send(&message).await {
-                            emit(events, ConnectionEvent::Error(err.to_string()));
+                        if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
+                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
                             return Ok(false);
                         }
                     }
                     Some(ConnectionCommand::SendLatestPointer { x, y }) => {
                         let message = latest_pointer_as_reliable(x, y);
-                        if let Err(err) = transport.send(&message).await {
-                            emit(events, ConnectionEvent::Error(err.to_string()));
+                        if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
+                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
                             return Ok(false);
                         }
                     }
-                    Some(ConnectionCommand::Stop) | None => return Ok(true),
+                    Some(ConnectionCommand::Stop) | None => {
+                        stop_driver(driver_tx, driver).await;
+                        return Ok(true);
+                    }
                 }
             }
-            frame = transport.read_frame() => {
-                match frame {
-                    Ok(frame) => emit(events, ConnectionEvent::Message(frame.message)),
-                    Err(err) => {
-                        emit(events, ConnectionEvent::Error(err.to_string()));
+            driver_event = driver_events.recv() => {
+                match driver_event {
+                    Some(ReliableDriverEvent::Frame(message)) => {
+                        emit(events, ConnectionEvent::Message(message));
+                    }
+                    Some(ReliableDriverEvent::Error(error)) => {
+                        emit(events, ConnectionEvent::Error(error));
+                        stop_driver(driver_tx, driver).await;
                         return Ok(false);
                     }
+                    None => return Ok(false),
                 }
             }
         }
@@ -134,13 +156,15 @@ async fn run_tcp_connection(
 }
 
 async fn run_kcp_connection(
-    mut transport: KcpFramedTransport,
+    transport: KcpFramedTransport,
+    peer: SocketAddr,
     settings: &TransportSettings,
     events: &UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<bool> {
-    let pointer_socket = UdpSocket::bind(settings.pointer_addr()).await?;
-    let pointer_target = settings.pointer_addr();
+    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
+    let pointer_socket = UdpSocket::bind(settings.pointer_addr()?).await?;
+    let pointer_target = SocketAddr::new(peer.ip(), settings.pointer_port).to_string();
     let mut pointer_state = LatestPointerState::default();
     let mut pointer_sequence = 1;
     let mut pointer_buf = [0u8; 64];
@@ -150,8 +174,8 @@ async fn run_kcp_connection(
             command = commands.recv() => {
                 match command {
                     Some(ConnectionCommand::SendReliable(message)) => {
-                        if let Err(err) = transport.send(&message).await {
-                            emit(events, ConnectionEvent::Error(err.to_string()));
+                        if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
+                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
                             return Ok(false);
                         }
                     }
@@ -166,36 +190,47 @@ async fn run_kcp_connection(
                             emit(events, ConnectionEvent::Error(err.to_string()));
                         }
                     }
-                    Some(ConnectionCommand::Stop) | None => return Ok(true),
+                    Some(ConnectionCommand::Stop) | None => {
+                        stop_driver(driver_tx, driver).await;
+                        return Ok(true);
+                    }
                 }
             }
             received = pointer_socket.recv_from(&mut pointer_buf) => {
                 match received {
-                    Ok((len, _)) => match PointerPacket::decode(&pointer_buf[..len]) {
-                        Ok(packet) => {
-                            if let Some((x, y)) = pointer_state.accept(packet) {
-                                emit(
-                                    events,
-                                    ConnectionEvent::LatestPointer {
-                                        x,
-                                        y,
-                                        sequence: packet.sequence,
-                                    },
-                                );
+                    Ok((len, source)) => {
+                        if source_matches_peer(source, peer) {
+                            match PointerPacket::decode(&pointer_buf[..len]) {
+                                Ok(packet) => {
+                                    if let Some((x, y)) = pointer_state.accept(packet) {
+                                        emit(
+                                            events,
+                                            ConnectionEvent::LatestPointer {
+                                                x,
+                                                y,
+                                                sequence: packet.sequence,
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
                             }
                         }
-                        Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
-                    },
+                    }
                     Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
                 }
             }
-            frame = transport.read_frame() => {
-                match frame {
-                    Ok(frame) => emit(events, ConnectionEvent::Message(frame.message)),
-                    Err(err) => {
-                        emit(events, ConnectionEvent::Error(err.to_string()));
+            driver_event = driver_events.recv() => {
+                match driver_event {
+                    Some(ReliableDriverEvent::Frame(message)) => {
+                        emit(events, ConnectionEvent::Message(message));
+                    }
+                    Some(ReliableDriverEvent::Error(error)) => {
+                        emit(events, ConnectionEvent::Error(error));
+                        stop_driver(driver_tx, driver).await;
                         return Ok(false);
                     }
+                    None => return Ok(false),
                 }
             }
         }
@@ -206,11 +241,136 @@ fn latest_pointer_as_reliable(x: i32, y: i32) -> WireMessage {
     WireMessage::Input(InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x, y }))
 }
 
-fn listener_addr(listener: &KcpListener) -> String {
-    listener
-        .local_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+fn spawn_tcp_driver(
+    transport: TcpFramedTransport,
+) -> (
+    UnboundedSender<ReliableDriverCommand>,
+    JoinHandle<()>,
+    UnboundedReceiver<ReliableDriverEvent>,
+) {
+    let (reader, writer) = transport.split();
+    spawn_driver(reader, writer)
+}
+
+fn spawn_kcp_driver(
+    transport: KcpFramedTransport,
+) -> (
+    UnboundedSender<ReliableDriverCommand>,
+    JoinHandle<()>,
+    UnboundedReceiver<ReliableDriverEvent>,
+) {
+    let (reader, writer) = transport.split();
+    spawn_driver(reader, writer)
+}
+
+fn spawn_driver<R, W>(
+    mut reader: R,
+    mut writer: W,
+) -> (
+    UnboundedSender<ReliableDriverCommand>,
+    JoinHandle<()>,
+    UnboundedReceiver<ReliableDriverEvent>,
+)
+where
+    R: ReliableReader + Send + 'static,
+    W: ReliableWriter + Send + 'static,
+{
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reader_events = event_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match reader.read_frame().await {
+                Ok(frame) => {
+                    if reader_events
+                        .send(ReliableDriverEvent::Frame(frame.message))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = reader_events.send(ReliableDriverEvent::Error(err.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    let driver = tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                ReliableDriverCommand::Send(message) => {
+                    if let Err(err) = writer.send(&message).await {
+                        let _ = event_tx.send(ReliableDriverEvent::Error(err.to_string()));
+                        break;
+                    }
+                }
+                ReliableDriverCommand::Stop => break,
+            }
+        }
+        reader_task.abort();
+        let _ = reader_task.await;
+    });
+
+    (command_tx, driver, event_rx)
+}
+
+async fn stop_driver(driver_tx: UnboundedSender<ReliableDriverCommand>, driver: JoinHandle<()>) {
+    let _ = driver_tx.send(ReliableDriverCommand::Stop);
+    let _ = driver.await;
+}
+
+trait ReliableReader {
+    fn read_frame(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<borderless_core::protocol::DecodedFrame>>
+           + Send
+           + '_;
+}
+
+impl ReliableReader for TcpFramedReader {
+    fn read_frame(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<borderless_core::protocol::DecodedFrame>>
+           + Send
+           + '_ {
+        TcpFramedReader::read_frame(self)
+    }
+}
+
+impl ReliableReader for KcpFramedReader {
+    fn read_frame(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<borderless_core::protocol::DecodedFrame>>
+           + Send
+           + '_ {
+        KcpFramedReader::read_frame(self)
+    }
+}
+
+trait ReliableWriter {
+    fn send<'a>(
+        &'a mut self,
+        message: &'a WireMessage,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a;
+}
+
+impl ReliableWriter for TcpFramedWriter {
+    fn send<'a>(
+        &'a mut self,
+        message: &'a WireMessage,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        TcpFramedWriter::send(self, message)
+    }
+}
+
+impl ReliableWriter for KcpFramedWriter {
+    fn send<'a>(
+        &'a mut self,
+        message: &'a WireMessage,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        KcpFramedWriter::send(self, message)
+    }
 }
 
 fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {

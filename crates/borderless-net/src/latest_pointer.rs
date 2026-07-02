@@ -1,5 +1,6 @@
 use anyhow::{anyhow, ensure};
 use bytes::{Buf, BufMut, BytesMut};
+use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
 const POINTER_MAGIC: u32 = 0x4250_5452;
@@ -79,9 +80,14 @@ pub async fn send_pointer(
     }
 }
 
+pub(crate) fn source_matches_peer(source: SocketAddr, peer: SocketAddr) -> bool {
+    source.ip() == peer.ip()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn stale_pointer_packets_are_ignored() {
@@ -122,5 +128,16 @@ mod tests {
         };
         let encoded = packet.encode();
         assert_eq!(PointerPacket::decode(&encoded).unwrap(), packet);
+    }
+
+    #[test]
+    fn source_filter_accepts_only_same_peer_ip() {
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 24800);
+        let same_ip_different_port =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 24801);
+        let different_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24801);
+
+        assert!(source_matches_peer(same_ip_different_port, peer));
+        assert!(!source_matches_peer(different_ip, peer));
     }
 }
