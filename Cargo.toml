@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/borderless-core",
+    "crates/borderless-net",
+    "crates/borderless-win",
+    "crates/borderless-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+bytes = "1"
+bincode = "1"
+crossbeam-channel = "0.5"
+eframe = "0.28"
+egui = "0.28"
+kcp-tokio = "0.7"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+windows = "0.58"
