@@ -113,6 +113,7 @@ async fn run_kcp_server(
                         continue;
                     }
                 };
+                pointer_session.begin_reliable_session();
                 emit(
                     &events,
                     ConnectionEvent::Connected {

@@ -85,6 +85,7 @@ pub async fn run_controller_client(
                     ConnectAttempt::Connected(transport) => {
                         match prepare_kcp_pointer_endpoint(&settings).await {
                             Ok(pointer_endpoint) => {
+                                pointer_session.begin_reliable_session();
                                 emit(
                                     &events,
                                     ConnectionEvent::Connected {

@@ -78,6 +78,13 @@ impl LatestPointerState {
         self.latest_sequence = packet.sequence;
         Some((packet.x, packet.y))
     }
+
+    fn retire_current_session(&mut self) {
+        if let Some(current_session_id) = self.current_session_id.take() {
+            self.retired_session_ids.insert(current_session_id);
+        }
+        self.latest_sequence = 0;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +105,12 @@ impl Default for LatestPointerSession {
 }
 
 impl LatestPointerSession {
+    pub(crate) fn begin_reliable_session(&mut self) {
+        self.outbound_session_id = Uuid::new_v4().as_u128();
+        self.next_sequence = 1;
+        self.inbound.retire_current_session();
+    }
+
     pub(crate) fn next_packet(&mut self, x: i32, y: i32) -> PointerPacket {
         let packet = PointerPacket {
             session_id: self.outbound_session_id,
@@ -327,5 +340,47 @@ mod tests {
         let post_reconnect = session.next_packet(51, 510);
         assert_eq!(post_reconnect.sequence, 51);
         assert_eq!(session.accept(post_reconnect), Some((51, 510)));
+    }
+
+    #[test]
+    fn reliable_reconnect_retires_current_inbound_session_before_new_udp_arrives() {
+        let mut session = LatestPointerSession::default();
+        let old_outbound = session.next_packet(1, 2);
+        assert_eq!(old_outbound.sequence, 1);
+
+        assert_eq!(
+            session.accept(PointerPacket {
+                session_id: 7,
+                sequence: 50,
+                x: 100,
+                y: 200,
+            }),
+            Some((100, 200))
+        );
+
+        session.begin_reliable_session();
+
+        let new_outbound = session.next_packet(3, 4);
+        assert_ne!(new_outbound.session_id, old_outbound.session_id);
+        assert_eq!(new_outbound.sequence, 1);
+
+        assert_eq!(
+            session.accept(PointerPacket {
+                session_id: 7,
+                sequence: 51,
+                x: 300,
+                y: 400,
+            }),
+            None
+        );
+        assert_eq!(
+            session.accept(PointerPacket {
+                session_id: 8,
+                sequence: 1,
+                x: 500,
+                y: 600,
+            }),
+            Some((500, 600))
+        );
     }
 }
