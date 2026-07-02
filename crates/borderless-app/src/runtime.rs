@@ -44,6 +44,7 @@ impl RuntimeHandle {
                     }
                     RuntimeCommand::Stop => {
                         status.run_state = RunState::Stopped;
+                        status.transport_mode = None;
                         send(&events_tx, RuntimeEvent::Log("runtime stopped".to_string()));
                     }
                     RuntimeCommand::Reconnect(config) => {
@@ -118,7 +119,8 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                RuntimeEvent::Status(status) if status.run_state == RunState::Stopped
+                RuntimeEvent::Status(status)
+                    if status.run_state == RunState::Stopped && status.transport_mode.is_none()
             )
         }));
 
