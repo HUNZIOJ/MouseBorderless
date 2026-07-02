@@ -1,1 +1,270 @@
+use anyhow::{anyhow, Context};
+use borderless_core::{
+    geometry::{Point, Rect},
+    input_event::{
+        InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseWheelEvent,
+        PressedState,
+    },
+};
+use windows::Win32::UI::{
+    Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    },
+    WindowsAndMessaging::{XBUTTON1, XBUTTON2},
+};
 
+pub struct InputInjector {
+    desktop: Rect,
+    pressed: PressedState,
+}
+
+impl InputInjector {
+    pub fn new(desktop: Rect) -> Self {
+        Self {
+            desktop,
+            pressed: PressedState::default(),
+        }
+    }
+
+    pub fn inject(&mut self, event: &InputEvent) -> anyhow::Result<()> {
+        let mut next_pressed = self.pressed.clone();
+        let inputs = build_inputs(event, &mut next_pressed, self.desktop);
+        send_inputs(&inputs).with_context(|| format!("send input event: {event:?}"))?;
+        self.pressed = next_pressed;
+        Ok(())
+    }
+
+    pub fn release_all(&mut self) -> anyhow::Result<()> {
+        let mut next_pressed = self.pressed.clone();
+        let inputs = build_inputs(&InputEvent::ReleaseAll, &mut next_pressed, self.desktop);
+        send_inputs(&inputs).context("release all pressed input")?;
+        self.pressed = next_pressed;
+        Ok(())
+    }
+}
+
+pub fn manual_move_check(desktop: Rect) -> anyhow::Result<()> {
+    let center = Point::new(
+        desktop.left.saturating_add(desktop.width / 2),
+        desktop.top.saturating_add(desktop.height / 2),
+    );
+    let mut injector = InputInjector::new(desktop);
+    injector.inject(&InputEvent::MouseMoveAbs(MouseMoveAbsEvent {
+        x: center.x,
+        y: center.y,
+    }))
+}
+
+fn build_inputs(event: &InputEvent, pressed: &mut PressedState, desktop: Rect) -> Vec<INPUT> {
+    match event {
+        InputEvent::Key(event) => {
+            pressed.apply(&InputEvent::Key(*event));
+            vec![key_input(event)]
+        }
+        InputEvent::MouseButton(event) => {
+            pressed.apply(&InputEvent::MouseButton(*event));
+            vec![mouse_button_input(event)]
+        }
+        InputEvent::MouseMoveAbs(event) => {
+            let (x, y) = normalize(Point::new(event.x, event.y), desktop);
+            vec![mouse_input(
+                x,
+                y,
+                0,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            )]
+        }
+        InputEvent::MouseWheel(event) => vec![mouse_wheel_input(event)],
+        InputEvent::MouseMoveDelta(_) => Vec::new(),
+        InputEvent::ReleaseAll => {
+            let mut inputs = Vec::with_capacity(pressed.keys.len() + pressed.mouse_buttons.len());
+            inputs.extend(pressed.keys.iter().copied().map(|vk_code| {
+                key_input(&KeyEvent {
+                    vk_code,
+                    pressed: false,
+                })
+            }));
+            inputs.extend(pressed.mouse_buttons.iter().copied().map(|button| {
+                mouse_button_input(&MouseButtonEvent {
+                    button,
+                    pressed: false,
+                })
+            }));
+            pressed.clear();
+            inputs
+        }
+    }
+}
+
+fn send_inputs(inputs: &[INPUT]) -> anyhow::Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize == inputs.len() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "SendInput sent {sent} of {} input events",
+            inputs.len()
+        ))
+    }
+}
+
+fn normalize(point: Point, desktop: Rect) -> (i32, i32) {
+    (
+        normalize_axis(point.x, desktop.left, desktop.width),
+        normalize_axis(point.y, desktop.top, desktop.height),
+    )
+}
+
+fn normalize_axis(value: i32, start: i32, len: i32) -> i32 {
+    if len <= 1 {
+        return 0;
+    }
+
+    let max_offset = i64::from(len - 1);
+    let offset = (i64::from(value) - i64::from(start)).clamp(0, max_offset);
+    ((offset * 65_535) / max_offset) as i32
+}
+
+fn key_input(event: &KeyEvent) -> INPUT {
+    let flags = if event.pressed {
+        KEYBD_EVENT_FLAGS(0)
+    } else {
+        KEYEVENTF_KEYUP
+    };
+
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(event.vk_code),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn mouse_button_input(event: &MouseButtonEvent) -> INPUT {
+    let (flags, mouse_data) = match (event.button, event.pressed) {
+        (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+        (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+        (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+        (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+        (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, u32::from(XBUTTON1)),
+        (MouseButton::X1, false) => (MOUSEEVENTF_XUP, u32::from(XBUTTON1)),
+        (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, u32::from(XBUTTON2)),
+        (MouseButton::X2, false) => (MOUSEEVENTF_XUP, u32::from(XBUTTON2)),
+    };
+
+    mouse_input(0, 0, mouse_data, flags)
+}
+
+fn mouse_wheel_input(event: &MouseWheelEvent) -> INPUT {
+    let flags = if event.horizontal {
+        MOUSEEVENTF_HWHEEL
+    } else {
+        MOUSEEVENTF_WHEEL
+    };
+
+    mouse_input(0, 0, event.delta as u32, flags)
+}
+
+fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: mouse_data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borderless_core::input_event::{
+        InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveDeltaEvent,
+    };
+
+    #[test]
+    fn normalize_maps_desktop_endpoints_to_windows_absolute_range() {
+        let desktop = Rect::new(10, 20, 101, 201);
+
+        assert_eq!(normalize(Point::new(10, 20), desktop), (0, 0));
+        assert_eq!(normalize(Point::new(110, 220), desktop), (65_535, 65_535));
+    }
+
+    #[test]
+    fn normalize_clamps_points_outside_desktop() {
+        let desktop = Rect::new(10, 20, 101, 201);
+
+        assert_eq!(normalize(Point::new(-500, 10_000), desktop), (0, 65_535));
+    }
+
+    #[test]
+    fn build_inputs_tracks_pressed_state_and_mouse_delta_is_noop() {
+        let desktop = Rect::new(0, 0, 1920, 1080);
+        let mut pressed = PressedState::default();
+
+        let key_down = build_inputs(
+            &InputEvent::Key(KeyEvent {
+                vk_code: 0x41,
+                pressed: true,
+            }),
+            &mut pressed,
+            desktop,
+        );
+        let button_down = build_inputs(
+            &InputEvent::MouseButton(MouseButtonEvent {
+                button: MouseButton::Left,
+                pressed: true,
+            }),
+            &mut pressed,
+            desktop,
+        );
+        let delta = build_inputs(
+            &InputEvent::MouseMoveDelta(MouseMoveDeltaEvent { dx: 10, dy: -5 }),
+            &mut pressed,
+            desktop,
+        );
+
+        assert_eq!(key_down.len(), 1);
+        assert_eq!(button_down.len(), 1);
+        assert!(delta.is_empty());
+        assert!(pressed.keys.contains(&0x41));
+        assert!(pressed.mouse_buttons.contains(&MouseButton::Left));
+    }
+
+    #[test]
+    fn build_inputs_releases_all_pressed_state() {
+        let desktop = Rect::new(0, 0, 1920, 1080);
+        let mut pressed = PressedState::default();
+        pressed.keys.insert(0x41);
+        pressed.keys.insert(0x42);
+        pressed.mouse_buttons.insert(MouseButton::Left);
+        pressed.mouse_buttons.insert(MouseButton::X2);
+
+        let releases = build_inputs(&InputEvent::ReleaseAll, &mut pressed, desktop);
+
+        assert_eq!(releases.len(), 4);
+        assert!(pressed.is_empty());
+    }
+}
