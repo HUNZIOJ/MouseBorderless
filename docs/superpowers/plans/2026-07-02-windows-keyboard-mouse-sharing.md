@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a complete first-version Windows-to-Windows LAN keyboard and mouse sharing app with GUI configuration, edge switching in four directions, configurable TCP/KCP low-latency transport, Windows input capture/injection, diagnostics, and release packaging.
+**Goal:** Build a complete first-version Windows-to-Windows LAN sharing app with GUI configuration, edge switching in four directions, configurable TCP/KCP low-latency transport, keyboard/mouse sharing, clipboard sync, cross-machine copy/paste, real file drag/drop, diagnostics, and release packaging.
 
-**Architecture:** The project is a Rust workspace with separate crates for platform-independent domain logic, networking, Windows input integration, and the GUI app. The GUI configures and monitors the system; input capture, network send/receive, control state, and input injection run outside the GUI hot path.
+**Architecture:** The project is a Rust workspace with separate crates for platform-independent domain logic, networking, Windows integration, and the GUI app. Keyboard/mouse events stay on the low-latency path. Clipboard metadata uses the reliable control path, file contents use a separate bulk TCP path, and Windows Shell/OLE drag/drop is isolated from the input hook path.
 
-**Tech Stack:** Rust stable MSVC toolchain, `egui`/`eframe`, `tokio`, `kcp-tokio`, `windows`, `serde`, `toml`, `tracing`, `bytes`, `crossbeam-channel`.
+**Tech Stack:** Rust stable MSVC toolchain, `egui`/`eframe`, `tokio`, `kcp-tokio`, `windows`, `serde`, `toml`, `tracing`, `bytes`, `crossbeam-channel`, `blake3`, `uuid`, `walkdir`.
 
 ---
 
@@ -40,6 +40,12 @@ All paths are relative to `C:\Users\oujie\Desktop\Borderless`.
   - Binary wire protocol and framing.
 - `crates/borderless-core/src/control.rs`
   - Controller state machine for local/remote control and edge return.
+- `crates/borderless-core/src/clipboard.rs`
+  - Clipboard payload types, change IDs, format policy, loop suppression metadata.
+- `crates/borderless-core/src/file_transfer.rs`
+  - File manifests, transfer IDs, chunk metadata, progress and conflict naming policy.
+- `crates/borderless-core/src/drag_drop.rs`
+  - Cross-machine drag/drop session state.
 - `crates/borderless-net/Cargo.toml`
   - Transport crate for TCP, KCP, and UDP latest-pointer delivery.
 - `crates/borderless-net/src/lib.rs`
@@ -52,6 +58,8 @@ All paths are relative to `C:\Users\oujie\Desktop\Borderless`.
   - KCP reliable transport over UDP for low-latency mode.
 - `crates/borderless-net/src/latest_pointer.rs`
   - UDP latest-pointer channel with sequence discard for stale mouse moves.
+- `crates/borderless-net/src/bulk_transfer.rs`
+  - TCP bulk file transfer with chunking, progress, cancellation, retry, and BLAKE3 checks.
 - `crates/borderless-net/src/controller_client.rs`
   - Controller-side connection loop.
 - `crates/borderless-net/src/agent_server.rs`
@@ -64,6 +72,10 @@ All paths are relative to `C:\Users\oujie\Desktop\Borderless`.
   - DPI awareness setup.
 - `crates/borderless-win/src/monitor.rs`
   - Virtual desktop discovery.
+- `crates/borderless-win/src/clipboard.rs`
+  - Windows clipboard listener and read/write implementation.
+- `crates/borderless-win/src/drag_drop.rs`
+  - Windows Shell/OLE edge drop target and remote drag source.
 - `crates/borderless-win/src/inject.rs`
   - `SendInput` injection and pressed-state release.
 - `crates/borderless-win/src/hooks.rs`
@@ -193,6 +205,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+blake3 = "1"
 bytes = "1"
 bincode = "1"
 crossbeam-channel = "0.5"
@@ -206,6 +219,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
 windows = "0.58"
 ```
 
@@ -222,10 +237,13 @@ license.workspace = true
 
 [dependencies]
 bincode.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
 ```
 
 Write `crates/borderless-net/Cargo.toml`:
@@ -239,11 +257,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 borderless-core = { path = "../borderless-core" }
 bytes.workspace = true
 kcp-tokio.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 ```
 
 Write `crates/borderless-win/Cargo.toml`:
@@ -260,12 +280,17 @@ anyhow.workspace = true
 borderless-core = { path = "../borderless-core" }
 crossbeam-channel.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 windows = { workspace = true, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 ```
@@ -302,8 +327,11 @@ tracing-subscriber.workspace = true
 Write `crates/borderless-core/src/lib.rs`:
 
 ```rust
+pub mod clipboard;
 pub mod config;
 pub mod control;
+pub mod drag_drop;
+pub mod file_transfer;
 pub mod geometry;
 pub mod input_event;
 pub mod protocol;
@@ -313,6 +341,7 @@ Write `crates/borderless-net/src/lib.rs`:
 
 ```rust
 pub mod agent_server;
+pub mod bulk_transfer;
 pub mod controller_client;
 pub mod kcp_transport;
 pub mod latest_pointer;
@@ -323,7 +352,9 @@ pub mod transport;
 Write `crates/borderless-win/src/lib.rs`:
 
 ```rust
+pub mod clipboard;
 pub mod dpi;
+pub mod drag_drop;
 pub mod hooks;
 pub mod inject;
 pub mod monitor;
@@ -354,16 +385,22 @@ Create:
 ```text
 crates/borderless-core/src/config.rs
 crates/borderless-core/src/control.rs
+crates/borderless-core/src/clipboard.rs
+crates/borderless-core/src/drag_drop.rs
+crates/borderless-core/src/file_transfer.rs
 crates/borderless-core/src/geometry.rs
 crates/borderless-core/src/input_event.rs
 crates/borderless-core/src/protocol.rs
 crates/borderless-net/src/agent_server.rs
+crates/borderless-net/src/bulk_transfer.rs
 crates/borderless-net/src/controller_client.rs
 crates/borderless-net/src/kcp_transport.rs
 crates/borderless-net/src/latest_pointer.rs
 crates/borderless-net/src/tcp_transport.rs
 crates/borderless-net/src/transport.rs
 crates/borderless-win/src/dpi.rs
+crates/borderless-win/src/clipboard.rs
+crates/borderless-win/src/drag_drop.rs
 crates/borderless-win/src/hooks.rs
 crates/borderless-win/src/inject.rs
 crates/borderless-win/src/monitor.rs
@@ -622,6 +659,9 @@ mod tests {
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
         assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
         assert_eq!(decoded.controller.pointer_port, 24801);
+        assert!(decoded.sharing.clipboard_text);
+        assert!(decoded.sharing.file_copy_paste);
+        assert!(decoded.sharing.real_file_drag_drop);
     }
 }
 ```
@@ -685,12 +725,26 @@ pub struct AgentConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharingConfig {
+    pub clipboard_text: bool,
+    pub clipboard_html: bool,
+    pub clipboard_images: bool,
+    pub file_copy_paste: bool,
+    pub real_file_drag_drop: bool,
+    pub max_clipboard_bytes: u64,
+    pub max_file_transfer_bytes: u64,
+    pub bulk_transfer_port: u16,
+    pub incoming_cache_dir: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub role: Role,
     pub edge_trigger_px: i32,
     pub debug_logging: bool,
     pub controller: ControllerConfig,
     pub agent: AgentConfig,
+    pub sharing: SharingConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -731,6 +785,17 @@ impl Default for AppConfig {
                 transport_mode: TransportMode::Tcp,
                 pointer_port: 24801,
             },
+            sharing: SharingConfig {
+                clipboard_text: true,
+                clipboard_html: true,
+                clipboard_images: true,
+                file_copy_paste: true,
+                real_file_drag_drop: true,
+                max_clipboard_bytes: 32 * 1024 * 1024,
+                max_file_transfer_bytes: 20 * 1024 * 1024 * 1024,
+                bulk_transfer_port: 24802,
+                incoming_cache_dir: "%LOCALAPPDATA%\\Borderless\\Incoming".to_string(),
+            },
         }
     }
 }
@@ -755,6 +820,22 @@ impl AppConfig {
 
         if self.agent.pointer_port == 0 {
             return Err(ConfigError::new("agent.pointer_port must be greater than 0"));
+        }
+
+        if self.sharing.bulk_transfer_port == 0 {
+            return Err(ConfigError::new("sharing.bulk_transfer_port must be greater than 0"));
+        }
+
+        if self.sharing.max_clipboard_bytes == 0 {
+            return Err(ConfigError::new("sharing.max_clipboard_bytes must be greater than 0"));
+        }
+
+        if self.sharing.max_file_transfer_bytes == 0 {
+            return Err(ConfigError::new("sharing.max_file_transfer_bytes must be greater than 0"));
+        }
+
+        if self.sharing.incoming_cache_dir.trim().is_empty() {
+            return Err(ConfigError::new("sharing.incoming_cache_dir must not be empty"));
         }
 
         if self.controller.agent_host.trim().is_empty() {
@@ -810,6 +891,9 @@ mod tests {
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
         assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
         assert_eq!(decoded.controller.pointer_port, 24801);
+        assert!(decoded.sharing.clipboard_text);
+        assert!(decoded.sharing.file_copy_paste);
+        assert!(decoded.sharing.real_file_drag_drop);
     }
 }
 ```
@@ -835,6 +919,17 @@ listen_host = "0.0.0.0"
 listen_port = 24800
 transport_mode = "tcp"
 pointer_port = 24801
+
+[sharing]
+clipboard_text = true
+clipboard_html = true
+clipboard_images = true
+file_copy_paste = true
+real_file_drag_drop = true
+max_clipboard_bytes = 33554432
+max_file_transfer_bytes = 21474836480
+bulk_transfer_port = 24802
+incoming_cache_dir = "%LOCALAPPDATA%\\Borderless\\Incoming"
 ```
 
 - [ ] **Step 5: Verify config tests pass**
@@ -2161,6 +2256,22 @@ impl eframe::App for BorderlessApp {
                 ui.label("KCP mode uses UDP for reliable events and a separate UDP port for latest mouse position.");
             }
 
+            ui.group(|ui| {
+                ui.label("Clipboard and files");
+                ui.checkbox(&mut self.config.sharing.clipboard_text, "Clipboard text");
+                ui.checkbox(&mut self.config.sharing.clipboard_html, "Clipboard HTML");
+                ui.checkbox(&mut self.config.sharing.clipboard_images, "Clipboard images");
+                ui.checkbox(&mut self.config.sharing.file_copy_paste, "Cross-machine file copy/paste");
+                ui.checkbox(&mut self.config.sharing.real_file_drag_drop, "Real file drag/drop");
+                ui.add(egui::DragValue::new(&mut self.config.sharing.bulk_transfer_port).range(1..=65535).prefix("Bulk TCP "));
+                ui.add(egui::DragValue::new(&mut self.config.sharing.max_clipboard_bytes).speed(1024.0).prefix("Max clipboard bytes "));
+                ui.add(egui::DragValue::new(&mut self.config.sharing.max_file_transfer_bytes).speed(1024.0 * 1024.0).prefix("Max file bytes "));
+                ui.horizontal(|ui| {
+                    ui.label("Incoming cache");
+                    ui.text_edit_singleline(&mut self.config.sharing.incoming_cache_dir);
+                });
+            });
+
             ui.separator();
             ui.label(format!("State: {:?}", self.status.run_state));
             ui.label(format!("Transport: {:?}", self.status.transport_mode));
@@ -2867,7 +2978,581 @@ git commit -m "feat: add disconnect recovery"
 
 ---
 
-### Task 18: Documentation and Two-Machine Acceptance Checklist
+### Task 18: Clipboard and File Sharing Domain Models
+
+**Files:**
+- Create: `crates/borderless-core/src/clipboard.rs`
+- Create: `crates/borderless-core/src/file_transfer.rs`
+- Create: `crates/borderless-core/src/drag_drop.rs`
+- Modify: `crates/borderless-core/src/protocol.rs`
+
+- [ ] **Step 1: Write clipboard payload tests**
+
+Add tests in `clipboard.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_clipboard_change_from_same_source_is_ignored() {
+        let source = uuid::Uuid::new_v4();
+        let change = ClipboardChangeId::new(source, 7);
+        let mut guard = ClipboardLoopGuard::default();
+        assert!(guard.accept(change));
+        assert!(!guard.accept(change));
+    }
+
+    #[test]
+    fn file_clipboard_offer_reports_total_size() {
+        let offer = ClipboardPayload::Files(RemoteFileOffer {
+            transfer_id: uuid::Uuid::new_v4(),
+            files: vec![
+                FileManifestEntry::file("a.txt", 10),
+                FileManifestEntry::file("dir/b.txt", 20),
+            ],
+        });
+        assert_eq!(offer.total_bytes(), 30);
+    }
+}
+```
+
+- [ ] **Step 2: Implement clipboard payload types**
+
+Write `clipboard.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use uuid::Uuid;
+
+use crate::file_transfer::FileManifestEntry;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClipboardChangeId {
+    pub source_device_id: Uuid,
+    pub sequence: u64,
+}
+
+impl ClipboardChangeId {
+    pub fn new(source_device_id: Uuid, sequence: u64) -> Self {
+        Self { source_device_id, sequence }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClipboardLoopGuard {
+    seen: BTreeSet<ClipboardChangeId>,
+}
+
+impl ClipboardLoopGuard {
+    pub fn accept(&mut self, change_id: ClipboardChangeId) -> bool {
+        self.seen.insert(change_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardPayload {
+    UnicodeText(String),
+    Html(String),
+    ImagePng(Vec<u8>),
+    ImageDib(Vec<u8>),
+    Files(RemoteFileOffer),
+}
+
+impl ClipboardPayload {
+    pub fn total_bytes(&self) -> u64 {
+        match self {
+            Self::UnicodeText(value) | Self::Html(value) => value.as_bytes().len() as u64,
+            Self::ImagePng(bytes) | Self::ImageDib(bytes) => bytes.len() as u64,
+            Self::Files(offer) => offer.files.iter().map(|file| file.size_bytes).sum(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteFileOffer {
+    pub transfer_id: Uuid,
+    pub files: Vec<FileManifestEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardEnvelope {
+    pub change_id: ClipboardChangeId,
+    pub payload: ClipboardPayload,
+}
+```
+
+- [ ] **Step 3: Implement file transfer manifest types**
+
+Write `file_transfer.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileManifestEntry {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub is_dir: bool,
+    pub blake3_hex: Option<String>,
+}
+
+impl FileManifestEntry {
+    pub fn file(relative_path: impl Into<String>, size_bytes: u64) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            size_bytes,
+            is_dir: false,
+            blake3_hex: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferManifest {
+    pub transfer_id: Uuid,
+    pub root_name: String,
+    pub files: Vec<FileManifestEntry>,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub transfer_id: Uuid,
+    pub relative_path: String,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub blake3_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTransferState {
+    Offered,
+    Transferring,
+    Completed,
+    Cancelled,
+    Failed,
+}
+```
+
+- [ ] **Step 4: Implement drag/drop session types**
+
+Write `drag_drop.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DragDropState {
+    LocalDragDetected,
+    TransferringFiles,
+    RemoteDragReady,
+    RemoteDragging,
+    Dropped,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragDropSession {
+    pub session_id: Uuid,
+    pub transfer_id: Uuid,
+    pub state: DragDropState,
+}
+```
+
+- [ ] **Step 5: Add clipboard/file/drag messages to protocol**
+
+Extend `WireMessage` in `protocol.rs`:
+
+```rust
+ClipboardOffer(crate::clipboard::ClipboardEnvelope),
+ClipboardData(crate::clipboard::ClipboardEnvelope),
+FileTransferOffer(crate::file_transfer::FileTransferManifest),
+FileTransferProgress { transfer_id: uuid::Uuid, bytes_done: u64, bytes_total: u64 },
+FileTransferComplete { transfer_id: uuid::Uuid, ok: bool },
+DragDropStart(crate::drag_drop::DragDropSession),
+DragDropCancel { session_id: uuid::Uuid },
+```
+
+Assign stable message type IDs after `Error`.
+
+- [ ] **Step 6: Run core tests**
+
+Run:
+
+```powershell
+cargo test -p borderless-core clipboard file_transfer drag_drop protocol
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+Run:
+
+```powershell
+git add crates/borderless-core/src
+git commit -m "feat: add clipboard file drag domain models"
+```
+
+---
+
+### Task 19: Windows Clipboard Synchronization
+
+**Files:**
+- Create: `crates/borderless-win/src/clipboard.rs`
+- Modify: `crates/borderless-app/src/runtime.rs`
+- Modify: `crates/borderless-app/src/status.rs`
+
+- [ ] **Step 1: Implement clipboard monitor API**
+
+Write `crates/borderless-win/src/clipboard.rs` with these public types:
+
+```rust
+use borderless_core::clipboard::{ClipboardEnvelope, ClipboardPayload};
+
+#[derive(Clone, Debug)]
+pub enum ClipboardEvent {
+    Changed(ClipboardEnvelope),
+    Ignored(String),
+    Error(String),
+}
+
+pub struct ClipboardMonitor;
+
+impl ClipboardMonitor {
+    pub fn start(sender: crossbeam_channel::Sender<ClipboardEvent>) -> anyhow::Result<Self>;
+    pub fn stop(self) -> anyhow::Result<()>;
+}
+
+pub fn read_current_clipboard(max_bytes: u64) -> anyhow::Result<Option<ClipboardPayload>>;
+pub fn write_clipboard(payload: &ClipboardPayload) -> anyhow::Result<()>;
+```
+
+Implementation requirements:
+
+- Use `AddClipboardFormatListener` and handle `WM_CLIPBOARDUPDATE`.
+- Read `CF_UNICODETEXT`.
+- Read registered `HTML Format`.
+- Read PNG if present via registered `PNG`, otherwise read `CF_DIB`.
+- Read `CF_HDROP` file lists for file copy/paste.
+- Write synced remote text, HTML, images, and file paths back to the local clipboard.
+- Record a local suppress window after writing remote data so the next clipboard update is not sent back.
+
+- [ ] **Step 2: Connect clipboard monitor to runtime**
+
+Runtime behavior:
+
+- Start `ClipboardMonitor` when `sharing.clipboard_text`, `clipboard_html`, `clipboard_images`, or `file_copy_paste` is enabled.
+- Convert local clipboard changes into `WireMessage::ClipboardOffer`.
+- Receive `ClipboardData` and write it with `write_clipboard`.
+- Enforce `max_clipboard_bytes` before sending.
+- Push GUI status for synced format, bytes, ignored reason, and errors.
+
+- [ ] **Step 3: Add clipboard status fields**
+
+Extend `AppStatus`:
+
+```rust
+pub clipboard_enabled: bool,
+pub last_clipboard_format: Option<String>,
+pub last_clipboard_bytes: Option<u64>,
+pub clipboard_ignored_reason: Option<String>,
+```
+
+- [ ] **Step 4: Run checks**
+
+Run:
+
+```powershell
+cargo check -p borderless-win
+cargo check -p borderless-app
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Manual clipboard check**
+
+With two app instances connected:
+
+- Copy text on controller, paste on agent.
+- Copy formatted HTML from a browser or editor, paste on agent into a rich text target.
+- Copy an image, paste on agent into Paint.
+- Confirm GUI logs show format and byte count.
+
+- [ ] **Step 6: Commit**
+
+Run:
+
+```powershell
+git add crates/borderless-win/src/clipboard.rs crates/borderless-app/src/runtime.rs crates/borderless-app/src/status.rs
+git commit -m "feat: add windows clipboard sync"
+```
+
+---
+
+### Task 20: Bulk File Transfer Channel
+
+**Files:**
+- Create: `crates/borderless-net/src/bulk_transfer.rs`
+- Modify: `crates/borderless-app/src/runtime.rs`
+
+- [ ] **Step 1: Write file transfer manifest tests**
+
+Add tests in `bulk_transfer.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_names_are_renamed_without_overwrite() {
+        assert_eq!(rename_conflict("report.txt", 1), "report (Borderless 1).txt");
+        assert_eq!(rename_conflict("archive", 2), "archive (Borderless 2)");
+    }
+}
+```
+
+- [ ] **Step 2: Implement bulk transfer API**
+
+Write `bulk_transfer.rs` public API:
+
+```rust
+use borderless_core::file_transfer::{FileTransferManifest, FileTransferState};
+use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+pub enum BulkTransferEvent {
+    Offered(FileTransferManifest),
+    Progress { transfer_id: Uuid, bytes_done: u64, bytes_total: u64 },
+    Completed { transfer_id: Uuid, cache_paths: Vec<String> },
+    Cancelled(Uuid),
+    Failed { transfer_id: Uuid, error: String },
+}
+
+#[derive(Clone, Debug)]
+pub enum BulkTransferCommand {
+    SendManifest(FileTransferManifest),
+    SendFiles { manifest: FileTransferManifest, source_paths: Vec<String> },
+    Cancel(Uuid),
+    Stop,
+}
+
+pub fn rename_conflict(name: &str, index: u32) -> String;
+
+pub async fn run_bulk_transfer_server(
+    listen_host: String,
+    port: u16,
+    incoming_cache_dir: String,
+    events: tokio::sync::mpsc::UnboundedSender<BulkTransferEvent>,
+    commands: tokio::sync::mpsc::UnboundedReceiver<BulkTransferCommand>,
+) -> anyhow::Result<()>;
+
+pub async fn run_bulk_transfer_client(
+    host: String,
+    port: u16,
+    incoming_cache_dir: String,
+    events: tokio::sync::mpsc::UnboundedSender<BulkTransferEvent>,
+    commands: tokio::sync::mpsc::UnboundedReceiver<BulkTransferCommand>,
+) -> anyhow::Result<()>;
+```
+
+Implementation requirements:
+
+- Use a separate TCP listener and client.
+- Expand directories with `walkdir`.
+- Send files in 1 MiB chunks.
+- Compute per-chunk `blake3` and final per-file `blake3`.
+- Write to `*.borderless-part` temporary files, then atomically rename after final checksum.
+- Support cancel by transfer ID.
+- Support retry by re-sending a manifest and missing files.
+- Never overwrite existing user files; use `rename_conflict`.
+
+- [ ] **Step 3: Integrate bulk channel into runtime**
+
+Runtime behavior:
+
+- Start bulk server on `sharing.bulk_transfer_port`.
+- Start bulk client against peer bulk port.
+- Convert progress events into GUI status.
+- Keep bulk transfer independent from keyboard/mouse transport.
+
+- [ ] **Step 4: Run tests**
+
+Run:
+
+```powershell
+cargo test -p borderless-net bulk_transfer
+cargo check -p borderless-app
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+Run:
+
+```powershell
+git add crates/borderless-net/src/bulk_transfer.rs crates/borderless-app/src/runtime.rs
+git commit -m "feat: add bulk file transfer channel"
+```
+
+---
+
+### Task 21: Cross-Machine Copy and Paste
+
+**Files:**
+- Modify: `crates/borderless-win/src/clipboard.rs`
+- Modify: `crates/borderless-app/src/runtime.rs`
+- Modify: `crates/borderless-app/src/app.rs`
+- Modify: `crates/borderless-app/src/status.rs`
+
+- [ ] **Step 1: Implement CF_HDROP file copy detection**
+
+In `clipboard.rs`, when `CF_HDROP` is available:
+
+- Extract copied file and directory paths.
+- Build a `FileTransferManifest`.
+- Send `ClipboardPayload::Files(RemoteFileOffer { transfer_id, files })`.
+- Respect `sharing.max_file_transfer_bytes`.
+
+- [ ] **Step 2: Transfer copied files to remote cache**
+
+Runtime behavior:
+
+- On local `ClipboardPayload::Files`, start `BulkTransferCommand::SendFiles`.
+- On remote transfer completion, write local cache paths to clipboard as `CF_HDROP`.
+- Push GUI status `Remote files ready to paste`.
+
+- [ ] **Step 3: Add GUI file copy/paste controls**
+
+In `app.rs`, add:
+
+- Checkbox for `file_copy_paste`.
+- Numeric control for `max_file_transfer_bytes`.
+- Text input for `incoming_cache_dir`.
+- Transfer progress row with bytes done, bytes total, current file, Cancel button.
+
+- [ ] **Step 4: Manual copy/paste check**
+
+With two Windows machines connected:
+
+- Copy one file on controller, paste in agent Explorer.
+- Copy a folder on controller, paste in agent Explorer and verify relative layout.
+- Copy multiple files, paste in agent Explorer.
+- Copy a file larger than the configured limit and verify GUI refuses it with a clear message.
+
+- [ ] **Step 5: Commit**
+
+Run:
+
+```powershell
+git add crates/borderless-win/src/clipboard.rs crates/borderless-app/src/runtime.rs crates/borderless-app/src/app.rs crates/borderless-app/src/status.rs
+git commit -m "feat: add cross machine file paste"
+```
+
+---
+
+### Task 22: Real File Drag and Drop Across the Screen Edge
+
+**Files:**
+- Create: `crates/borderless-win/src/drag_drop.rs`
+- Modify: `crates/borderless-app/src/runtime.rs`
+- Modify: `crates/borderless-app/src/app.rs`
+- Modify: `crates/borderless-app/src/status.rs`
+
+- [ ] **Step 1: Define drag/drop Windows API boundary**
+
+Write `drag_drop.rs` public API:
+
+```rust
+use borderless_core::drag_drop::DragDropSession;
+
+#[derive(Clone, Debug)]
+pub enum DragDropEvent {
+    LocalFileDragEntered { session: DragDropSession, paths: Vec<String> },
+    LocalDragCancelled { session_id: uuid::Uuid },
+    RemoteDropStarted { session_id: uuid::Uuid },
+    RemoteDropFinished { session_id: uuid::Uuid },
+    Error { session_id: Option<uuid::Uuid>, message: String },
+}
+
+pub struct EdgeDropTarget;
+
+impl EdgeDropTarget {
+    pub fn install(edge: borderless_core::geometry::Edge, sender: crossbeam_channel::Sender<DragDropEvent>) -> anyhow::Result<Self>;
+    pub fn uninstall(self) -> anyhow::Result<()>;
+}
+
+pub fn start_remote_file_drag(cache_paths: Vec<String>, sender: crossbeam_channel::Sender<DragDropEvent>) -> anyhow::Result<()>;
+```
+
+Implementation requirements:
+
+- Initialize COM with apartment threading on the drag/drop thread.
+- Create a transparent edge window on the configured transition edge.
+- Register it as an OLE `IDropTarget`.
+- Accept only `CF_HDROP` file drags.
+- Extract file paths on `DragEnter` and create a `DragDropSession`.
+- On the agent, create an OLE data object with `CF_HDROP` cache paths.
+- Start remote `DoDragDrop` from a hidden drag source so the user can drop into Explorer or standard file-drop targets.
+- Cancel the session cleanly if the user presses Escape, releases before remote files are ready, disconnects, or stops the runtime.
+
+- [ ] **Step 2: Integrate drag handoff with file transfer**
+
+Runtime behavior:
+
+- Start `EdgeDropTarget` when `sharing.real_file_drag_drop` is true.
+- On `LocalFileDragEntered`, send `DragDropStart` and start bulk file transfer.
+- When remote cache files are ready, call `start_remote_file_drag`.
+- Send `DragDropCancel` if transfer, input, or network state cancels.
+- Keep keyboard/mouse suppression consistent during drag handoff.
+
+- [ ] **Step 3: Add GUI drag/drop state**
+
+In `AppStatus`, add:
+
+```rust
+pub drag_drop_enabled: bool,
+pub active_drag_session: Option<uuid::Uuid>,
+pub drag_drop_state: Option<String>,
+```
+
+In `app.rs`, add:
+
+- Checkbox for `real_file_drag_drop`.
+- Current drag session label.
+- Drag transfer progress.
+- Cancel drag button.
+
+- [ ] **Step 4: Manual drag/drop check**
+
+With two Windows machines connected:
+
+- Drag one file from controller Explorer across the configured edge and drop into agent Explorer.
+- Drag a folder and verify folder contents arrive.
+- Drag multiple files into a remote app that accepts file drops.
+- Cancel a drag before transfer completes and verify both GUIs return to normal.
+- Disconnect during drag and verify partial files remain in temporary names only.
+
+- [ ] **Step 5: Commit**
+
+Run:
+
+```powershell
+git add crates/borderless-win/src/drag_drop.rs crates/borderless-app/src/runtime.rs crates/borderless-app/src/app.rs crates/borderless-app/src/status.rs
+git commit -m "feat: add cross machine file drag drop"
+```
+
+---
+
+### Task 23: Documentation and Two-Machine Acceptance Checklist
 
 **Files:**
 - Modify: `README.md`
@@ -2880,7 +3565,7 @@ Create `README.md` with:
 ```markdown
 # Borderless
 
-Borderless shares one keyboard and mouse between two Windows computers on the same LAN.
+Borderless shares one keyboard, mouse, clipboard, copied files, and file drag/drop workflows between two Windows computers on the same LAN.
 
 ## Requirements
 
@@ -2890,6 +3575,7 @@ Borderless shares one keyboard and mouse between two Windows computers on the sa
 - Same privilege level on both computers when controlling elevated windows
 - TCP mode requires the agent listen port.
 - KCP mode requires the reliable UDP port and the pointer UDP port.
+- File copy/paste and drag/drop require the bulk transfer TCP port.
 
 ## Run
 
@@ -2904,8 +3590,10 @@ cargo run -p borderless-app
 3. Choose transport mode: `TCP` for stable default behavior, `KCP` for low-latency UDP behavior.
 4. If using KCP, confirm the pointer UDP port.
 5. Choose the agent position: left, right, top, or bottom.
-6. Click `Save`.
-7. Click `Start`.
+6. Enable clipboard text, HTML, image sync, file copy/paste, and real file drag/drop as needed.
+7. Confirm bulk transfer port, incoming cache folder, and transfer limits.
+8. Click `Save`.
+9. Click `Start`.
 
 ## Agent Setup
 
@@ -2914,12 +3602,21 @@ cargo run -p borderless-app
 3. Set listen port to match the controller.
 4. Choose the same transport mode as the controller.
 5. If using KCP, confirm the pointer UDP port.
-6. Click `Save`.
-7. Click `Start`.
+6. Enable matching clipboard and file sharing options.
+7. Confirm bulk transfer port and incoming cache folder.
+8. Click `Save`.
+9. Click `Start`.
 
 ## Firewall
 
-Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port.
+Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port. For file copy/paste and drag/drop, allow the bulk transfer TCP port.
+
+## Clipboard and Files
+
+- Text, HTML, and image clipboard sync can be toggled separately.
+- Copied files and folders are transferred to the peer cache folder, then written to the peer clipboard as local paths.
+- Real file drag/drop uses a screen-edge handoff and then starts a remote file drag with cached files.
+- Large transfer progress, cancellation, and errors appear in the GUI.
 
 ## Permissions
 
@@ -2972,14 +3669,42 @@ Create `tests/manual/windows-two-machine-checklist.md` with:
 - [ ] Key repeat does not get stuck.
 - [ ] Pressed keys release after Stop.
 
+## Clipboard
+
+- [ ] Unicode text syncs controller to agent.
+- [ ] Unicode text syncs agent to controller.
+- [ ] HTML formatting syncs into a rich text target.
+- [ ] Image clipboard syncs into Paint.
+- [ ] Clipboard loop prevention avoids repeated re-sync events.
+- [ ] Oversized clipboard content is refused with a clear GUI reason.
+
+## Cross-Machine Copy/Paste
+
+- [ ] Single copied file pastes into remote Explorer.
+- [ ] Multiple copied files paste into remote Explorer.
+- [ ] Copied folder pastes with relative structure preserved.
+- [ ] File name conflict creates a renamed file instead of overwriting.
+- [ ] Transfer progress appears in GUI.
+- [ ] Cancel leaves only temporary partial files.
+
+## Real File Drag/Drop
+
+- [ ] Single file dragged across the configured edge drops into remote Explorer.
+- [ ] Folder dragged across the configured edge drops with contents preserved.
+- [ ] Multiple files dragged across the edge drop into a remote file-drop target.
+- [ ] Drag cancel returns both GUIs and input state to normal.
+- [ ] Disconnect during drag cleans session state and leaves partial files temporary.
+
 ## Recovery
 
 - [ ] Stop restores local controller input.
 - [ ] Agent disconnect releases pressed state.
 - [ ] Controller reconnects after agent restarts.
 - [ ] KCP mode recovers after agent restart and reopens the pointer UDP channel.
+- [ ] Bulk transfer reconnects or fails clearly after agent restart.
 - [ ] GUI logs explain permission errors.
 - [ ] GUI logs explain likely firewall issues when KCP UDP ports are blocked.
+- [ ] GUI logs explain likely firewall issues when the bulk transfer port is blocked.
 ```
 
 - [ ] **Step 3: Commit**
@@ -2993,7 +3718,7 @@ git commit -m "docs: add usage and acceptance checklist"
 
 ---
 
-### Task 19: Release Build and Portable Package
+### Task 24: Release Build and Portable Package
 
 **Files:**
 - Modify: `README.md`
@@ -3053,7 +3778,7 @@ git commit -m "docs: add release packaging instructions"
 
 ---
 
-### Task 20: Final Verification
+### Task 25: Final Verification
 
 **Files:**
 - No source changes expected unless verification reveals a concrete defect.
@@ -3084,6 +3809,8 @@ Expected:
 - Main window opens.
 - Config can be changed and saved.
 - Start, Stop, and Reconnect change status.
+- Clipboard and file sharing controls are visible and persist to `config.toml`.
+- Transfer progress and drag/drop session state render without resizing the whole window.
 - No panic appears in terminal or log file.
 
 - [ ] **Step 3: Run real two-machine acceptance**
@@ -3102,6 +3829,9 @@ Update the final delivery message with:
 - Latest commit hash.
 - Automated verification results.
 - Manual two-machine checklist result.
+- Clipboard sync result.
+- Cross-machine copy/paste result.
+- Real file drag/drop result.
 - Known product limitations from the spec.
 
 ---
@@ -3112,15 +3842,19 @@ Spec coverage:
 
 - GUI configuration and state display: covered by Tasks 9, 10, 15.
 - Windows-to-Windows input capture and injection: covered by Tasks 11, 12, 13, 14, 16.
-- Four-direction edge switching and coordinate mapping: covered by Tasks 5, 6, 16, 18.
+- Four-direction edge switching and coordinate mapping: covered by Tasks 5, 6, 16, 23, 25.
 - TCP, KCP, UDP latest-pointer communication, heartbeat, reconnect: covered by Tasks 7, 8, 14, 17.
 - Low-latency hot path separation from GUI: covered by Tasks 8, 14, 16.
 - Error handling and release-all safety: covered by Tasks 12, 14, 17.
-- Testing and manual validation: covered by Tasks 3-8, 16-18, 20.
-- Portable release package: covered by Task 19.
+- Clipboard sync: covered by Tasks 18, 19, 23, 25.
+- Bulk file transfer: covered by Tasks 18, 20, 21, 23, 25.
+- Cross-machine copy/paste: covered by Tasks 19, 20, 21, 23, 25.
+- Real file drag/drop: covered by Tasks 18, 20, 22, 23, 25.
+- Testing and manual validation: covered by Tasks 3-8, 16-23, 25.
+- Portable release package: covered by Task 24.
 
 Type consistency:
 
-- `Role`, `RemotePosition`, `AppConfig`, `Rect`, `Point`, `InputEvent`, `WireMessage`, `ControlState`, `InputInjector`, `HookManager`, and `RuntimeHandle` are introduced before use.
+- `Role`, `RemotePosition`, `AppConfig`, `SharingConfig`, `Rect`, `Point`, `InputEvent`, `WireMessage`, `ControlState`, `ClipboardPayload`, `FileTransferManifest`, `DragDropSession`, `InputInjector`, `HookManager`, and `RuntimeHandle` are introduced before use.
 - Runtime command/event types are defined in `borderless-app/src/runtime.rs` before GUI integration.
 - Networking event/command types are defined before runtime orchestration consumes them.
