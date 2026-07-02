@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use borderless_core::input_event::{
     InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseWheelEvent,
 };
@@ -9,20 +9,20 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread,
+    thread::{self, JoinHandle},
 };
 use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-            UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-            WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-            XBUTTON1, XBUTTON2,
+            CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
+            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
     },
 };
@@ -41,6 +41,7 @@ pub enum SuppressionMode {
 
 pub struct HookManager {
     mode: Arc<AtomicBool>,
+    stop: Option<HookThreadHandle>,
 }
 
 impl HookManager {
@@ -49,7 +50,7 @@ impl HookManager {
         let hook_mode = Arc::clone(&mode);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        thread::Builder::new()
+        let join = thread::Builder::new()
             .name("borderless-input-hooks".to_owned())
             .spawn(move || {
                 if let Err(error) = run_hook_thread(sender, hook_mode, ready_tx) {
@@ -58,11 +59,26 @@ impl HookManager {
             })
             .context("spawn input hook thread")?;
 
-        ready_rx
-            .recv()
-            .context("input hook thread exited before reporting hook installation")??;
+        let ready = match ready_rx.recv() {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = join.join();
+                return Err(error)
+                    .context("input hook thread exited before reporting hook installation");
+            }
+        };
+        let thread_id = match ready {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                let _ = join.join();
+                return Err(error);
+            }
+        };
 
-        Ok(Self { mode })
+        Ok(Self {
+            mode,
+            stop: Some(HookThreadHandle::new(thread_id, join)),
+        })
     }
 
     pub fn set_suppression_mode(&self, mode: SuppressionMode) {
@@ -73,16 +89,107 @@ impl HookManager {
 impl Drop for HookManager {
     fn drop(&mut self) {
         self.set_suppression_mode(SuppressionMode::PassThrough);
+        if let Some(stop) = self.stop.take() {
+            if let Err(error) = stop.stop_and_join() {
+                tracing::warn!(?error, "failed to stop input hook thread");
+            }
+        }
+    }
+}
+
+struct HookThreadHandle {
+    thread_id: u32,
+    join: Option<JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
+    post_quit: fn(u32) -> anyhow::Result<()>,
+}
+
+impl HookThreadHandle {
+    fn new(thread_id: u32, join: JoinHandle<()>) -> Self {
+        Self {
+            thread_id,
+            join: Some(join),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            post_quit: post_thread_quit_message,
+        }
+    }
+
+    #[cfg(test)]
+    fn test(thread_id: u32, stop_requested: Arc<AtomicBool>) -> Self {
+        Self {
+            thread_id,
+            join: None,
+            stop_requested,
+            post_quit: |_| Ok(()),
+        }
+    }
+
+    fn request_stop(&self) -> anyhow::Result<bool> {
+        request_thread_stop_once(&self.stop_requested, self.thread_id, self.post_quit)
+    }
+
+    fn stop_and_join(mut self) -> anyhow::Result<()> {
+        let stop_result = self.request_stop();
+        let join_result = self
+            .join
+            .take()
+            .map(join_hook_thread)
+            .unwrap_or_else(|| Ok(()));
+
+        stop_result?;
+        join_result
     }
 }
 
 struct HookThreadState {
     sender: Sender<HookEvent>,
     mode: Arc<AtomicBool>,
+    pointer_move_pending: bool,
+}
+
+impl HookThreadState {
+    fn new(sender: Sender<HookEvent>, mode: Arc<AtomicBool>) -> Self {
+        Self {
+            sender,
+            mode,
+            pointer_move_pending: false,
+        }
+    }
+
+    fn emit_mouse_events(&mut self, message: u32, data: &MSLLHOOKSTRUCT) {
+        if message == WM_MOUSEMOVE && self.pointer_move_pending {
+            return;
+        }
+
+        let events = mouse_hook_events(message, data);
+        if events.is_empty() {
+            return;
+        }
+
+        self.pointer_move_pending = message == WM_MOUSEMOVE;
+        self.emit_events(events);
+    }
+
+    fn emit_keyboard_event(&mut self, message: u32, data: &KBDLLHOOKSTRUCT) {
+        if let Some(event) = keyboard_hook_event(message, data) {
+            self.pointer_move_pending = false;
+            self.emit_event(event);
+        }
+    }
+
+    fn emit_events(&self, events: Vec<HookEvent>) {
+        for event in events {
+            self.emit_event(event);
+        }
+    }
+
+    fn emit_event(&self, event: HookEvent) {
+        let _ = self.sender.try_send(event);
+    }
 }
 
 thread_local! {
-    static HOOK_THREAD_STATE: RefCell<Option<HookThreadState>> = RefCell::new(None);
+    static HOOK_THREAD_STATE: RefCell<Option<HookThreadState>> = const { RefCell::new(None) };
 }
 
 struct HookThreadStateGuard;
@@ -112,16 +219,19 @@ impl Drop for InstalledHooks {
 fn run_hook_thread(
     sender: Sender<HookEvent>,
     mode: Arc<AtomicBool>,
-    ready_tx: Sender<anyhow::Result<()>>,
+    ready_tx: Sender<anyhow::Result<u32>>,
 ) -> anyhow::Result<()> {
+    let thread_id = unsafe { GetCurrentThreadId() };
+    ensure_message_queue();
+
     HOOK_THREAD_STATE.with(|state| {
-        *state.borrow_mut() = Some(HookThreadState { sender, mode });
+        *state.borrow_mut() = Some(HookThreadState::new(sender, mode));
     });
     let _state_guard = HookThreadStateGuard;
 
     let hooks = match install_low_level_hooks() {
         Ok(hooks) => {
-            let _ = ready_tx.send(Ok(()));
+            let _ = ready_tx.send(Ok(thread_id));
             hooks
         }
         Err(error) => {
@@ -133,6 +243,47 @@ fn run_hook_thread(
     let result = message_loop();
     drop(hooks);
     result
+}
+
+fn request_thread_stop_once<F>(
+    requested: &AtomicBool,
+    thread_id: u32,
+    post_quit: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(u32) -> anyhow::Result<()>,
+{
+    if requested.swap(true, Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    if let Err(error) = post_quit(thread_id) {
+        requested.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+
+    Ok(true)
+}
+
+fn post_thread_quit_message(thread_id: u32) -> anyhow::Result<()> {
+    unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
+        .context("post hook thread quit message")
+}
+
+fn join_hook_thread(join: JoinHandle<()>) -> anyhow::Result<()> {
+    if join.thread().id() == thread::current().id() {
+        return Ok(());
+    }
+
+    join.join()
+        .map_err(|_| anyhow!("input hook thread panicked"))
+}
+
+fn ensure_message_queue() {
+    let mut message = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut message, HWND::default(), 0, 0, PM_NOREMOVE);
+    }
 }
 
 fn install_low_level_hooks() -> anyhow::Result<InstalledHooks> {
@@ -175,7 +326,11 @@ unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LP
     if ncode == HC_ACTION as i32 {
         let data = unsafe { (lparam.0 as *const MSLLHOOKSTRUCT).as_ref() };
         if let Some(data) = data {
-            emit_hook_events(mouse_hook_events(wparam.0 as u32, data));
+            HOOK_THREAD_STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.emit_mouse_events(wparam.0 as u32, data);
+                }
+            });
         }
 
         if hook_should_suppress() {
@@ -193,8 +348,12 @@ unsafe extern "system" fn keyboard_hook_proc(
 ) -> LRESULT {
     if ncode == HC_ACTION as i32 {
         let data = unsafe { (lparam.0 as *const KBDLLHOOKSTRUCT).as_ref() };
-        if let Some(data) = data.and_then(|data| keyboard_hook_event(wparam.0 as u32, data)) {
-            emit_hook_events(vec![data]);
+        if let Some(data) = data {
+            HOOK_THREAD_STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.emit_keyboard_event(wparam.0 as u32, data);
+                }
+            });
         }
 
         if hook_should_suppress() {
@@ -205,26 +364,12 @@ unsafe extern "system" fn keyboard_hook_proc(
     unsafe { CallNextHookEx(HHOOK::default(), ncode, wparam, lparam) }
 }
 
-fn emit_hook_events(events: Vec<HookEvent>) {
-    if events.is_empty() {
-        return;
-    }
-
-    HOOK_THREAD_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            for event in events {
-                let _ = state.sender.try_send(event);
-            }
-        }
-    });
-}
-
 fn hook_should_suppress() -> bool {
     HOOK_THREAD_STATE.with(|state| {
         state
             .borrow()
             .as_ref()
-            .map_or(false, |state| state.mode.load(Ordering::SeqCst))
+            .is_some_and(|state| state.mode.load(Ordering::SeqCst))
     })
 }
 
@@ -314,7 +459,7 @@ mod tests {
     use super::*;
     use borderless_core::input_event::{InputEvent, MouseButton};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use windows::Win32::{
@@ -412,6 +557,7 @@ mod tests {
         let mode = Arc::new(AtomicBool::new(false));
         let manager = HookManager {
             mode: Arc::clone(&mode),
+            stop: None,
         };
 
         manager.set_suppression_mode(SuppressionMode::Suppress);
@@ -424,14 +570,91 @@ mod tests {
     #[test]
     fn dropping_hook_manager_restores_pass_through_mode() {
         let mode = Arc::new(AtomicBool::new(false));
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let manager = HookManager {
             mode: Arc::clone(&mode),
+            stop: Some(HookThreadHandle::test(123, Arc::clone(&stop_requested))),
         };
 
         manager.set_suppression_mode(SuppressionMode::Suppress);
         drop(manager);
 
         assert!(!mode.load(Ordering::SeqCst));
+        assert!(stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_request_posts_quit_only_once() {
+        let requested = AtomicBool::new(false);
+        let post_count = AtomicUsize::new(0);
+
+        let first = request_thread_stop_once(&requested, 42, |thread_id| {
+            assert_eq!(thread_id, 42);
+            post_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("first stop request should post quit");
+        let second = request_thread_stop_once(&requested, 42, |_| {
+            post_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("second stop request should be a no-op");
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callback_state_coalesces_pointer_moves_until_input_resets() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = HookThreadState::new(sender, Arc::new(AtomicBool::new(false)));
+
+        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(1, 2, 0));
+        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(3, 4, 0));
+
+        let first_batch: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(first_batch.len(), 2);
+        assert!(
+            matches!(first_batch[0], HookEvent::PointerPosition { x: 1, y: 2 }),
+            "first pointer position should be emitted, got {:?}",
+            first_batch[0]
+        );
+        assert!(
+            matches!(
+                first_batch[1],
+                HookEvent::Input(InputEvent::MouseMoveAbs(event)) if event.x == 1 && event.y == 2
+            ),
+            "first absolute mouse move should be emitted, got {:?}",
+            first_batch[1]
+        );
+
+        state.emit_keyboard_event(
+            WM_KEYDOWN,
+            &KBDLLHOOKSTRUCT {
+                vkCode: 0x41,
+                scanCode: 0,
+                flags: KBDLLHOOKSTRUCT_FLAGS(0),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        );
+        let key_batch: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(key_batch.len(), 1);
+        assert!(matches!(
+            key_batch[0],
+            HookEvent::Input(InputEvent::Key(event)) if event.vk_code == 0x41 && event.pressed
+        ));
+
+        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(5, 6, 0));
+
+        let reset_batch: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(reset_batch.len(), 2);
+        assert!(
+            matches!(reset_batch[0], HookEvent::PointerPosition { x: 5, y: 6 }),
+            "pointer movement should emit again after input reset, got {:?}",
+            reset_batch[0]
+        );
     }
 
     fn assert_mouse_button(message: u32, mouse_data: u32, button: MouseButton, pressed: bool) {
