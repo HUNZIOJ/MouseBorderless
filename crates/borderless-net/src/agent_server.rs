@@ -44,6 +44,7 @@ async fn run_tcp_server(
     events: UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<()> {
+    emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
     let listener = TcpListener::bind(settings.peer_addr()).await?;
 
     loop {
@@ -63,6 +64,7 @@ async fn run_tcp_server(
                 }
                 emit(&events, ConnectionEvent::Disconnected(peer.to_string()));
                 emit(&events, ConnectionEvent::Waiting);
+                emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
             }
             command = commands.recv() => {
                 if matches!(command, Some(ConnectionCommand::Stop) | None) {
@@ -78,6 +80,7 @@ async fn run_kcp_server(
     events: UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<()> {
+    emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
     let listener = KcpFramedTransport::bind(&settings.peer_addr()).await?;
 
     loop {
@@ -98,6 +101,7 @@ async fn run_kcp_server(
                 }
                 emit(&events, ConnectionEvent::Disconnected(peer_display));
                 emit(&events, ConnectionEvent::Waiting);
+                emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
             }
             command = commands.recv() => {
                 if matches!(command, Some(ConnectionCommand::Stop) | None) {

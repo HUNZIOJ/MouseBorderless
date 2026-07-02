@@ -88,6 +88,7 @@ pub(crate) fn source_matches_peer(source: SocketAddr, peer: SocketAddr) -> bool 
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::time::{timeout, Duration};
 
     #[test]
     fn stale_pointer_packets_are_ignored() {
@@ -128,6 +129,52 @@ mod tests {
         };
         let encoded = packet.encode();
         assert_eq!(PointerPacket::decode(&encoded).unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn udp_loopback_pointer_packets_accept_only_fresh_sequences() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = receiver.local_addr().unwrap().to_string();
+        let peer = sender.local_addr().unwrap();
+
+        for packet in [
+            PointerPacket {
+                sequence: 10,
+                x: 100,
+                y: 200,
+            },
+            PointerPacket {
+                sequence: 9,
+                x: 300,
+                y: 400,
+            },
+            PointerPacket {
+                sequence: 11,
+                x: 500,
+                y: 600,
+            },
+        ] {
+            send_pointer(&sender, &target, packet).await.unwrap();
+        }
+
+        let mut state = LatestPointerState::default();
+        let mut buf = [0u8; 64];
+        let mut accepted = Vec::new();
+
+        for _ in 0..3 {
+            let (len, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(source_matches_peer(source, peer));
+            let packet = PointerPacket::decode(&buf[..len]).unwrap();
+            if let Some((x, y)) = state.accept(packet) {
+                accepted.push((packet.sequence, x, y));
+            }
+        }
+
+        assert_eq!(accepted, [(10, 100, 200), (11, 500, 600)]);
     }
 
     #[test]

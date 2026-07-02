@@ -1,6 +1,6 @@
 use crate::{
     kcp_transport::{KcpFramedReader, KcpFramedTransport, KcpFramedWriter},
-    latest_pointer::{send_pointer, PointerPacket},
+    latest_pointer::{send_pointer, source_matches_peer, LatestPointerState, PointerPacket},
     tcp_transport::{TcpFramedReader, TcpFramedTransport, TcpFramedWriter},
     transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
 };
@@ -135,9 +135,12 @@ async fn run_kcp_connection(
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<bool> {
     let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
-    let pointer_socket = UdpSocket::bind(pointer_ephemeral_bind_addr(settings)?).await?;
+    let pointer_socket = UdpSocket::bind(pointer_bind_addr(settings)?).await?;
+    let pointer_peer = settings.pointer_addr()?;
     let pointer_target = settings.pointer_addr_string();
+    let mut pointer_state = LatestPointerState::default();
     let mut pointer_sequence = 1;
+    let mut pointer_buf = [0u8; 64];
 
     loop {
         tokio::select! {
@@ -177,6 +180,30 @@ async fn run_kcp_connection(
                         return Ok(false);
                     }
                     None => return Ok(false),
+                }
+            }
+            received = pointer_socket.recv_from(&mut pointer_buf) => {
+                match received {
+                    Ok((len, source)) => {
+                        if source_matches_peer(source, pointer_peer) {
+                            match PointerPacket::decode(&pointer_buf[..len]) {
+                                Ok(packet) => {
+                                    if let Some((x, y)) = pointer_state.accept(packet) {
+                                        emit(
+                                            events,
+                                            ConnectionEvent::LatestPointer {
+                                                x,
+                                                y,
+                                                sequence: packet.sequence,
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
+                            }
+                        }
+                    }
+                    Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
                 }
             }
         }
@@ -326,14 +353,127 @@ impl ReliableWriter for KcpFramedWriter {
     }
 }
 
-fn pointer_ephemeral_bind_addr(settings: &TransportSettings) -> anyhow::Result<SocketAddr> {
+fn pointer_bind_addr(settings: &TransportSettings) -> anyhow::Result<SocketAddr> {
     let ip = match settings.reliable_addr()?.ip() {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
-    Ok(SocketAddr::new(ip, 0))
+    Ok(SocketAddr::new(ip, settings.pointer_port))
 }
 
 fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {
     let _ = events.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{kcp_transport::KcpFramedTransport, latest_pointer::send_pointer};
+    use borderless_core::config::TransportMode;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn kcp_controller_receives_fresh_latest_pointer_packets_on_configured_port() {
+        let listener = KcpFramedTransport::bind("127.0.0.1:0").await.unwrap();
+        let reliable_port = listener.local_addr().unwrap().port();
+        let pointer_port = unused_udp_port().await;
+        let _server = tokio::spawn(async move {
+            let _accepted = KcpFramedTransport::accept(&listener).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let settings = TransportSettings {
+            mode: TransportMode::Kcp,
+            host: "127.0.0.1".to_string(),
+            reliable_port,
+            pointer_port,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let controller = tokio::spawn(run_controller_client(settings, event_tx, command_rx));
+
+        wait_for_connected(&mut event_rx).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("127.0.0.1:{pointer_port}");
+        for packet in [
+            PointerPacket {
+                sequence: 10,
+                x: 100,
+                y: 200,
+            },
+            PointerPacket {
+                sequence: 9,
+                x: 300,
+                y: 400,
+            },
+            PointerPacket {
+                sequence: 11,
+                x: 500,
+                y: 600,
+            },
+        ] {
+            send_pointer(&sender, &target, packet).await.unwrap();
+        }
+
+        assert_eq!(
+            next_latest_pointer(&mut event_rx).await,
+            ConnectionEvent::LatestPointer {
+                x: 100,
+                y: 200,
+                sequence: 10,
+            }
+        );
+        assert_eq!(
+            next_latest_pointer(&mut event_rx).await,
+            ConnectionEvent::LatestPointer {
+                x: 500,
+                y: 600,
+                sequence: 11,
+            }
+        );
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        controller.await.unwrap().unwrap();
+    }
+
+    async fn unused_udp_port() -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn wait_for_connected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
+        loop {
+            match timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ConnectionEvent::Connected { .. } => return,
+                ConnectionEvent::Error(error) => panic!("unexpected connection error: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    async fn next_latest_pointer(
+        event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>,
+    ) -> ConnectionEvent {
+        loop {
+            match timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                event @ ConnectionEvent::LatestPointer { .. } => return event,
+                ConnectionEvent::Error(error) => panic!("unexpected connection error: {error}"),
+                _ => {}
+            }
+        }
+    }
 }
