@@ -19,14 +19,14 @@ use borderless_net::{
 };
 use borderless_win::{
     hooks::{HookEvent, HookManager, SuppressionMode},
-    inject::InputInjector,
+    inject::{move_local_pointer_to, InputInjector},
     monitor::virtual_desktop_rect,
 };
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{interval, MissedTickBehavior},
+    time::{interval, sleep_until, Instant as TokioInstant, MissedTickBehavior},
 };
 
 use crate::status::{AppStatus, RunState};
@@ -34,7 +34,8 @@ use crate::status::{AppStatus, RunState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const MAX_OUTSTANDING_HEARTBEATS: usize = 8;
-const STALE_POINTER_LOG_INTERVAL_MILLIS: u64 = 1_000;
+const STALE_POINTER_EMIT_INTERVAL_MILLIS: u64 = 1_000;
+const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
@@ -91,12 +92,17 @@ struct ActiveRuntime {
     session_commands: mpsc::UnboundedSender<SessionCommand>,
     hook_manager: Option<Arc<Mutex<HookManager>>>,
     send_release_all_on_stop: bool,
-    _tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<JoinHandle<()>>,
     stopped: bool,
 }
 
 impl ActiveRuntime {
-    fn stop(&mut self) {
+    async fn stop(&mut self) -> StopTaskOutcome {
+        self.request_stop();
+        wait_for_session_tasks(&mut self.tasks, SESSION_STOP_TIMEOUT).await
+    }
+
+    fn request_stop(&mut self) {
         if self.stopped {
             return;
         }
@@ -118,7 +124,43 @@ impl ActiveRuntime {
 
 impl Drop for ActiveRuntime {
     fn drop(&mut self) {
-        self.stop();
+        self.request_stop();
+        abort_session_tasks(&mut self.tasks);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StopTaskOutcome {
+    completed: usize,
+    aborted: usize,
+}
+
+async fn wait_for_session_tasks(
+    tasks: &mut Vec<JoinHandle<()>>,
+    timeout: Duration,
+) -> StopTaskOutcome {
+    let mut outcome = StopTaskOutcome::default();
+    let deadline = TokioInstant::now() + timeout;
+
+    for mut task in std::mem::take(tasks) {
+        tokio::select! {
+            result = &mut task => {
+                let _ = result;
+                outcome.completed += 1;
+            }
+            _ = sleep_until(deadline) => {
+                task.abort();
+                outcome.aborted += 1;
+            }
+        }
+    }
+
+    outcome
+}
+
+fn abort_session_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
     }
 }
 
@@ -146,7 +188,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
     let (updates_tx, updates_rx) = unbounded();
     let mut active: Option<ActiveRuntime> = None;
     let mut status = AppStatus::default();
-    let mut stale_pointer_log_gate = StalePointerLogGate::default();
+    let mut stale_pointer_packet_gate = StalePointerPacketGate::default();
     let mut next_session_id: u64 = 1;
 
     loop {
@@ -159,10 +201,11 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                 match command {
                     RuntimeCommand::Start(config) => {
                         if let Some(mut session) = active.take() {
-                            session.stop();
+                            let outcome = session.stop().await;
+                            log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_log_gate.reset();
+                        stale_pointer_packet_gate.reset();
                         prepare_running_status(&mut status, &config, RunState::Connecting);
                         emit_log(&mut status, &events_tx, "starting runtime");
                         emit_status(&events_tx, &status);
@@ -175,27 +218,29 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
-                                    &mut stale_pointer_log_gate,
+                                    &mut stale_pointer_packet_gate,
                                 );
                             })
                             .ok();
                     }
                     RuntimeCommand::Stop => {
                         if let Some(mut session) = active.take() {
-                            session.stop();
+                            let outcome = session.stop().await;
+                            log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_log_gate.reset();
+                        stale_pointer_packet_gate.reset();
                         prepare_stopped_status(&mut status);
                         emit_log(&mut status, &events_tx, "runtime stopped");
                         emit_status(&events_tx, &status);
                     }
                     RuntimeCommand::Reconnect(config) => {
                         if let Some(mut session) = active.take() {
-                            session.stop();
+                            let outcome = session.stop().await;
+                            log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_log_gate.reset();
+                        stale_pointer_packet_gate.reset();
                         prepare_running_status(&mut status, &config, RunState::Reconnecting);
                         emit_log(&mut status, &events_tx, "reconnecting runtime");
                         emit_status(&events_tx, &status);
@@ -208,7 +253,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
-                                    &mut stale_pointer_log_gate,
+                                    &mut stale_pointer_packet_gate,
                                 );
                             })
                             .ok();
@@ -228,7 +273,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                         &mut status,
                         &events_tx,
                         update.update,
-                        &mut stale_pointer_log_gate,
+                        &mut stale_pointer_packet_gate,
                     );
                 }
             }
@@ -236,7 +281,7 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
     }
 
     if let Some(mut session) = active {
-        session.stop();
+        let _ = session.stop().await;
     }
 }
 
@@ -304,7 +349,7 @@ fn start_controller_session(
         session_commands: session_commands_tx,
         hook_manager: Some(hook_manager),
         send_release_all_on_stop: true,
-        _tasks: tasks,
+        tasks,
         stopped: false,
     })
 }
@@ -354,7 +399,7 @@ fn start_agent_session(
         session_commands: session_commands_tx,
         hook_manager: None,
         send_release_all_on_stop: false,
-        _tasks: tasks,
+        tasks,
         stopped: false,
     }
 }
@@ -388,6 +433,7 @@ async fn run_controller_event_pump(
                 while let Ok(event) = hook_events.try_recv() {
                     handle_controller_hook_event(
                         event,
+                        local_desktop,
                         &mut control_state,
                         &mut last_pointer,
                         &hook_manager,
@@ -414,6 +460,7 @@ async fn run_controller_event_pump(
                     &config,
                     local_desktop,
                     &mut control_state,
+                    &hook_manager,
                     &connection_commands,
                     &updates,
                     session_id,
@@ -431,6 +478,7 @@ fn handle_controller_connection_event(
     config: &AppConfig,
     local_desktop: Rect,
     control_state: &mut Option<ControlState>,
+    hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -441,6 +489,7 @@ fn handle_controller_connection_event(
         session_id,
         SessionUpdate::Connection(event.clone()),
     );
+    let recovery_action = controller_recovery_action_for_connection_event(&event, control_state);
 
     match event {
         ConnectionEvent::Message(WireMessage::Hello(hello)) => {
@@ -477,10 +526,11 @@ fn handle_controller_connection_event(
             handle_heartbeat_message(message, heartbeat, connection_commands, updates, session_id);
         }
         ConnectionEvent::Message(WireMessage::Error(error)) => {
+            apply_controller_recovery_action(recovery_action, hook_manager, connection_commands);
             send_session_update(updates, session_id, SessionUpdate::Error(error));
         }
         ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_) => {
-            *control_state = None;
+            apply_controller_recovery_action(recovery_action, hook_manager, connection_commands);
         }
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
@@ -492,8 +542,52 @@ fn handle_controller_connection_event(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ControllerRecoveryAction {
+    pass_through: bool,
+    release_all: bool,
+}
+
+fn controller_recovery_action_for_connection_event(
+    event: &ConnectionEvent,
+    control_state: &mut Option<ControlState>,
+) -> ControllerRecoveryAction {
+    if !matches!(
+        event,
+        ConnectionEvent::Disconnected(_)
+            | ConnectionEvent::Error(_)
+            | ConnectionEvent::Message(WireMessage::Error(_))
+    ) {
+        return ControllerRecoveryAction::default();
+    }
+
+    let was_remote = control_state
+        .as_ref()
+        .is_some_and(|state| state.mode() == ControlMode::Remote);
+    *control_state = None;
+
+    ControllerRecoveryAction {
+        pass_through: was_remote,
+        release_all: was_remote,
+    }
+}
+
+fn apply_controller_recovery_action(
+    action: ControllerRecoveryAction,
+    hook_manager: &Arc<Mutex<HookManager>>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+) {
+    if action.pass_through {
+        set_hook_suppression(hook_manager, SuppressionMode::PassThrough);
+    }
+    if action.release_all {
+        send_release_all(connection_commands);
+    }
+}
+
 fn handle_controller_hook_event(
     event: HookEvent,
+    local_desktop: Rect,
     control_state: &mut Option<ControlState>,
     last_pointer: &mut Option<Point>,
     hook_manager: &Arc<Mutex<HookManager>>,
@@ -515,6 +609,7 @@ fn handle_controller_hook_event(
                     let output = state.observe_local_pointer(point);
                     handle_control_output(
                         output,
+                        local_desktop,
                         hook_manager,
                         connection_commands,
                         updates,
@@ -532,6 +627,7 @@ fn handle_controller_hook_event(
                     let output = state.apply_remote_delta(dx, dy);
                     handle_control_output(
                         output,
+                        local_desktop,
                         hook_manager,
                         connection_commands,
                         updates,
@@ -547,6 +643,7 @@ fn handle_controller_hook_event(
             {
                 send_remote_input(
                     input,
+                    local_desktop,
                     control_state,
                     hook_manager,
                     connection_commands,
@@ -560,6 +657,7 @@ fn handle_controller_hook_event(
 
 fn send_remote_input(
     input: InputEvent,
+    local_desktop: Rect,
     control_state: &mut Option<ControlState>,
     hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
@@ -573,6 +671,7 @@ fn send_remote_input(
                 let output = state.apply_remote_delta(delta.dx, delta.dy);
                 handle_control_output(
                     output,
+                    local_desktop,
                     hook_manager,
                     connection_commands,
                     updates,
@@ -590,11 +689,14 @@ fn send_remote_input(
 
 fn handle_control_output(
     output: ControlOutput,
+    local_desktop: Rect,
     hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
 ) {
+    let return_local_target = return_local_pointer_target(&output);
+
     match output {
         ControlOutput::None => {}
         ControlOutput::EnterRemote(point) => {
@@ -615,7 +717,17 @@ fn handle_control_output(
             send_latest_pointer(connection_commands, point);
         }
         ControlOutput::ReturnLocal(_) => {
+            let Some(point) = return_local_target else {
+                return;
+            };
             set_hook_suppression(hook_manager, SuppressionMode::PassThrough);
+            if let Err(error) = move_local_pointer_to(local_desktop, point) {
+                send_session_update(
+                    updates,
+                    session_id,
+                    SessionUpdate::Error(format!("local pointer move failed: {error}")),
+                );
+            }
             send_release_all(connection_commands);
             send_session_update(
                 updates,
@@ -628,6 +740,13 @@ fn handle_control_output(
                 SessionUpdate::RunState(RunState::LocalControl),
             );
         }
+    }
+}
+
+fn return_local_pointer_target(output: &ControlOutput) -> Option<Point> {
+    match output {
+        ControlOutput::ReturnLocal(point) => Some(*point),
+        ControlOutput::None | ControlOutput::EnterRemote(_) | ControlOutput::MoveRemote(_) => None,
     }
 }
 
@@ -847,22 +966,28 @@ fn apply_session_update(
     status: &mut AppStatus,
     events: &Sender<RuntimeEvent>,
     update: SessionUpdate,
-    stale_pointer_log_gate: &mut StalePointerLogGate,
+    stale_pointer_packet_gate: &mut StalePointerPacketGate,
 ) {
     let mut status_changed = false;
 
     match update {
         SessionUpdate::Connection(event) => {
-            status_changed = connection_event_updates_status(&event);
-            apply_connection_event_to_status(status, &event);
-            let log_message = match &event {
-                ConnectionEvent::StalePointerPackets { count } => {
-                    stale_pointer_log_gate.maybe_log(*count, now_millis())
+            if let ConnectionEvent::StalePointerPackets { count } = event {
+                if let Some(emission) = apply_stale_pointer_packet_update(
+                    status,
+                    stale_pointer_packet_gate,
+                    count,
+                    now_millis(),
+                ) {
+                    emit_log(status, events, emission.log_message());
+                    status_changed = true;
                 }
-                _ => connection_event_log(&event),
-            };
-            if let Some(message) = log_message {
-                emit_log(status, events, message);
+            } else {
+                status_changed = connection_event_updates_status(&event);
+                apply_connection_event_to_status(status, &event);
+                if let Some(message) = connection_event_log(&event) {
+                    emit_log(status, events, message);
+                }
             }
         }
         SessionUpdate::Error(error) => {
@@ -927,7 +1052,6 @@ fn connection_event_updates_status(event: &ConnectionEvent) -> bool {
             | ConnectionEvent::Connected { .. }
             | ConnectionEvent::Disconnected(_)
             | ConnectionEvent::LatestPointer { .. }
-            | ConnectionEvent::StalePointerPackets { .. }
             | ConnectionEvent::Error(_)
             | ConnectionEvent::Message(WireMessage::Error(_))
     )
@@ -959,6 +1083,23 @@ fn emit_status(sender: &Sender<RuntimeEvent>, status: &AppStatus) {
 
 fn send(sender: &Sender<RuntimeEvent>, event: RuntimeEvent) {
     let _ = sender.send(event);
+}
+
+fn log_stop_task_outcome(
+    status: &mut AppStatus,
+    events: &Sender<RuntimeEvent>,
+    outcome: StopTaskOutcome,
+) {
+    if outcome.aborted > 0 {
+        emit_log(
+            status,
+            events,
+            format!(
+                "aborted {} runtime task(s) after shutdown timeout",
+                outcome.aborted
+            ),
+        );
+    }
 }
 
 fn runtime_transport_mode(config: &AppConfig) -> TransportMode {
@@ -1009,33 +1150,54 @@ impl HeartbeatTracker {
     }
 }
 
-#[derive(Debug, Default)]
-struct StalePointerLogGate {
-    last_logged_count: u64,
-    last_logged_at_millis: Option<u64>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StalePointerPacketEmission {
+    count: u64,
 }
 
-impl StalePointerLogGate {
+impl StalePointerPacketEmission {
+    fn log_message(self) -> String {
+        format!("KCP UDP stale pointer packets: {}", self.count)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StalePointerPacketGate {
+    last_emitted_count: u64,
+    last_emitted_at_millis: Option<u64>,
+}
+
+impl StalePointerPacketGate {
     fn reset(&mut self) {
         *self = Self::default();
     }
 
-    fn maybe_log(&mut self, count: u64, now_millis: u64) -> Option<String> {
-        if count == self.last_logged_count {
+    fn maybe_emit(&mut self, count: u64, now_millis: u64) -> Option<StalePointerPacketEmission> {
+        if self.last_emitted_at_millis.is_some() && count == self.last_emitted_count {
             return None;
         }
 
-        if let Some(last_logged_at_millis) = self.last_logged_at_millis {
-            let elapsed = now_millis.saturating_sub(last_logged_at_millis);
-            if elapsed < STALE_POINTER_LOG_INTERVAL_MILLIS {
+        if let Some(last_emitted_at_millis) = self.last_emitted_at_millis {
+            let elapsed = now_millis.saturating_sub(last_emitted_at_millis);
+            if elapsed < STALE_POINTER_EMIT_INTERVAL_MILLIS {
                 return None;
             }
         }
 
-        self.last_logged_count = count;
-        self.last_logged_at_millis = Some(now_millis);
-        Some(format!("KCP UDP stale pointer packets: {count}"))
+        self.last_emitted_count = count;
+        self.last_emitted_at_millis = Some(now_millis);
+        Some(StalePointerPacketEmission { count })
     }
+}
+
+fn apply_stale_pointer_packet_update(
+    status: &mut AppStatus,
+    gate: &mut StalePointerPacketGate,
+    count: u64,
+    now_millis: u64,
+) -> Option<StalePointerPacketEmission> {
+    status.stale_pointer_packets = count;
+    gate.maybe_emit(count, now_millis)
 }
 
 fn now_millis() -> u64 {
@@ -1055,7 +1217,7 @@ mod tests {
     };
 
     use borderless_core::{
-        config::{Role, TransportMode},
+        config::{RemotePosition, Role, TransportMode},
         protocol::WireMessage,
     };
     use borderless_net::transport::ConnectionEvent;
@@ -1124,7 +1286,7 @@ mod tests {
             &ConnectionEvent::StalePointerPackets { count: 4 },
         );
         assert_eq!(status.stale_pointer_packets, 4);
-        assert!(connection_event_updates_status(
+        assert!(!connection_event_updates_status(
             &ConnectionEvent::StalePointerPackets { count: 4 }
         ));
 
@@ -1141,24 +1303,82 @@ mod tests {
 
     #[test]
     fn stale_pointer_log_gate_logs_count_changes_at_most_once_per_second() {
-        let mut gate = StalePointerLogGate::default();
+        let mut gate = StalePointerPacketGate::default();
 
         assert_eq!(
-            gate.maybe_log(1, 1_000),
+            gate.maybe_emit(1, 1_000)
+                .map(StalePointerPacketEmission::log_message),
             Some("KCP UDP stale pointer packets: 1".to_string())
         );
-        assert_eq!(gate.maybe_log(2, 1_500), None);
-        assert_eq!(gate.maybe_log(2, 1_999), None);
+        assert_eq!(gate.maybe_emit(2, 1_500), None);
+        assert_eq!(gate.maybe_emit(2, 1_999), None);
         assert_eq!(
-            gate.maybe_log(2, 2_000),
+            gate.maybe_emit(2, 2_000)
+                .map(StalePointerPacketEmission::log_message),
             Some("KCP UDP stale pointer packets: 2".to_string())
         );
-        assert_eq!(gate.maybe_log(3, 2_500), None);
+        assert_eq!(gate.maybe_emit(3, 2_500), None);
         assert_eq!(
-            gate.maybe_log(3, 3_000),
+            gate.maybe_emit(3, 3_000)
+                .map(StalePointerPacketEmission::log_message),
             Some("KCP UDP stale pointer packets: 3".to_string())
         );
-        assert_eq!(gate.maybe_log(3, 4_000), None);
+        assert_eq!(gate.maybe_emit(3, 4_000), None);
+    }
+
+    #[test]
+    fn stale_pointer_packet_updates_emit_latest_count_at_cadence() {
+        let mut status = AppStatus::default();
+        let mut gate = StalePointerPacketGate::default();
+
+        let samples = [(1, 1_000), (2, 1_010), (3, 1_500), (4, 1_999), (5, 2_000)];
+        let emissions = samples
+            .into_iter()
+            .filter_map(|(count, now)| {
+                apply_stale_pointer_packet_update(&mut status, &mut gate, count, now)
+                    .map(|emission| emission.count)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(emissions, vec![1, 5]);
+        assert_eq!(status.stale_pointer_packets, 5);
+    }
+
+    #[test]
+    fn controller_terminal_connection_events_recover_from_remote_mode() {
+        for event in [
+            ConnectionEvent::Disconnected("agent".to_string()),
+            ConnectionEvent::Error("network down".to_string()),
+            ConnectionEvent::Message(WireMessage::Error("peer error".to_string())),
+        ] {
+            let mut control_state = Some(remote_control_state());
+
+            let action =
+                controller_recovery_action_for_connection_event(&event, &mut control_state);
+
+            assert_eq!(
+                action,
+                ControllerRecoveryAction {
+                    pass_through: true,
+                    release_all: true,
+                }
+            );
+            assert!(control_state.is_none());
+        }
+    }
+
+    #[test]
+    fn return_local_control_output_preserves_pointer_target() {
+        let point = Point::new(1917, 540);
+
+        assert_eq!(
+            return_local_pointer_target(&ControlOutput::ReturnLocal(point)),
+            Some(point)
+        );
+        assert_eq!(
+            return_local_pointer_target(&ControlOutput::MoveRemote(point)),
+            None
+        );
     }
 
     #[test]
@@ -1216,6 +1436,60 @@ mod tests {
         runtime.send(RuntimeCommand::Stop);
     }
 
+    #[tokio::test]
+    async fn active_runtime_stop_sends_shutdown_commands_and_awaits_tasks() {
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (session_commands_tx, mut session_commands_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let _ = session_commands_rx.recv().await;
+        });
+        let mut runtime = ActiveRuntime {
+            session_id: 7,
+            connection_commands: connection_commands_tx,
+            session_commands: session_commands_tx,
+            hook_manager: None,
+            send_release_all_on_stop: true,
+            tasks: vec![task],
+            stopped: false,
+        };
+
+        let outcome = runtime.stop().await;
+
+        assert_eq!(
+            outcome,
+            StopTaskOutcome {
+                completed: 1,
+                aborted: 0,
+            }
+        );
+        assert_eq!(
+            connection_commands_rx.recv().await,
+            Some(ConnectionCommand::SendReliable(WireMessage::ReleaseAll))
+        );
+        assert_eq!(
+            connection_commands_rx.recv().await,
+            Some(ConnectionCommand::Stop)
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_tasks_aborts_pending_tasks_after_timeout() {
+        let mut tasks = vec![tokio::spawn(async {
+            std::future::pending::<()>().await;
+        })];
+
+        let outcome = wait_for_session_tasks(&mut tasks, Duration::from_millis(1)).await;
+
+        assert_eq!(
+            outcome,
+            StopTaskOutcome {
+                completed: 0,
+                aborted: 1,
+            }
+        );
+        assert!(tasks.is_empty());
+    }
+
     #[test]
     fn runtime_command_is_cloneable() {
         let command = RuntimeCommand::Start(AppConfig::default());
@@ -1265,6 +1539,21 @@ mod tests {
         };
         config.agent.pointer_port = unused_udp_port();
         config
+    }
+
+    fn remote_control_state() -> ControlState {
+        let mut state = ControlState::new(
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1280, 720),
+            RemotePosition::Right,
+            2,
+        );
+        assert!(matches!(
+            state.observe_local_pointer(Point::new(1919, 540)),
+            ControlOutput::EnterRemote(_)
+        ));
+        assert_eq!(state.mode(), ControlMode::Remote);
+        state
     }
 
     fn unused_tcp_port() -> u16 {

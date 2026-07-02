@@ -60,6 +60,23 @@ pub fn manual_move_check(desktop: Rect) -> anyhow::Result<()> {
     }))
 }
 
+pub fn move_local_pointer_to(desktop: Rect, point: Point) -> anyhow::Result<()> {
+    let inputs = local_pointer_move_inputs(desktop, point);
+    send_inputs(&inputs).with_context(|| format!("move local pointer to {point:?}"))
+}
+
+fn local_pointer_move_inputs(desktop: Rect, point: Point) -> Vec<INPUT> {
+    let mut pressed = PressedState::default();
+    build_inputs(
+        &InputEvent::MouseMoveAbs(MouseMoveAbsEvent {
+            x: point.x,
+            y: point.y,
+        }),
+        &mut pressed,
+        desktop,
+    )
+}
+
 fn build_inputs(event: &InputEvent, pressed: &mut PressedState, desktop: Rect) -> Vec<INPUT> {
     match event {
         InputEvent::Key(event) => {
@@ -285,6 +302,21 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         let flags = unsafe { inputs[0].Anonymous.mi.dwFlags };
         assert_ne!(flags.0 & MOUSEEVENTF_VIRTUALDESK.0, 0);
+    }
+
+    #[test]
+    fn local_pointer_move_inputs_use_absolute_virtual_desktop_coordinates() {
+        let desktop = Rect::new(-1920, 0, 3840, 1080);
+        let inputs = local_pointer_move_inputs(desktop, Point::new(-10, 10));
+
+        assert_eq!(inputs.len(), 1);
+        let mouse = unsafe { inputs[0].Anonymous.mi };
+        assert_eq!(
+            mouse.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        );
+        assert_eq!(mouse.dx, normalize_axis(-10, desktop.left, desktop.width));
+        assert_eq!(mouse.dy, normalize_axis(10, desktop.top, desktop.height));
     }
 
     #[test]
