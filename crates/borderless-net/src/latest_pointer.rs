@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure};
 use bytes::{Buf, BufMut, BytesMut};
-use std::net::SocketAddr;
+use std::{collections::BTreeSet, net::SocketAddr};
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
@@ -53,12 +53,20 @@ impl PointerPacket {
 #[derive(Clone, Debug, Default)]
 pub struct LatestPointerState {
     current_session_id: Option<u128>,
+    retired_session_ids: BTreeSet<u128>,
     latest_sequence: u64,
 }
 
 impl LatestPointerState {
     pub fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
+        if self.retired_session_ids.contains(&packet.session_id) {
+            return None;
+        }
+
         if self.current_session_id != Some(packet.session_id) {
+            if let Some(current_session_id) = self.current_session_id {
+                self.retired_session_ids.insert(current_session_id);
+            }
             self.current_session_id = Some(packet.session_id);
             self.latest_sequence = 0;
         }
@@ -188,6 +196,39 @@ mod tests {
                 y: 400,
             }),
             Some((300, 400))
+        );
+    }
+
+    #[test]
+    fn retired_pointer_session_packets_are_ignored_after_new_session() {
+        let mut state = LatestPointerState::default();
+
+        assert_eq!(
+            state.accept(PointerPacket {
+                session_id: 7,
+                sequence: 900,
+                x: 100,
+                y: 200,
+            }),
+            Some((100, 200))
+        );
+        assert_eq!(
+            state.accept(PointerPacket {
+                session_id: 8,
+                sequence: 1,
+                x: 300,
+                y: 400,
+            }),
+            Some((300, 400))
+        );
+        assert_eq!(
+            state.accept(PointerPacket {
+                session_id: 7,
+                sequence: 901,
+                x: 500,
+                y: 600,
+            }),
+            None
         );
     }
 
