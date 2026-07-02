@@ -14,6 +14,7 @@ use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
+    time::{sleep, Duration},
 };
 
 enum ReliableDriverCommand {
@@ -63,6 +64,9 @@ async fn run_tcp_server(
                     return Ok(());
                 }
                 emit(&events, ConnectionEvent::Disconnected(peer.to_string()));
+                if wait_after_disconnect_backoff(commands, Duration::from_millis(500)).await {
+                    return Ok(());
+                }
                 emit(&events, ConnectionEvent::Waiting);
                 emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
             }
@@ -100,6 +104,9 @@ async fn run_kcp_server(
                     return Ok(());
                 }
                 emit(&events, ConnectionEvent::Disconnected(peer_display));
+                if wait_after_disconnect_backoff(commands, Duration::from_millis(500)).await {
+                    return Ok(());
+                }
                 emit(&events, ConnectionEvent::Waiting);
                 emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
             }
@@ -245,6 +252,27 @@ fn latest_pointer_as_reliable(x: i32, y: i32) -> WireMessage {
     WireMessage::Input(InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x, y }))
 }
 
+async fn wait_after_disconnect_backoff(
+    commands: &mut UnboundedReceiver<ConnectionCommand>,
+    delay: Duration,
+) -> bool {
+    let delay = sleep(delay);
+    tokio::pin!(delay);
+
+    loop {
+        tokio::select! {
+            _ = &mut delay => return false,
+            command = commands.recv() => {
+                match command {
+                    Some(ConnectionCommand::Stop) | None => return true,
+                    Some(ConnectionCommand::SendReliable(_))
+                    | Some(ConnectionCommand::SendLatestPointer { .. }) => {}
+                }
+            }
+        }
+    }
+}
+
 fn spawn_tcp_driver(
     transport: TcpFramedTransport,
 ) -> (
@@ -379,4 +407,57 @@ impl ReliableWriter for KcpFramedWriter {
 
 fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {
     let _ = events.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn post_disconnect_backoff_ignores_send_commands_until_delay_expires() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        command_tx
+            .send(ConnectionCommand::SendLatestPointer { x: 1, y: 2 })
+            .unwrap();
+
+        let delayed = timeout(
+            Duration::from_millis(100),
+            wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
+        )
+        .await;
+
+        assert!(
+            delayed.is_err(),
+            "send command ended post-disconnect backoff before the delay"
+        );
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_disconnect_backoff_stops_immediately_on_stop() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                wait_after_disconnect_backoff(&mut command_rx, Duration::from_millis(500)),
+            )
+            .await
+            .unwrap()
+        );
+    }
 }

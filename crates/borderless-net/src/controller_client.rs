@@ -211,9 +211,20 @@ async fn run_kcp_connection(
 }
 
 async fn wait_before_reconnect(commands: &mut UnboundedReceiver<ConnectionCommand>) -> bool {
-    tokio::select! {
-        _ = sleep(Duration::from_millis(500)) => false,
-        command = commands.recv() => matches!(command, Some(ConnectionCommand::Stop) | None),
+    let delay = sleep(Duration::from_millis(500));
+    tokio::pin!(delay);
+
+    loop {
+        tokio::select! {
+            _ = &mut delay => return false,
+            command = commands.recv() => {
+                match command {
+                    Some(ConnectionCommand::Stop) | None => return true,
+                    Some(ConnectionCommand::SendReliable(_))
+                    | Some(ConnectionCommand::SendLatestPointer { .. }) => {}
+                }
+            }
+        }
     }
 }
 
@@ -372,6 +383,29 @@ mod tests {
     use borderless_core::config::TransportMode;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn reconnect_delay_ignores_send_commands_until_delay_expires() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        command_tx
+            .send(ConnectionCommand::SendLatestPointer { x: 1, y: 2 })
+            .unwrap();
+
+        let delayed = timeout(
+            Duration::from_millis(100),
+            wait_before_reconnect(&mut command_rx),
+        )
+        .await;
+
+        assert!(
+            delayed.is_err(),
+            "send command ended reconnect delay before the 500ms backoff"
+        );
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        assert!(wait_before_reconnect(&mut command_rx).await);
+    }
 
     #[tokio::test]
     async fn kcp_controller_receives_fresh_latest_pointer_packets_on_configured_port() {
