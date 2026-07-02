@@ -1,0 +1,27 @@
+role = "controller"
+edge_trigger_px = 2
+debug_logging = false
+
+[controller]
+agent_host = "192.168.1.2"
+agent_port = 24800
+transport_mode = "tcp"
+pointer_port = 24801
+remote_position = "right"
+
+[agent]
+listen_host = "0.0.0.0"
+listen_port = 24800
+transport_mode = "tcp"
+pointer_port = 24801
+
+[sharing]
+clipboard_text = true
+clipboard_html = true
+clipboard_images = true
+file_copy_paste = true
+real_file_drag_drop = true
+max_clipboard_bytes = 33554432
+max_file_transfer_bytes = 21474836480
+bulk_transfer_port = 24802
+incoming_cache_dir = "%LOCALAPPDATA%\\Borderless\\Incoming"
