@@ -1,6 +1,7 @@
 use crate::config::RemotePosition;
 use crate::geometry::{
-    detect_edge_for_position, edge_for_position, map_entry_point, opposite_edge, Edge, Point, Rect,
+    detect_edge_for_position, edge_for_position, opposite_edge, try_map_entry_point, Edge, Point,
+    Rect,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,9 +52,13 @@ impl ControlState {
     }
 
     pub fn observe_local_pointer(&mut self, point: Point) -> ControlOutput {
+        if self.mode == ControlMode::Remote {
+            return ControlOutput::None;
+        }
+
         self.last_local_point = point;
 
-        if self.mode == ControlMode::Remote {
+        if !self.local_desktop.is_valid() || !self.remote_desktop.is_valid() {
             return ControlOutput::None;
         }
 
@@ -65,13 +70,17 @@ impl ControlState {
             self.remote_position.clone(),
         ) == Some(target_edge)
         {
-            self.mode = ControlMode::Remote;
-            self.remote_point = self.entry_point(
+            let Some(remote_point) = try_map_entry_point(
                 self.remote_position.clone(),
                 point,
                 self.local_desktop,
                 self.remote_desktop,
-            );
+            ) else {
+                return ControlOutput::None;
+            };
+
+            self.mode = ControlMode::Remote;
+            self.remote_point = remote_point;
             return ControlOutput::EnterRemote(self.remote_point);
         }
 
@@ -83,7 +92,10 @@ impl ControlState {
             return ControlOutput::None;
         }
 
-        let next = Point::new(self.remote_point.x + dx, self.remote_point.y + dy);
+        let next = Point::new(
+            self.remote_point.x.saturating_add(dx),
+            self.remote_point.y.saturating_add(dy),
+        );
         let return_edge = opposite_edge(edge_for_position(self.remote_position.clone()));
         if crossed_edge(next, self.remote_desktop, return_edge) {
             self.mode = ControlMode::Local;
@@ -97,55 +109,22 @@ impl ControlState {
     fn local_return_point(&self) -> Point {
         match self.remote_position {
             RemotePosition::Left => Point::new(
-                self.local_desktop.left + self.edge_trigger_px - 1,
+                self.local_desktop.left + self.edge_trigger_px,
                 self.last_local_point.y,
             ),
             RemotePosition::Right => Point::new(
-                self.local_desktop.right() - self.edge_trigger_px + 1,
+                self.local_desktop.right() - self.edge_trigger_px,
                 self.last_local_point.y,
             ),
             RemotePosition::Top => Point::new(
                 self.last_local_point.x,
-                self.local_desktop.top + self.edge_trigger_px - 1,
+                self.local_desktop.top + self.edge_trigger_px,
             ),
             RemotePosition::Bottom => Point::new(
                 self.last_local_point.x,
-                self.local_desktop.bottom() - self.edge_trigger_px + 1,
+                self.local_desktop.bottom() - self.edge_trigger_px,
             ),
         }
-    }
-
-    fn entry_point(
-        &self,
-        position: RemotePosition,
-        local_point: Point,
-        local: Rect,
-        remote: Rect,
-    ) -> Point {
-        let mapped = map_entry_point(position.clone(), local_point, local, remote);
-
-        if !local.is_valid() || !remote.is_valid() {
-            return mapped;
-        }
-
-        remote.clamp(match position {
-            RemotePosition::Left => Point::new(
-                mapped.x,
-                scale_axis(local_point.y, local.top, local.height, remote.top, remote.height),
-            ),
-            RemotePosition::Right => Point::new(
-                mapped.x,
-                scale_axis(local_point.y, local.top, local.height, remote.top, remote.height),
-            ),
-            RemotePosition::Top => Point::new(
-                scale_axis(local_point.x, local.left, local.width, remote.left, remote.width),
-                mapped.y,
-            ),
-            RemotePosition::Bottom => Point::new(
-                scale_axis(local_point.x, local.left, local.width, remote.left, remote.width),
-                mapped.y,
-            ),
-        })
     }
 }
 
@@ -158,22 +137,11 @@ fn crossed_edge(point: Point, desktop: Rect, edge: Edge) -> bool {
     }
 }
 
-fn scale_axis(
-    value: i32,
-    source_start: i32,
-    source_len: i32,
-    target_start: i32,
-    target_len: i32,
-) -> i32 {
-    let source_offset = (value - source_start).clamp(0, source_len - 1) as i64;
-    target_start + ((source_offset * target_len as i64) / source_len as i64) as i32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::RemotePosition;
-    use crate::geometry::{Point, Rect};
+    use crate::geometry::{map_entry_point, Point, Rect};
 
     fn controller() -> ControlState {
         ControlState::new(
@@ -187,8 +155,12 @@ mod tests {
     #[test]
     fn entering_remote_mode_maps_to_remote_edge() {
         let mut state = controller();
-        let output = state.observe_local_pointer(Point::new(1919, 540));
-        assert_eq!(output, ControlOutput::EnterRemote(Point::new(0, 360)));
+        let local = Rect::new(0, 0, 1920, 1080);
+        let remote = Rect::new(0, 0, 1280, 720);
+        let local_point = Point::new(1919, 540);
+        let expected = map_entry_point(RemotePosition::Right, local_point, local, remote);
+        let output = state.observe_local_pointer(local_point);
+        assert_eq!(output, ControlOutput::EnterRemote(expected));
         assert_eq!(state.mode(), ControlMode::Remote);
     }
 
@@ -197,7 +169,66 @@ mod tests {
         let mut state = controller();
         state.observe_local_pointer(Point::new(1919, 540));
         let output = state.apply_remote_delta(-10, 0);
-        assert_eq!(output, ControlOutput::ReturnLocal(Point::new(1918, 540)));
+        assert_eq!(output, ControlOutput::ReturnLocal(Point::new(1917, 540)));
+        assert_eq!(state.mode(), ControlMode::Local);
+    }
+
+    #[test]
+    fn return_point_lands_outside_trigger_band() {
+        let mut state = controller();
+        state.observe_local_pointer(Point::new(1919, 540));
+
+        let output = state.apply_remote_delta(-10, 0);
+        let ControlOutput::ReturnLocal(return_point) = output else {
+            panic!("expected return to local control, got {output:?}");
+        };
+
+        assert_eq!(state.observe_local_pointer(return_point), ControlOutput::None);
+    }
+
+    #[test]
+    fn entering_remote_mode_uses_geometry_mapping() {
+        let local = Rect::new(0, 0, 1920, 1080);
+        let remote = Rect::new(0, 0, 1280, 720);
+        let local_point = Point::new(1919, 540);
+        let mut state = ControlState::new(local, remote, RemotePosition::Right, 2);
+
+        assert_eq!(
+            state.observe_local_pointer(local_point),
+            ControlOutput::EnterRemote(map_entry_point(
+                RemotePosition::Right,
+                local_point,
+                local,
+                remote,
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_remote_desktop_does_not_enter_remote() {
+        let mut state = ControlState::new(
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 0, 720),
+            RemotePosition::Right,
+            2,
+        );
+
+        assert_eq!(
+            state.observe_local_pointer(Point::new(1919, 540)),
+            ControlOutput::None
+        );
+        assert_eq!(state.mode(), ControlMode::Local);
+    }
+
+    #[test]
+    fn remote_delta_saturates_before_clamp_or_return() {
+        let mut state = controller();
+        state.observe_local_pointer(Point::new(1919, 540));
+
+        assert_eq!(
+            state.apply_remote_delta(i32::MIN, i32::MAX),
+            ControlOutput::ReturnLocal(Point::new(1917, 540))
+        );
         assert_eq!(state.mode(), ControlMode::Local);
     }
 
