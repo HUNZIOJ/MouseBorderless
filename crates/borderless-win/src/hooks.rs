@@ -28,6 +28,7 @@ use windows::{
 };
 
 const HOOK_EVENT_QUEUE_CAPACITY: usize = 1024;
+const EXTERNAL_EVENT_BACKLOG_LIMIT: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub enum HookEvent {
@@ -97,15 +98,21 @@ impl HookManager {
 impl Drop for HookManager {
     fn drop(&mut self) {
         self.set_suppression_mode(SuppressionMode::PassThrough);
+        let mut hook_thread_stopped = true;
         if let Some(stop) = self.stop.take() {
             if let Err(error) = stop.stop_and_join() {
+                hook_thread_stopped = false;
                 tracing::warn!(?error, "failed to stop input hook thread");
             }
         }
-        if let Some(forwarder) = self.forwarder.take() {
-            if let Err(error) = join_hook_thread(forwarder) {
-                tracing::warn!(?error, "failed to join input hook event forwarder");
+        if should_join_forwarder_after_stop(hook_thread_stopped) {
+            if let Some(forwarder) = self.forwarder.take() {
+                if let Err(error) = join_hook_thread(forwarder) {
+                    tracing::warn!(?error, "failed to join input hook event forwarder");
+                }
             }
+        } else {
+            let _detached_forwarder = self.forwarder.take();
         }
     }
 }
@@ -195,11 +202,25 @@ fn spawn_hook_event_forwarder(
 
 fn forward_hook_events(receiver: Receiver<HookEvent>, sender: Sender<HookEvent>) {
     for event in receiver {
-        match sender.try_send(event) {
-            Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+        if !try_forward_event(&sender, event) {
+            break;
         }
     }
+}
+
+fn try_forward_event(sender: &Sender<HookEvent>, event: HookEvent) -> bool {
+    if sender.capacity().is_none() && sender.len() >= EXTERNAL_EVENT_BACKLOG_LIMIT {
+        return true;
+    }
+
+    match sender.try_send(event) {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => true,
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn should_join_forwarder_after_stop(hook_thread_stopped: bool) -> bool {
+    hook_thread_stopped
 }
 
 thread_local! {
@@ -677,6 +698,29 @@ mod tests {
             batch[1],
             HookEvent::Input(InputEvent::MouseMoveAbs(event)) if event.x == 1 && event.y == 2
         ));
+    }
+
+    #[test]
+    fn forwarding_caps_unbounded_public_sender_backlog() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+
+        for index in 0..(EXTERNAL_EVENT_BACKLOG_LIMIT + 10) {
+            try_forward_event(
+                &sender,
+                HookEvent::PointerPosition {
+                    x: index as i32,
+                    y: 0,
+                },
+            );
+        }
+
+        assert_eq!(receiver.len(), EXTERNAL_EVENT_BACKLOG_LIMIT);
+    }
+
+    #[test]
+    fn stop_failure_leaves_forwarder_detached() {
+        assert!(!should_join_forwarder_after_stop(false));
+        assert!(should_join_forwarder_after_stop(true));
     }
 
     fn assert_mouse_button(message: u32, mouse_data: u32, button: MouseButton, pressed: bool) {
