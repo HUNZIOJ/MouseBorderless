@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a complete first-version Windows-to-Windows LAN keyboard and mouse sharing app with GUI configuration, edge switching in four directions, low-latency TCP transport, Windows input capture/injection, diagnostics, and release packaging.
+**Goal:** Build a complete first-version Windows-to-Windows LAN keyboard and mouse sharing app with GUI configuration, edge switching in four directions, configurable TCP/KCP low-latency transport, Windows input capture/injection, diagnostics, and release packaging.
 
 **Architecture:** The project is a Rust workspace with separate crates for platform-independent domain logic, networking, Windows input integration, and the GUI app. The GUI configures and monitors the system; input capture, network send/receive, control state, and input injection run outside the GUI hot path.
 
-**Tech Stack:** Rust stable MSVC toolchain, `egui`/`eframe`, `tokio`, `windows`, `serde`, `toml`, `tracing`, `bytes`, `crossbeam-channel`.
+**Tech Stack:** Rust stable MSVC toolchain, `egui`/`eframe`, `tokio`, `kcp-tokio`, `windows`, `serde`, `toml`, `tracing`, `bytes`, `crossbeam-channel`.
 
 ---
 
@@ -41,11 +41,17 @@ All paths are relative to `C:\Users\oujie\Desktop\Borderless`.
 - `crates/borderless-core/src/control.rs`
   - Controller state machine for local/remote control and edge return.
 - `crates/borderless-net/Cargo.toml`
-  - TCP transport crate.
+  - Transport crate for TCP, KCP, and UDP latest-pointer delivery.
 - `crates/borderless-net/src/lib.rs`
   - Exposes networking APIs.
 - `crates/borderless-net/src/transport.rs`
-  - Framed message reader/writer, `TCP_NODELAY`, heartbeat support.
+  - Transport mode, reliable transport trait, common events, heartbeat types.
+- `crates/borderless-net/src/tcp_transport.rs`
+  - TCP framed transport with `TCP_NODELAY`.
+- `crates/borderless-net/src/kcp_transport.rs`
+  - KCP reliable transport over UDP for low-latency mode.
+- `crates/borderless-net/src/latest_pointer.rs`
+  - UDP latest-pointer channel with sequence discard for stale mouse moves.
 - `crates/borderless-net/src/controller_client.rs`
   - Controller-side connection loop.
 - `crates/borderless-net/src/agent_server.rs`
@@ -192,6 +198,7 @@ bincode = "1"
 crossbeam-channel = "0.5"
 eframe = "0.28"
 egui = "0.28"
+kcp-tokio = "0.7"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
@@ -234,6 +241,7 @@ license.workspace = true
 anyhow.workspace = true
 borderless-core = { path = "../borderless-core" }
 bytes.workspace = true
+kcp-tokio.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ```
@@ -306,6 +314,9 @@ Write `crates/borderless-net/src/lib.rs`:
 ```rust
 pub mod agent_server;
 pub mod controller_client;
+pub mod kcp_transport;
+pub mod latest_pointer;
+pub mod tcp_transport;
 pub mod transport;
 ```
 
@@ -348,6 +359,9 @@ crates/borderless-core/src/input_event.rs
 crates/borderless-core/src/protocol.rs
 crates/borderless-net/src/agent_server.rs
 crates/borderless-net/src/controller_client.rs
+crates/borderless-net/src/kcp_transport.rs
+crates/borderless-net/src/latest_pointer.rs
+crates/borderless-net/src/tcp_transport.rs
 crates/borderless-net/src/transport.rs
 crates/borderless-win/src/dpi.rs
 crates/borderless-win/src/hooks.rs
@@ -606,6 +620,8 @@ mod tests {
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.role, Role::Controller);
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
+        assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
+        assert_eq!(decoded.controller.pointer_port, 24801);
     }
 }
 ```
@@ -644,10 +660,19 @@ pub enum RemotePosition {
     Bottom,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    Tcp,
+    Kcp,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerConfig {
     pub agent_host: String,
     pub agent_port: u16,
+    pub transport_mode: TransportMode,
+    pub pointer_port: u16,
     pub remote_position: RemotePosition,
 }
 
@@ -655,6 +680,8 @@ pub struct ControllerConfig {
 pub struct AgentConfig {
     pub listen_host: String,
     pub listen_port: u16,
+    pub transport_mode: TransportMode,
+    pub pointer_port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,11 +721,15 @@ impl Default for AppConfig {
             controller: ControllerConfig {
                 agent_host: "192.168.1.2".to_string(),
                 agent_port: 24800,
+                transport_mode: TransportMode::Tcp,
+                pointer_port: 24801,
                 remote_position: RemotePosition::Right,
             },
             agent: AgentConfig {
                 listen_host: "0.0.0.0".to_string(),
                 listen_port: 24800,
+                transport_mode: TransportMode::Tcp,
+                pointer_port: 24801,
             },
         }
     }
@@ -714,8 +745,16 @@ impl AppConfig {
             return Err(ConfigError::new("controller.agent_port must be greater than 0"));
         }
 
+        if self.controller.pointer_port == 0 {
+            return Err(ConfigError::new("controller.pointer_port must be greater than 0"));
+        }
+
         if self.agent.listen_port == 0 {
             return Err(ConfigError::new("agent.listen_port must be greater than 0"));
+        }
+
+        if self.agent.pointer_port == 0 {
+            return Err(ConfigError::new("agent.pointer_port must be greater than 0"));
         }
 
         if self.controller.agent_host.trim().is_empty() {
@@ -769,6 +808,8 @@ mod tests {
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.role, Role::Controller);
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
+        assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
+        assert_eq!(decoded.controller.pointer_port, 24801);
     }
 }
 ```
@@ -785,11 +826,15 @@ debug_logging = false
 [controller]
 agent_host = "192.168.1.2"
 agent_port = 24800
+transport_mode = "tcp"
+pointer_port = 24801
 remote_position = "right"
 
 [agent]
 listen_host = "0.0.0.0"
 listen_port = 24800
+transport_mode = "tcp"
+pointer_port = 24801
 ```
 
 - [ ] **Step 5: Verify config tests pass**
@@ -1425,61 +1470,101 @@ git commit -m "feat: add wire protocol framing"
 
 ---
 
-### Task 8: TCP Transport, Heartbeats, and Reconnect Events
+### Task 8: Configurable TCP/KCP Transport and Latest Pointer UDP
 
 **Files:**
+- Modify: `crates/borderless-net/src/lib.rs`
 - Modify: `crates/borderless-net/src/transport.rs`
+- Create: `crates/borderless-net/src/tcp_transport.rs`
+- Create: `crates/borderless-net/src/kcp_transport.rs`
+- Create: `crates/borderless-net/src/latest_pointer.rs`
 - Modify: `crates/borderless-net/src/controller_client.rs`
 - Modify: `crates/borderless-net/src/agent_server.rs`
 
-- [ ] **Step 1: Write loopback transport test**
+- [ ] **Step 1: Write latest-pointer ordering tests**
 
-Add an async test in `transport.rs`:
+Add tests in `latest_pointer.rs`:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borderless_core::protocol::{Hello, PROTOCOL_VERSION, WireMessage};
-    use borderless_core::geometry::Rect;
-    use tokio::net::TcpListener;
 
-    #[tokio::test]
-    async fn framed_transport_sends_and_receives_hello() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    #[test]
+    fn stale_pointer_packets_are_ignored() {
+        let mut state = LatestPointerState::default();
 
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = FramedTransport::new(stream).unwrap();
-            transport.read_frame().await.unwrap().message
-        });
+        assert_eq!(state.accept(PointerPacket { sequence: 10, x: 100, y: 200 }), Some((100, 200)));
+        assert_eq!(state.accept(PointerPacket { sequence: 9, x: 300, y: 400 }), None);
+        assert_eq!(state.accept(PointerPacket { sequence: 11, x: 500, y: 600 }), Some((500, 600)));
+    }
 
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client = FramedTransport::new(stream).unwrap();
-        client.send(&WireMessage::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
-            desktop: Rect::new(0, 0, 1920, 1080),
-        })).await.unwrap();
-
-        assert!(matches!(server.await.unwrap(), WireMessage::Hello(_)));
+    #[test]
+    fn pointer_packet_round_trips() {
+        let packet = PointerPacket { sequence: 42, x: -10, y: 900 };
+        let encoded = packet.encode();
+        assert_eq!(PointerPacket::decode(&encoded).unwrap(), packet);
     }
 }
 ```
 
-- [ ] **Step 2: Run transport test**
+- [ ] **Step 2: Run latest-pointer tests**
 
 Run:
 
 ```powershell
-cargo test -p borderless-net framed_transport_sends_and_receives_hello
+cargo test -p borderless-net latest_pointer
 ```
 
-Expected: FAIL because `FramedTransport` is not implemented.
+Expected: FAIL because `PointerPacket` and `LatestPointerState` are not implemented.
 
-- [ ] **Step 3: Implement framed transport**
+- [ ] **Step 3: Implement common transport types**
 
-Implement in `transport.rs`:
+Write `transport.rs`:
+
+```rust
+use borderless_core::{config::TransportMode, protocol::WireMessage};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    Waiting,
+    Connecting(String),
+    Connected { peer: String, mode: TransportMode },
+    Disconnected(String),
+    Message(WireMessage),
+    LatestPointer { x: i32, y: i32, sequence: u64 },
+    Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionCommand {
+    SendReliable(WireMessage),
+    SendLatestPointer { x: i32, y: i32 },
+    Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportSettings {
+    pub mode: TransportMode,
+    pub host: String,
+    pub reliable_port: u16,
+    pub pointer_port: u16,
+}
+
+impl TransportSettings {
+    pub fn peer_addr(&self) -> String {
+        format!("{}:{}", self.host, self.reliable_port)
+    }
+
+    pub fn pointer_addr(&self) -> String {
+        format!("{}:{}", self.host, self.pointer_port)
+    }
+}
+```
+
+- [ ] **Step 4: Implement TCP framed transport**
+
+Write `tcp_transport.rs`:
 
 ```rust
 use anyhow::Context;
@@ -1489,15 +1574,19 @@ use tokio::{
     net::TcpStream,
 };
 
-pub struct FramedTransport {
+pub struct TcpFramedTransport {
     stream: TcpStream,
     next_sequence: u64,
 }
 
-impl FramedTransport {
+impl TcpFramedTransport {
     pub fn new(stream: TcpStream) -> anyhow::Result<Self> {
         stream.set_nodelay(true).context("enable TCP_NODELAY")?;
         Ok(Self { stream, next_sequence: 1 })
+    }
+
+    pub async fn connect(addr: &str) -> anyhow::Result<Self> {
+        Self::new(TcpStream::connect(addr).await?)
     }
 
     pub async fn send(&mut self, message: &WireMessage) -> anyhow::Result<()> {
@@ -1518,61 +1607,208 @@ impl FramedTransport {
 }
 ```
 
-- [ ] **Step 4: Implement connection event types**
+- [ ] **Step 5: Implement KCP framed transport**
 
-Add to `controller_client.rs` and `agent_server.rs` public event enums:
+Write `kcp_transport.rs`:
 
 ```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConnectionEvent {
-    Waiting,
-    Connecting(String),
-    Connected(String),
-    Disconnected(String),
-    Message(borderless_core::protocol::WireMessage),
-    Error(String),
+use borderless_core::protocol::{decode_frame, encode_frame, DecodedFrame, WireMessage};
+use kcp_tokio::{KcpConfig, KcpListener, KcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub struct KcpFramedTransport {
+    stream: KcpStream,
+    next_sequence: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConnectionCommand {
-    Send(borderless_core::protocol::WireMessage),
-    Stop,
+impl KcpFramedTransport {
+    pub async fn connect(addr: &str) -> anyhow::Result<Self> {
+        let config = KcpConfig::new().fast_mode();
+        let stream = KcpStream::connect(addr, config).await?;
+        Ok(Self { stream, next_sequence: 1 })
+    }
+
+    pub async fn accept(listener: &KcpListener) -> anyhow::Result<Self> {
+        let (stream, _) = listener.accept().await?;
+        Ok(Self { stream, next_sequence: 1 })
+    }
+
+    pub async fn bind(addr: &str) -> anyhow::Result<KcpListener> {
+        let config = KcpConfig::new().fast_mode();
+        Ok(KcpListener::bind(addr, config).await?)
+    }
+
+    pub async fn send(&mut self, message: &WireMessage) -> anyhow::Result<()> {
+        let frame = encode_frame(self.next_sequence, message)?;
+        self.next_sequence += 1;
+        self.stream.write_u32(frame.len() as u32).await?;
+        self.stream.write_all(&frame).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_frame(&mut self) -> anyhow::Result<DecodedFrame> {
+        let len = self.stream.read_u32().await? as usize;
+        let mut raw = vec![0; len];
+        self.stream.read_exact(&mut raw).await?;
+        Ok(decode_frame(&raw)?)
+    }
 }
 ```
 
-- [ ] **Step 5: Add connection loops**
+- [ ] **Step 6: Implement UDP latest-pointer channel**
 
-Implement:
+Write `latest_pointer.rs`:
+
+```rust
+use bytes::{Buf, BufMut, BytesMut};
+use tokio::net::UdpSocket;
+
+const POINTER_MAGIC: u32 = 0x4250_5452;
+const POINTER_LEN: usize = 4 + 8 + 4 + 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerPacket {
+    pub sequence: u64,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl PointerPacket {
+    pub fn encode(self) -> Vec<u8> {
+        let mut buf = BytesMut::with_capacity(POINTER_LEN);
+        buf.put_u32(POINTER_MAGIC);
+        buf.put_u64(self.sequence);
+        buf.put_i32(self.x);
+        buf.put_i32(self.y);
+        buf.to_vec()
+    }
+
+    pub fn decode(raw: &[u8]) -> anyhow::Result<Self> {
+        if raw.len() != POINTER_LEN {
+            anyhow::bail!("invalid pointer packet length");
+        }
+        let mut buf = raw;
+        if buf.get_u32() != POINTER_MAGIC {
+            anyhow::bail!("invalid pointer packet magic");
+        }
+        Ok(Self {
+            sequence: buf.get_u64(),
+            x: buf.get_i32(),
+            y: buf.get_i32(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LatestPointerState {
+    latest_sequence: u64,
+}
+
+impl LatestPointerState {
+    pub fn accept(&mut self, packet: PointerPacket) -> Option<(i32, i32)> {
+        if packet.sequence <= self.latest_sequence {
+            return None;
+        }
+        self.latest_sequence = packet.sequence;
+        Some((packet.x, packet.y))
+    }
+}
+
+pub async fn send_pointer(socket: &UdpSocket, target: &str, packet: PointerPacket) -> anyhow::Result<()> {
+    socket.send_to(&packet.encode(), target).await?;
+    Ok(())
+}
+```
+
+- [ ] **Step 7: Add connection loop signatures**
+
+In `controller_client.rs`, implement:
 
 ```rust
 pub async fn run_controller_client(
-    host: String,
-    port: u16,
-    events: tokio::sync::mpsc::UnboundedSender<ConnectionEvent>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<ConnectionCommand>,
+    settings: crate::transport::TransportSettings,
+    events: tokio::sync::mpsc::UnboundedSender<crate::transport::ConnectionEvent>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<crate::transport::ConnectionCommand>,
 ) -> anyhow::Result<()>
 ```
 
-and:
+In `agent_server.rs`, implement:
 
 ```rust
 pub async fn run_agent_server(
-    listen_host: String,
-    listen_port: u16,
-    events: tokio::sync::mpsc::UnboundedSender<ConnectionEvent>,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<ConnectionCommand>,
+    settings: crate::transport::TransportSettings,
+    events: tokio::sync::mpsc::UnboundedSender<crate::transport::ConnectionEvent>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<crate::transport::ConnectionCommand>,
 ) -> anyhow::Result<()>
 ```
 
-The loops must:
+Both loops must:
 
+- Use TCP transport when `settings.mode == TransportMode::Tcp`.
+- Use KCP transport when `settings.mode == TransportMode::Kcp`.
+- Start UDP latest-pointer send/receive only in KCP mode.
 - Send `Waiting`, `Connecting`, `Connected`, and `Disconnected` events.
 - Reconnect after 500ms when the peer is unavailable.
 - Stop cleanly on `ConnectionCommand::Stop`.
-- Forward `ConnectionCommand::Send` through `FramedTransport::send`.
-- Read incoming frames and emit `ConnectionEvent::Message`.
+- Send `SendReliable` through the selected reliable transport.
+- Send `SendLatestPointer` through UDP in KCP mode and through reliable transport as a normal input message in TCP mode.
+- Read incoming reliable frames and emit `ConnectionEvent::Message`.
+- Read incoming pointer packets and emit `ConnectionEvent::LatestPointer` only for fresh sequence numbers.
 
-- [ ] **Step 6: Verify networking tests pass**
+- [ ] **Step 8: Write loopback transport tests**
+
+Add tests that cover both reliable modes and pointer ordering:
+
+```rust
+#[tokio::test]
+async fn tcp_transport_sends_and_receives_hello() {
+    use borderless_core::{geometry::Rect, protocol::{Hello, PROTOCOL_VERSION, WireMessage}};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut transport = crate::tcp_transport::TcpFramedTransport::new(stream).unwrap();
+        transport.read_frame().await.unwrap().message
+    });
+
+    let mut client = crate::tcp_transport::TcpFramedTransport::connect(&addr.to_string()).await.unwrap();
+    client.send(&WireMessage::Hello(Hello {
+        protocol_version: PROTOCOL_VERSION,
+        desktop: Rect::new(0, 0, 1920, 1080),
+    })).await.unwrap();
+
+    assert!(matches!(server.await.unwrap(), WireMessage::Hello(_)));
+}
+```
+
+Add this KCP loopback test:
+
+```rust
+#[tokio::test]
+async fn kcp_transport_sends_and_receives_hello() {
+    use borderless_core::{geometry::Rect, protocol::{Hello, PROTOCOL_VERSION, WireMessage}};
+
+    let listener = crate::kcp_transport::KcpFramedTransport::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut transport = crate::kcp_transport::KcpFramedTransport::accept(&listener).await.unwrap();
+        transport.read_frame().await.unwrap().message
+    });
+
+    let mut client = crate::kcp_transport::KcpFramedTransport::connect(&addr.to_string()).await.unwrap();
+    client.send(&WireMessage::Hello(Hello {
+        protocol_version: PROTOCOL_VERSION,
+        desktop: Rect::new(0, 0, 1920, 1080),
+    })).await.unwrap();
+
+    assert!(matches!(server.await.unwrap(), WireMessage::Hello(_)));
+}
+```
+
+- [ ] **Step 9: Verify networking tests pass**
 
 Run:
 
@@ -1582,13 +1818,13 @@ cargo test -p borderless-net
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 10: Commit**
 
 Run:
 
 ```powershell
-git add crates/borderless-net/src
-git commit -m "feat: add tcp transport loops"
+git add crates/borderless-net/src Cargo.toml crates/borderless-net/Cargo.toml
+git commit -m "feat: add configurable tcp kcp transport"
 ```
 
 ---
@@ -1627,6 +1863,7 @@ Write `status.rs`:
 
 ```rust
 use std::collections::VecDeque;
+use borderless_core::config::TransportMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunState {
@@ -1649,9 +1886,12 @@ impl Default for RunState {
 #[derive(Clone, Debug, Default)]
 pub struct AppStatus {
     pub run_state: RunState,
+    pub transport_mode: Option<TransportMode>,
     pub last_error: Option<String>,
     pub recent_rtt_ms: Option<u64>,
     pub average_rtt_ms: Option<u64>,
+    pub stale_pointer_packets: u64,
+    pub latest_pointer_sequence: Option<u64>,
     pub events: VecDeque<String>,
 }
 
@@ -1801,7 +2041,7 @@ impl RuntimeHandle {
 Write `app.rs`:
 
 ```rust
-use borderless_core::config::{AppConfig, RemotePosition, Role};
+use borderless_core::config::{AppConfig, RemotePosition, Role, TransportMode};
 use crate::{
     runtime::{RuntimeCommand, RuntimeEvent, RuntimeHandle},
     status::AppStatus,
@@ -1861,6 +2101,13 @@ impl eframe::App for BorderlessApp {
                     ui.text_edit_singleline(&mut self.config.controller.agent_host);
                 });
                 ui.add(egui::DragValue::new(&mut self.config.controller.agent_port).range(1..=65535).prefix("Port "));
+                egui::ComboBox::from_label("Transport")
+                    .selected_text(format!("{:?}", self.config.controller.transport_mode))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.config.controller.transport_mode, TransportMode::Tcp, "TCP");
+                        ui.selectable_value(&mut self.config.controller.transport_mode, TransportMode::Kcp, "KCP");
+                    });
+                ui.add(egui::DragValue::new(&mut self.config.controller.pointer_port).range(1..=65535).prefix("Pointer UDP "));
                 egui::ComboBox::from_label("Remote position")
                     .selected_text(format!("{:?}", self.config.controller.remote_position))
                     .show_ui(ui, |ui| {
@@ -1878,6 +2125,13 @@ impl eframe::App for BorderlessApp {
                     ui.text_edit_singleline(&mut self.config.agent.listen_host);
                 });
                 ui.add(egui::DragValue::new(&mut self.config.agent.listen_port).range(1..=65535).prefix("Port "));
+                egui::ComboBox::from_label("Transport")
+                    .selected_text(format!("{:?}", self.config.agent.transport_mode))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.config.agent.transport_mode, TransportMode::Tcp, "TCP");
+                        ui.selectable_value(&mut self.config.agent.transport_mode, TransportMode::Kcp, "KCP");
+                    });
+                ui.add(egui::DragValue::new(&mut self.config.agent.pointer_port).range(1..=65535).prefix("Pointer UDP "));
             });
 
             ui.add(egui::Slider::new(&mut self.config.edge_trigger_px, 1..=32).text("Edge trigger px"));
@@ -1903,10 +2157,17 @@ impl eframe::App for BorderlessApp {
                 ui.colored_label(egui::Color32::RED, error);
             }
 
+            if self.config.controller.transport_mode == TransportMode::Kcp || self.config.agent.transport_mode == TransportMode::Kcp {
+                ui.label("KCP mode uses UDP for reliable events and a separate UDP port for latest mouse position.");
+            }
+
             ui.separator();
             ui.label(format!("State: {:?}", self.status.run_state));
+            ui.label(format!("Transport: {:?}", self.status.transport_mode));
             ui.label(format!("RTT: {:?}", self.status.recent_rtt_ms));
             ui.label(format!("Average RTT: {:?}", self.status.average_rtt_ms));
+            ui.label(format!("Latest pointer sequence: {:?}", self.status.latest_pointer_sequence));
+            ui.label(format!("Stale pointer packets: {}", self.status.stale_pointer_packets));
 
             egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                 for event in &self.status.events {
@@ -2327,12 +2588,15 @@ When `RuntimeCommand::Start(config)` has `Role::Controller`, runtime must:
 
 - Load local desktop from `borderless_win::monitor::virtual_desktop_rect()`.
 - Start `HookManager`.
-- Connect to agent with `run_controller_client`.
+- Build `TransportSettings` from `config.controller.transport_mode`, `agent_host`, `agent_port`, and `pointer_port`.
+- Connect to agent with `run_controller_client(settings, events, commands)`.
 - On `Hello` from agent, build `ControlState`.
 - On hook pointer events in local mode, call `observe_local_pointer`.
-- On `EnterRemote`, switch hook suppression to `Suppress` and send `MouseMoveAbs`.
-- In remote mode, convert mouse delta and button/key events to protocol input messages.
+- On `EnterRemote`, switch hook suppression to `Suppress` and send the first remote pointer position.
+- In remote mode, send mouse movement through `ConnectionCommand::SendLatestPointer`.
+- In remote mode, send mouse buttons, wheel, keyboard events, `ReleaseAll`, and control messages through `ConnectionCommand::SendReliable`.
 - On `ReturnLocal`, switch suppression to `PassThrough` and send `ReleaseAll`.
+- Push transport mode, RTT, pointer packet sequence, stale packet count, and connection state to GUI.
 - Push status changes to GUI.
 
 - [ ] **Step 3: Implement agent runtime**
@@ -2340,11 +2604,14 @@ When `RuntimeCommand::Start(config)` has `Role::Controller`, runtime must:
 When `RuntimeCommand::Start(config)` has `Role::Agent`, runtime must:
 
 - Load local desktop from `borderless_win::monitor::virtual_desktop_rect()`.
-- Start `run_agent_server`.
+- Build `TransportSettings` from `config.agent.transport_mode`, `listen_host`, `listen_port`, and `pointer_port`.
+- Start `run_agent_server(settings, events, commands)`.
 - Send `Hello` with desktop info after connection.
 - Create `InputInjector`.
 - On `WireMessage::Input`, call `InputInjector::inject`.
+- On `ConnectionEvent::LatestPointer`, call `InputInjector::inject` with `InputEvent::MouseMoveAbs`.
 - On disconnect or stop, call `InputInjector::release_all`.
+- In KCP mode, surface UDP pointer stale packet counts in the GUI event log once per second when the count changes.
 - Push status changes to GUI.
 
 - [ ] **Step 4: Implement clean stop**
@@ -2482,7 +2749,8 @@ fn remote_mode_keeps_non_move_events_ordered() {
 
 In runtime send path:
 
-- Keep the most recent remote absolute mouse move when send queue is under pressure.
+- TCP mode keeps the most recent remote absolute mouse move when the reliable send queue is under pressure.
+- KCP mode sends remote absolute mouse move through `ConnectionCommand::SendLatestPointer`, which uses UDP latest-pointer delivery.
 - Never drop `Key`, `MouseButton`, `MouseWheel`, or `ReleaseAll`.
 - Push a GUI log entry if mouse move coalescing happens more than 100 times in a second.
 
@@ -2530,7 +2798,7 @@ git commit -m "feat: complete keyboard mouse event flow"
 
 - [ ] **Step 1: Add disconnect behavior test at transport boundary**
 
-In `transport.rs`, add a test that dropping the peer returns an error from `read_frame`.
+In `tcp_transport.rs`, add a test that dropping the peer returns an error from `read_frame`.
 
 ```rust
 #[tokio::test]
@@ -2543,7 +2811,7 @@ async fn dropped_peer_causes_read_error() {
     });
 
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut client = FramedTransport::new(stream).unwrap();
+    let mut client = crate::tcp_transport::TcpFramedTransport::new(stream).unwrap();
     server.await.unwrap();
     assert!(client.read_frame().await.is_err());
 }
@@ -2551,7 +2819,7 @@ async fn dropped_peer_causes_read_error() {
 
 - [ ] **Step 2: Implement timeout policy**
 
-Networking loops must treat no incoming data or heartbeat for 1500ms as disconnected.
+Networking loops must treat no incoming data or heartbeat for 1500ms as disconnected on the selected reliable channel.
 
 Runtime behavior:
 
@@ -2559,6 +2827,8 @@ Runtime behavior:
 - Controller returns GUI state to `Reconnecting`.
 - Agent calls `InputInjector::release_all`.
 - Agent logs `released all pressed input after disconnect`.
+- KCP mode closes the latest-pointer UDP task when the reliable KCP channel disconnects.
+- KCP mode reopens both the KCP reliable channel and latest-pointer UDP channel during reconnect.
 
 - [ ] **Step 3: Add stop cleanup**
 
@@ -2618,6 +2888,8 @@ Borderless shares one keyboard and mouse between two Windows computers on the sa
 - Rust stable MSVC toolchain
 - Both computers on the same LAN
 - Same privilege level on both computers when controlling elevated windows
+- TCP mode requires the agent listen port.
+- KCP mode requires the reliable UDP port and the pointer UDP port.
 
 ## Run
 
@@ -2629,21 +2901,25 @@ cargo run -p borderless-app
 
 1. Choose `Controller`.
 2. Enter the agent computer IP and port.
-3. Choose the agent position: left, right, top, or bottom.
-4. Click `Save`.
-5. Click `Start`.
+3. Choose transport mode: `TCP` for stable default behavior, `KCP` for low-latency UDP behavior.
+4. If using KCP, confirm the pointer UDP port.
+5. Choose the agent position: left, right, top, or bottom.
+6. Click `Save`.
+7. Click `Start`.
 
 ## Agent Setup
 
 1. Choose `Agent`.
 2. Set listen IP to `0.0.0.0`.
 3. Set listen port to match the controller.
-4. Click `Save`.
-5. Click `Start`.
+4. Choose the same transport mode as the controller.
+5. If using KCP, confirm the pointer UDP port.
+6. Click `Save`.
+7. Click `Start`.
 
 ## Firewall
 
-Allow the app to listen on the configured port on the agent computer.
+Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port.
 
 ## Permissions
 
@@ -2670,6 +2946,9 @@ Create `tests/manual/windows-two-machine-checklist.md` with:
 - [ ] Controller connects to agent IP and port.
 - [ ] Both GUIs show connected state.
 - [ ] RTT appears and updates.
+- [ ] TCP mode connects and reports TCP in the GUI.
+- [ ] KCP mode connects and reports KCP in the GUI.
+- [ ] KCP mode shows latest pointer sequence updates during remote mouse movement.
 
 ## Edge Switching
 
@@ -2698,7 +2977,9 @@ Create `tests/manual/windows-two-machine-checklist.md` with:
 - [ ] Stop restores local controller input.
 - [ ] Agent disconnect releases pressed state.
 - [ ] Controller reconnects after agent restarts.
+- [ ] KCP mode recovers after agent restart and reopens the pointer UDP channel.
 - [ ] GUI logs explain permission errors.
+- [ ] GUI logs explain likely firewall issues when KCP UDP ports are blocked.
 ```
 
 - [ ] **Step 3: Commit**
@@ -2832,7 +3113,7 @@ Spec coverage:
 - GUI configuration and state display: covered by Tasks 9, 10, 15.
 - Windows-to-Windows input capture and injection: covered by Tasks 11, 12, 13, 14, 16.
 - Four-direction edge switching and coordinate mapping: covered by Tasks 5, 6, 16, 18.
-- TCP communication, heartbeat, reconnect: covered by Tasks 7, 8, 14, 17.
+- TCP, KCP, UDP latest-pointer communication, heartbeat, reconnect: covered by Tasks 7, 8, 14, 17.
 - Low-latency hot path separation from GUI: covered by Tasks 8, 14, 16.
 - Error handling and release-all safety: covered by Tasks 12, 14, 17.
 - Testing and manual validation: covered by Tasks 3-8, 16-18, 20.
