@@ -53,6 +53,13 @@ impl BorderlessApp {
         }
     }
 
+    fn reconnect_runtime(&mut self) {
+        if self.save_config() {
+            self.runtime
+                .send(RuntimeCommand::Reconnect(self.config.clone()));
+        }
+    }
+
     fn handle_runtime_events(&mut self) {
         for event in self.runtime.drain_events() {
             match event {
@@ -296,8 +303,7 @@ impl eframe::App for BorderlessApp {
                     }
 
                     if ui.button("Reconnect").clicked() {
-                        self.runtime
-                            .send(RuntimeCommand::Reconnect(self.config.clone()));
+                        self.reconnect_runtime();
                     }
                 });
 
@@ -367,6 +373,26 @@ mod tests {
         app.config.edge_trigger_px = 0;
 
         app.start_runtime();
+
+        assert!(app
+            .config_error
+            .as_deref()
+            .is_some_and(|error| error.contains("edge_trigger_px")));
+        assert!(wait_for_events(&app.runtime, Duration::from_millis(100)).is_empty());
+    }
+
+    #[test]
+    fn reconnect_runtime_does_not_send_reconnect_when_config_is_invalid() {
+        let runtime = RuntimeHandle::spawn();
+        let mut app = BorderlessApp {
+            config: AppConfig::default(),
+            status: AppStatus::default(),
+            runtime,
+            config_error: None,
+        };
+        app.config.edge_trigger_px = 0;
+
+        app.reconnect_runtime();
 
         assert!(app
             .config_error
