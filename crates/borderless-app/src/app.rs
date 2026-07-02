@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use borderless_core::config::{AppConfig, RemotePosition, Role, TransportMode};
 use eframe::egui;
@@ -37,11 +37,20 @@ impl BorderlessApp {
         }
     }
 
-    fn save_config(&mut self) {
+    fn save_config(&mut self) -> bool {
         self.config_error = match self.config.save_to_path(CONFIG_PATH) {
             Ok(()) => None,
             Err(err) => Some(format!("Failed to save {CONFIG_PATH}: {err}")),
         };
+
+        self.config_error.is_none()
+    }
+
+    fn start_runtime(&mut self) {
+        if self.save_config() {
+            self.runtime
+                .send(RuntimeCommand::Start(self.config.clone()));
+        }
     }
 
     fn handle_runtime_events(&mut self) {
@@ -240,62 +249,65 @@ impl BorderlessApp {
 impl eframe::App for BorderlessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_runtime_events();
+        ctx.request_repaint_after(Duration::from_millis(100));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Borderless");
-            ui.add_space(8.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Borderless");
+                ui.add_space(8.0);
 
-            self.show_role(ui);
-            ui.separator();
+                self.show_role(ui);
+                ui.separator();
 
-            self.show_controller(ui);
-            self.show_agent(ui);
+                self.show_controller(ui);
+                self.show_agent(ui);
 
-            if self.config.controller.transport_mode == TransportMode::Kcp
-                || self.config.agent.transport_mode == TransportMode::Kcp
-            {
-                ui.label("KCP uses TCP for reliable control and UDP for pointer updates.");
-            }
+                if self.config.controller.transport_mode == TransportMode::Kcp
+                    || self.config.agent.transport_mode == TransportMode::Kcp
+                {
+                    ui.label("KCP uses TCP for reliable control and UDP for pointer updates.");
+                }
 
-            ui.separator();
+                ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Edge trigger");
-                ui.add(egui::Slider::new(&mut self.config.edge_trigger_px, 1..=32).suffix(" px"));
-                ui.checkbox(&mut self.config.debug_logging, "Debug");
+                ui.horizontal(|ui| {
+                    ui.label("Edge trigger");
+                    ui.add(
+                        egui::Slider::new(&mut self.config.edge_trigger_px, 1..=32).suffix(" px"),
+                    );
+                    ui.checkbox(&mut self.config.debug_logging, "Debug");
+                });
+
+                self.show_sharing(ui);
+
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_config();
+                    }
+
+                    if ui.button("Start").clicked() {
+                        self.start_runtime();
+                    }
+
+                    if ui.button("Stop").clicked() {
+                        self.runtime.send(RuntimeCommand::Stop);
+                    }
+
+                    if ui.button("Reconnect").clicked() {
+                        self.runtime
+                            .send(RuntimeCommand::Reconnect(self.config.clone()));
+                    }
+                });
+
+                if let Some(error) = &self.config_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                self.show_status(ui);
+                self.show_event_log(ui);
             });
-
-            self.show_sharing(ui);
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    self.save_config();
-                }
-
-                if ui.button("Start").clicked() {
-                    self.save_config();
-                    self.runtime
-                        .send(RuntimeCommand::Start(self.config.clone()));
-                }
-
-                if ui.button("Stop").clicked() {
-                    self.runtime.send(RuntimeCommand::Stop);
-                }
-
-                if ui.button("Reconnect").clicked() {
-                    self.runtime
-                        .send(RuntimeCommand::Reconnect(self.config.clone()));
-                }
-            });
-
-            if let Some(error) = &self.config_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-
-            self.show_status(ui);
-            self.show_event_log(ui);
         });
     }
 }
@@ -332,4 +344,49 @@ fn option_number(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    #[test]
+    fn start_runtime_does_not_send_start_when_config_is_invalid() {
+        let runtime = RuntimeHandle::spawn();
+        let mut app = BorderlessApp {
+            config: AppConfig::default(),
+            status: AppStatus::default(),
+            runtime,
+            config_error: None,
+        };
+        app.config.edge_trigger_px = 0;
+
+        app.start_runtime();
+
+        assert!(app
+            .config_error
+            .as_deref()
+            .is_some_and(|error| error.contains("edge_trigger_px")));
+        assert!(wait_for_events(&app.runtime, Duration::from_millis(100)).is_empty());
+    }
+
+    fn wait_for_events(runtime: &RuntimeHandle, timeout: Duration) -> Vec<RuntimeEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut events = Vec::new();
+
+        while Instant::now() < deadline {
+            events.extend(runtime.drain_events());
+            if !events.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        events
+    }
 }

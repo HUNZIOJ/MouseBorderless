@@ -1,6 +1,6 @@
 use std::thread;
 
-use borderless_core::config::AppConfig;
+use borderless_core::config::{AppConfig, Role, TransportMode};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::status::{AppStatus, RunState};
@@ -36,7 +36,7 @@ impl RuntimeHandle {
                 match command {
                     RuntimeCommand::Start(config) => {
                         status.run_state = RunState::Connecting;
-                        status.transport_mode = Some(config.controller.transport_mode);
+                        status.transport_mode = Some(runtime_transport_mode(&config));
                         send(
                             &events_tx,
                             RuntimeEvent::Log("starting runtime".to_string()),
@@ -48,7 +48,7 @@ impl RuntimeHandle {
                     }
                     RuntimeCommand::Reconnect(config) => {
                         status.run_state = RunState::Reconnecting;
-                        status.transport_mode = Some(config.controller.transport_mode);
+                        status.transport_mode = Some(runtime_transport_mode(&config));
                         send(
                             &events_tx,
                             RuntimeEvent::Log("reconnecting runtime".to_string()),
@@ -79,9 +79,18 @@ fn send(sender: &Sender<RuntimeEvent>, event: RuntimeEvent) {
     let _ = sender.send(event);
 }
 
+fn runtime_transport_mode(config: &AppConfig) -> TransportMode {
+    match config.role {
+        Role::Controller => config.controller.transport_mode,
+        Role::Agent => config.agent.transport_mode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use borderless_core::config::{Role, TransportMode};
 
     use super::*;
 
@@ -132,6 +141,37 @@ mod tests {
         let cloned = command.clone();
 
         assert!(matches!(cloned, RuntimeCommand::Start(_)));
+    }
+
+    #[test]
+    fn agent_start_and_reconnect_report_agent_transport_mode() {
+        let runtime = RuntimeHandle::spawn();
+        let mut config = AppConfig::default();
+        config.role = Role::Agent;
+        config.controller.transport_mode = TransportMode::Tcp;
+        config.agent.transport_mode = TransportMode::Kcp;
+
+        runtime.send(RuntimeCommand::Start(config.clone()));
+        let events = wait_for_events(&runtime, 2);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::Status(status)
+                    if status.run_state == RunState::Connecting
+                        && status.transport_mode == Some(TransportMode::Kcp)
+            )
+        }));
+
+        runtime.send(RuntimeCommand::Reconnect(config));
+        let events = wait_for_events(&runtime, 2);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::Status(status)
+                    if status.run_state == RunState::Reconnecting
+                        && status.transport_mode == Some(TransportMode::Kcp)
+            )
+        }));
     }
 
     fn wait_for_events(runtime: &RuntimeHandle, count: usize) -> Vec<RuntimeEvent> {
