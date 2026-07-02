@@ -142,6 +142,7 @@ mod tests {
     use super::*;
     use crate::config::RemotePosition;
     use crate::geometry::{map_entry_point, Point, Rect};
+    use crate::input_event::{InputEvent, KeyEvent, MouseButton, MouseButtonEvent};
 
     fn controller() -> ControlState {
         ControlState::new(
@@ -247,5 +248,53 @@ mod tests {
         let output = state.observe_local_pointer(Point::new(0, 0));
         assert_eq!(output, ControlOutput::EnterRemote(Point::new(0, 719)));
         assert_eq!(state.mode(), ControlMode::Remote);
+    }
+
+    #[test]
+    fn remote_mode_keeps_non_move_events_ordered() {
+        let mut state = controller();
+        state.observe_local_pointer(Point::new(1919, 540));
+        assert_eq!(state.mode(), ControlMode::Remote);
+
+        let events = vec![
+            InputEvent::Key(KeyEvent {
+                vk_code: 0x41,
+                pressed: true,
+            }),
+            InputEvent::MouseButton(MouseButtonEvent {
+                button: MouseButton::Left,
+                pressed: true,
+            }),
+            InputEvent::MouseButton(MouseButtonEvent {
+                button: MouseButton::Left,
+                pressed: false,
+            }),
+            InputEvent::Key(KeyEvent {
+                vk_code: 0x41,
+                pressed: false,
+            }),
+        ];
+
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::Key(KeyEvent {
+                    vk_code: 0x41,
+                    pressed: true,
+                }),
+                InputEvent::MouseButton(MouseButtonEvent {
+                    button: MouseButton::Left,
+                    pressed: true,
+                }),
+                InputEvent::MouseButton(MouseButtonEvent {
+                    button: MouseButton::Left,
+                    pressed: false,
+                }),
+                InputEvent::Key(KeyEvent {
+                    vk_code: 0x41,
+                    pressed: false,
+                }),
+            ]
+        );
     }
 }

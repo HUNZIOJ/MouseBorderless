@@ -36,6 +36,8 @@ const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const MAX_OUTSTANDING_HEARTBEATS: usize = 8;
 const STALE_POINTER_EMIT_INTERVAL_MILLIS: u64 = 1_000;
 const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOTE_MOVE_COALESCE_LOG_THRESHOLD: u64 = 100;
+const REMOTE_MOVE_COALESCE_LOG_WINDOW_MILLIS: u64 = 1_000;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
@@ -418,6 +420,7 @@ async fn run_controller_event_pump(
 ) {
     let mut control_state: Option<ControlState> = None;
     let mut last_pointer: Option<Point> = None;
+    let mut remote_input_send_buffer = RemoteInputSendBuffer::new(config.controller.transport_mode);
     let mut heartbeat = HeartbeatTracker::default();
     let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
     let mut hook_interval = interval(HOOK_POLL_INTERVAL);
@@ -436,17 +439,29 @@ async fn run_controller_event_pump(
                         local_desktop,
                         &mut control_state,
                         &mut last_pointer,
+                        &mut remote_input_send_buffer,
                         &hook_manager,
                         &connection_commands,
                         &updates,
                         session_id,
                     );
                 }
+                emit_remote_send_actions(
+                    remote_input_send_buffer.flush_pending_move(),
+                    &connection_commands,
+                    &updates,
+                    session_id,
+                );
             }
             command = session_commands.recv() => {
                 if matches!(command, Some(SessionCommand::Stop) | None) {
                     set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
-                    send_release_all(&connection_commands);
+                    emit_remote_send_actions(
+                        remote_input_send_buffer.send_release_all(),
+                        &connection_commands,
+                        &updates,
+                        session_id,
+                    );
                     break;
                 }
             }
@@ -585,11 +600,144 @@ fn apply_controller_recovery_action(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteSendAction {
+    Command(ConnectionCommand),
+    Log(String),
+}
+
+#[derive(Clone, Debug)]
+struct RemoteInputSendBuffer {
+    transport_mode: TransportMode,
+    pending_tcp_move: Option<Point>,
+    coalescing_log_gate: RemoteMoveCoalescingLogGate,
+}
+
+impl RemoteInputSendBuffer {
+    fn new(transport_mode: TransportMode) -> Self {
+        Self {
+            transport_mode,
+            pending_tcp_move: None,
+            coalescing_log_gate: RemoteMoveCoalescingLogGate::default(),
+        }
+    }
+
+    fn send_pointer(&mut self, point: Point, now_millis: u64) -> Vec<RemoteSendAction> {
+        match self.transport_mode {
+            TransportMode::Kcp => vec![RemoteSendAction::Command(latest_pointer_command(point))],
+            TransportMode::Tcp => {
+                let mut actions = Vec::new();
+                if self.pending_tcp_move.replace(point).is_some() {
+                    if let Some(emission) = self.coalescing_log_gate.record(now_millis) {
+                        actions.push(RemoteSendAction::Log(emission.log_message()));
+                    }
+                }
+                actions
+            }
+        }
+    }
+
+    fn send_reliable_input(&mut self, event: InputEvent) -> Vec<RemoteSendAction> {
+        let mut actions = self.flush_pending_move();
+        actions.push(RemoteSendAction::Command(ConnectionCommand::SendReliable(
+            WireMessage::Input(event),
+        )));
+        actions
+    }
+
+    fn send_release_all(&mut self) -> Vec<RemoteSendAction> {
+        let mut actions = self.flush_pending_move();
+        actions.push(RemoteSendAction::Command(ConnectionCommand::SendReliable(
+            WireMessage::ReleaseAll,
+        )));
+        actions
+    }
+
+    fn flush_pending_move(&mut self) -> Vec<RemoteSendAction> {
+        self.pending_tcp_move
+            .take()
+            .map(latest_pointer_command)
+            .map(RemoteSendAction::Command)
+            .into_iter()
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteMoveCoalescingLogGate {
+    window_start_millis: Option<u64>,
+    coalesced_in_window: u64,
+    emitted_in_window: bool,
+}
+
+impl RemoteMoveCoalescingLogGate {
+    fn record(&mut self, now_millis: u64) -> Option<RemoteMoveCoalescingEmission> {
+        if self.window_start_millis.is_none_or(|start| {
+            now_millis.saturating_sub(start) >= REMOTE_MOVE_COALESCE_LOG_WINDOW_MILLIS
+        }) {
+            self.window_start_millis = Some(now_millis);
+            self.coalesced_in_window = 0;
+            self.emitted_in_window = false;
+        }
+
+        self.coalesced_in_window = self.coalesced_in_window.saturating_add(1);
+        if self.coalesced_in_window > REMOTE_MOVE_COALESCE_LOG_THRESHOLD && !self.emitted_in_window
+        {
+            self.emitted_in_window = true;
+            Some(RemoteMoveCoalescingEmission {
+                count: self.coalesced_in_window,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteMoveCoalescingEmission {
+    count: u64,
+}
+
+impl RemoteMoveCoalescingEmission {
+    fn log_message(self) -> String {
+        format!(
+            "coalesced remote mouse moves: {} in the last second",
+            self.count
+        )
+    }
+}
+
+fn emit_remote_send_actions(
+    actions: Vec<RemoteSendAction>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) {
+    for action in actions {
+        match action {
+            RemoteSendAction::Command(command) => {
+                let _ = connection_commands.send(command);
+            }
+            RemoteSendAction::Log(message) => {
+                send_session_update(updates, session_id, SessionUpdate::Log(message));
+            }
+        }
+    }
+}
+
+fn latest_pointer_command(point: Point) -> ConnectionCommand {
+    ConnectionCommand::SendLatestPointer {
+        x: point.x,
+        y: point.y,
+    }
+}
+
 fn handle_controller_hook_event(
     event: HookEvent,
     local_desktop: Rect,
     control_state: &mut Option<ControlState>,
     last_pointer: &mut Option<Point>,
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
@@ -610,6 +758,7 @@ fn handle_controller_hook_event(
                     handle_control_output(
                         output,
                         local_desktop,
+                        remote_input_send_buffer,
                         hook_manager,
                         connection_commands,
                         updates,
@@ -628,6 +777,7 @@ fn handle_controller_hook_event(
                     handle_control_output(
                         output,
                         local_desktop,
+                        remote_input_send_buffer,
                         hook_manager,
                         connection_commands,
                         updates,
@@ -645,6 +795,7 @@ fn handle_controller_hook_event(
                     input,
                     local_desktop,
                     control_state,
+                    remote_input_send_buffer,
                     hook_manager,
                     connection_commands,
                     updates,
@@ -659,6 +810,7 @@ fn send_remote_input(
     input: InputEvent,
     local_desktop: Rect,
     control_state: &mut Option<ControlState>,
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
@@ -672,6 +824,7 @@ fn send_remote_input(
                 handle_control_output(
                     output,
                     local_desktop,
+                    remote_input_send_buffer,
                     hook_manager,
                     connection_commands,
                     updates,
@@ -679,10 +832,19 @@ fn send_remote_input(
                 );
             }
         }
-        InputEvent::ReleaseAll => send_release_all(connection_commands),
+        InputEvent::ReleaseAll => emit_remote_send_actions(
+            remote_input_send_buffer.send_release_all(),
+            connection_commands,
+            updates,
+            session_id,
+        ),
         event => {
-            let _ = connection_commands
-                .send(ConnectionCommand::SendReliable(WireMessage::Input(event)));
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_reliable_input(event),
+                connection_commands,
+                updates,
+                session_id,
+            );
         }
     }
 }
@@ -690,6 +852,7 @@ fn send_remote_input(
 fn handle_control_output(
     output: ControlOutput,
     local_desktop: Rect,
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
@@ -701,7 +864,12 @@ fn handle_control_output(
         ControlOutput::None => {}
         ControlOutput::EnterRemote(point) => {
             set_hook_suppression(hook_manager, SuppressionMode::Suppress);
-            send_latest_pointer(connection_commands, point);
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_pointer(point, now_millis()),
+                connection_commands,
+                updates,
+                session_id,
+            );
             send_session_update(
                 updates,
                 session_id,
@@ -714,7 +882,12 @@ fn handle_control_output(
             );
         }
         ControlOutput::MoveRemote(point) => {
-            send_latest_pointer(connection_commands, point);
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_pointer(point, now_millis()),
+                connection_commands,
+                updates,
+                session_id,
+            );
         }
         ControlOutput::ReturnLocal(_) => {
             let Some(point) = return_local_target else {
@@ -728,7 +901,12 @@ fn handle_control_output(
                     SessionUpdate::Error(format!("local pointer move failed: {error}")),
                 );
             }
-            send_release_all(connection_commands);
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_release_all(),
+                connection_commands,
+                updates,
+                session_id,
+            );
             send_session_update(
                 updates,
                 session_id,
@@ -921,16 +1099,6 @@ fn send_heartbeat(
     let _ = connection_commands.send(ConnectionCommand::SendReliable(WireMessage::Heartbeat(
         Heartbeat { sent_millis },
     )));
-}
-
-fn send_latest_pointer(
-    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-    point: Point,
-) {
-    let _ = connection_commands.send(ConnectionCommand::SendLatestPointer {
-        x: point.x,
-        y: point.y,
-    });
 }
 
 fn send_release_all(connection_commands: &mpsc::UnboundedSender<ConnectionCommand>) {
@@ -1218,6 +1386,7 @@ mod tests {
 
     use borderless_core::{
         config::{RemotePosition, Role, TransportMode},
+        input_event::{InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseWheelEvent},
         protocol::WireMessage,
     };
     use borderless_net::transport::ConnectionEvent;
@@ -1342,6 +1511,118 @@ mod tests {
 
         assert_eq!(emissions, vec![1, 5]);
         assert_eq!(status.stale_pointer_packets, 5);
+    }
+
+    #[test]
+    fn remote_input_send_buffer_coalesces_tcp_moves_and_preserves_reliable_order() {
+        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let key_down = InputEvent::Key(KeyEvent {
+            vk_code: 0x41,
+            pressed: true,
+        });
+        let left_down = InputEvent::MouseButton(MouseButtonEvent {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        let wheel = InputEvent::MouseWheel(MouseWheelEvent {
+            delta: 120,
+            horizontal: false,
+        });
+        let mut actions = Vec::new();
+
+        actions.extend(buffer.send_pointer(Point::new(10, 10), 1_000));
+        actions.extend(buffer.send_pointer(Point::new(20, 20), 1_001));
+        actions.extend(buffer.send_reliable_input(key_down.clone()));
+        actions.extend(buffer.send_pointer(Point::new(30, 30), 1_002));
+        actions.extend(buffer.send_pointer(Point::new(40, 40), 1_003));
+        actions.extend(buffer.send_reliable_input(left_down.clone()));
+        actions.extend(buffer.send_reliable_input(wheel.clone()));
+        actions.extend(buffer.send_release_all());
+        actions.extend(buffer.flush_pending_move());
+
+        assert_eq!(
+            actions,
+            vec![
+                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 20, y: 20 }),
+                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
+                    key_down
+                ))),
+                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 40, y: 40 }),
+                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
+                    left_down
+                ))),
+                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
+                    wheel
+                ))),
+                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::ReleaseAll)),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_input_send_buffer_keeps_kcp_pointer_moves_on_latest_pointer_path() {
+        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Kcp);
+        let mut actions = Vec::new();
+
+        actions.extend(buffer.send_pointer(Point::new(10, 10), 1_000));
+        actions.extend(buffer.send_pointer(Point::new(20, 20), 1_001));
+
+        assert_eq!(
+            actions,
+            vec![
+                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 10, y: 10 }),
+                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 20, y: 20 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_input_send_buffer_logs_tcp_move_coalescing_once_per_second() {
+        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let mut log_actions = Vec::new();
+
+        for i in 0..=102 {
+            log_actions.extend(
+                buffer
+                    .send_pointer(Point::new(i, i), 1_000)
+                    .into_iter()
+                    .filter(|action| matches!(action, RemoteSendAction::Log(_))),
+            );
+        }
+        log_actions.extend(
+            buffer
+                .send_pointer(Point::new(200, 200), 1_500)
+                .into_iter()
+                .filter(|action| matches!(action, RemoteSendAction::Log(_))),
+        );
+
+        assert_eq!(
+            log_actions,
+            vec![RemoteSendAction::Log(
+                "coalesced remote mouse moves: 101 in the last second".to_string()
+            )]
+        );
+
+        for i in 0..=101 {
+            log_actions.extend(
+                buffer
+                    .send_pointer(Point::new(300 + i, 300 + i), 2_100)
+                    .into_iter()
+                    .filter(|action| matches!(action, RemoteSendAction::Log(_))),
+            );
+        }
+
+        assert_eq!(
+            log_actions,
+            vec![
+                RemoteSendAction::Log(
+                    "coalesced remote mouse moves: 101 in the last second".to_string()
+                ),
+                RemoteSendAction::Log(
+                    "coalesced remote mouse moves: 101 in the last second".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
