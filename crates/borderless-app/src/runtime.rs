@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -93,7 +96,7 @@ struct ActiveRuntime {
     connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
     session_commands: mpsc::UnboundedSender<SessionCommand>,
     hook_manager: Option<Arc<Mutex<HookManager>>>,
-    send_release_all_on_stop: bool,
+    remote_control_active: Option<Arc<AtomicBool>>,
     tasks: Vec<JoinHandle<()>>,
     stopped: bool,
 }
@@ -110,7 +113,11 @@ impl ActiveRuntime {
         }
         self.stopped = true;
 
-        if self.send_release_all_on_stop {
+        if self
+            .remote_control_active
+            .as_ref()
+            .is_some_and(|active| active.swap(false, Ordering::SeqCst))
+        {
             let _ = self
                 .connection_commands
                 .send(ConnectionCommand::SendReliable(WireMessage::ReleaseAll));
@@ -312,6 +319,7 @@ fn start_controller_session(
     let hook_manager = Arc::new(Mutex::new(
         HookManager::install(hook_events_tx).map_err(|error| error.to_string())?,
     ));
+    let remote_control_active = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
 
     let transport_updates = updates.clone();
@@ -330,12 +338,14 @@ fn start_controller_session(
     let pump_updates = updates;
     let pump_commands = connection_commands_tx.clone();
     let pump_hook_manager = Arc::clone(&hook_manager);
+    let pump_remote_control_active = Arc::clone(&remote_control_active);
     tasks.push(tokio::spawn(async move {
         run_controller_event_pump(
             session_id,
             config,
             local_desktop,
             pump_hook_manager,
+            pump_remote_control_active,
             hook_events_rx,
             connection_events_rx,
             pump_commands,
@@ -350,7 +360,7 @@ fn start_controller_session(
         connection_commands: connection_commands_tx,
         session_commands: session_commands_tx,
         hook_manager: Some(hook_manager),
-        send_release_all_on_stop: true,
+        remote_control_active: Some(remote_control_active),
         tasks,
         stopped: false,
     })
@@ -400,7 +410,7 @@ fn start_agent_session(
         connection_commands: connection_commands_tx,
         session_commands: session_commands_tx,
         hook_manager: None,
-        send_release_all_on_stop: false,
+        remote_control_active: None,
         tasks,
         stopped: false,
     }
@@ -412,6 +422,7 @@ async fn run_controller_event_pump(
     config: AppConfig,
     local_desktop: Rect,
     hook_manager: Arc<Mutex<HookManager>>,
+    remote_control_active: Arc<AtomicBool>,
     hook_events: Receiver<HookEvent>,
     mut connection_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
@@ -441,6 +452,7 @@ async fn run_controller_event_pump(
                         &mut last_pointer,
                         &mut remote_input_send_buffer,
                         &hook_manager,
+                        &remote_control_active,
                         &connection_commands,
                         &updates,
                         session_id,
@@ -456,12 +468,14 @@ async fn run_controller_event_pump(
             command = session_commands.recv() => {
                 if matches!(command, Some(SessionCommand::Stop) | None) {
                     set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
-                    emit_remote_send_actions(
-                        remote_input_send_buffer.send_release_all(),
-                        &connection_commands,
-                        &updates,
-                        session_id,
-                    );
+                    if remote_control_active.swap(false, Ordering::SeqCst) {
+                        emit_remote_send_actions(
+                            remote_input_send_buffer.send_release_all(),
+                            &connection_commands,
+                            &updates,
+                            session_id,
+                        );
+                    }
                     break;
                 }
             }
@@ -476,6 +490,7 @@ async fn run_controller_event_pump(
                     local_desktop,
                     &mut control_state,
                     &hook_manager,
+                    &remote_control_active,
                     &connection_commands,
                     &updates,
                     session_id,
@@ -486,6 +501,7 @@ async fn run_controller_event_pump(
     }
 
     set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
+    remote_control_active.store(false, Ordering::SeqCst);
 }
 
 fn handle_controller_connection_event(
@@ -494,6 +510,7 @@ fn handle_controller_connection_event(
     local_desktop: Rect,
     control_state: &mut Option<ControlState>,
     hook_manager: &Arc<Mutex<HookManager>>,
+    remote_control_active: &Arc<AtomicBool>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -526,6 +543,7 @@ fn handle_controller_connection_event(
                 config.controller.remote_position.clone(),
                 config.edge_trigger_px,
             ));
+            remote_control_active.store(false, Ordering::SeqCst);
             send_session_update(
                 updates,
                 session_id,
@@ -541,11 +559,21 @@ fn handle_controller_connection_event(
             handle_heartbeat_message(message, heartbeat, connection_commands, updates, session_id);
         }
         ConnectionEvent::Message(WireMessage::Error(error)) => {
-            apply_controller_recovery_action(recovery_action, hook_manager, connection_commands);
+            apply_controller_recovery_action(
+                recovery_action,
+                hook_manager,
+                remote_control_active,
+                connection_commands,
+            );
             send_session_update(updates, session_id, SessionUpdate::Error(error));
         }
         ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_) => {
-            apply_controller_recovery_action(recovery_action, hook_manager, connection_commands);
+            apply_controller_recovery_action(
+                recovery_action,
+                hook_manager,
+                remote_control_active,
+                connection_commands,
+            );
         }
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
@@ -590,13 +618,16 @@ fn controller_recovery_action_for_connection_event(
 fn apply_controller_recovery_action(
     action: ControllerRecoveryAction,
     hook_manager: &Arc<Mutex<HookManager>>,
+    remote_control_active: &Arc<AtomicBool>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
 ) {
     if action.pass_through {
         set_hook_suppression(hook_manager, SuppressionMode::PassThrough);
     }
     if action.release_all {
-        send_release_all(connection_commands);
+        emit_recovery_release_all(remote_control_active, || {
+            send_release_all(connection_commands)
+        });
     }
 }
 
@@ -725,6 +756,27 @@ fn emit_remote_send_actions(
     }
 }
 
+fn emit_return_local_release_all(
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
+    remote_control_active: &Arc<AtomicBool>,
+    emit: impl FnOnce(Vec<RemoteSendAction>),
+) {
+    let actions = remote_input_send_buffer.send_release_all();
+    emit_before_clearing_remote_control(remote_control_active, || emit(actions));
+}
+
+fn emit_recovery_release_all(remote_control_active: &Arc<AtomicBool>, emit: impl FnOnce()) {
+    emit_before_clearing_remote_control(remote_control_active, emit);
+}
+
+fn emit_before_clearing_remote_control(
+    remote_control_active: &Arc<AtomicBool>,
+    emit: impl FnOnce(),
+) {
+    emit();
+    remote_control_active.store(false, Ordering::SeqCst);
+}
+
 fn latest_pointer_command(point: Point) -> ConnectionCommand {
     ConnectionCommand::SendLatestPointer {
         x: point.x,
@@ -739,6 +791,7 @@ fn handle_controller_hook_event(
     last_pointer: &mut Option<Point>,
     remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
+    remote_control_active: &Arc<AtomicBool>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -760,6 +813,7 @@ fn handle_controller_hook_event(
                         local_desktop,
                         remote_input_send_buffer,
                         hook_manager,
+                        remote_control_active,
                         connection_commands,
                         updates,
                         session_id,
@@ -779,6 +833,7 @@ fn handle_controller_hook_event(
                         local_desktop,
                         remote_input_send_buffer,
                         hook_manager,
+                        remote_control_active,
                         connection_commands,
                         updates,
                         session_id,
@@ -797,6 +852,7 @@ fn handle_controller_hook_event(
                     control_state,
                     remote_input_send_buffer,
                     hook_manager,
+                    remote_control_active,
                     connection_commands,
                     updates,
                     session_id,
@@ -812,6 +868,7 @@ fn send_remote_input(
     control_state: &mut Option<ControlState>,
     remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
+    remote_control_active: &Arc<AtomicBool>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -826,6 +883,7 @@ fn send_remote_input(
                     local_desktop,
                     remote_input_send_buffer,
                     hook_manager,
+                    remote_control_active,
                     connection_commands,
                     updates,
                     session_id,
@@ -854,6 +912,7 @@ fn handle_control_output(
     local_desktop: Rect,
     remote_input_send_buffer: &mut RemoteInputSendBuffer,
     hook_manager: &Arc<Mutex<HookManager>>,
+    remote_control_active: &Arc<AtomicBool>,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -863,6 +922,7 @@ fn handle_control_output(
     match output {
         ControlOutput::None => {}
         ControlOutput::EnterRemote(point) => {
+            remote_control_active.store(true, Ordering::SeqCst);
             set_hook_suppression(hook_manager, SuppressionMode::Suppress);
             emit_remote_send_actions(
                 remote_input_send_buffer.send_pointer(point, now_millis()),
@@ -901,11 +961,12 @@ fn handle_control_output(
                     SessionUpdate::Error(format!("local pointer move failed: {error}")),
                 );
             }
-            emit_remote_send_actions(
-                remote_input_send_buffer.send_release_all(),
-                connection_commands,
-                updates,
-                session_id,
+            emit_return_local_release_all(
+                remote_input_send_buffer,
+                remote_control_active,
+                |actions| {
+                    emit_remote_send_actions(actions, connection_commands, updates, session_id);
+                },
             );
             send_session_update(
                 updates,
@@ -943,7 +1004,7 @@ async fn run_agent_event_pump(
         tokio::select! {
             command = session_commands.recv() => {
                 if matches!(command, Some(SessionCommand::Stop) | None) {
-                    release_agent_input(&mut injector, &updates, session_id);
+                    release_agent_input(&mut injector, &updates, session_id, false);
                     break;
                 }
             }
@@ -965,7 +1026,7 @@ async fn run_agent_event_pump(
         }
     }
 
-    release_agent_input(&mut injector, &updates, session_id);
+    release_agent_input(&mut injector, &updates, session_id, false);
 }
 
 fn handle_agent_connection_event(
@@ -994,7 +1055,7 @@ fn handle_agent_connection_event(
             )));
         }
         ConnectionEvent::Disconnected(_) => {
-            release_agent_input(injector, updates, session_id);
+            release_agent_input(injector, updates, session_id, true);
             *injector = None;
         }
         ConnectionEvent::Message(WireMessage::Input(input)) => {
@@ -1009,7 +1070,7 @@ fn handle_agent_connection_event(
             );
         }
         ConnectionEvent::Message(WireMessage::ReleaseAll) => {
-            release_agent_input(injector, updates, session_id);
+            release_agent_input(injector, updates, session_id, false);
         }
         ConnectionEvent::Message(WireMessage::Heartbeat(message)) => {
             handle_heartbeat_message(message, heartbeat, connection_commands, updates, session_id);
@@ -1018,7 +1079,7 @@ fn handle_agent_connection_event(
             send_session_update(updates, session_id, SessionUpdate::Error(error));
         }
         ConnectionEvent::Error(_) => {
-            release_agent_input(injector, updates, session_id);
+            release_agent_input(injector, updates, session_id, true);
             *injector = None;
         }
         ConnectionEvent::Waiting
@@ -1061,6 +1122,7 @@ fn release_agent_input(
     injector: &mut Option<InputInjector>,
     updates: &Sender<TaggedSessionUpdate>,
     session_id: u64,
+    log_after_disconnect: bool,
 ) {
     if let Some(injector) = injector.as_mut() {
         if let Err(error) = injector.release_all() {
@@ -1068,6 +1130,12 @@ fn release_agent_input(
                 updates,
                 session_id,
                 SessionUpdate::Error(format!("release all failed: {error}")),
+            );
+        } else if log_after_disconnect {
+            send_session_update(
+                updates,
+                session_id,
+                SessionUpdate::Log("released all pressed input after disconnect".to_string()),
             );
         }
     }
@@ -1381,6 +1449,10 @@ fn now_millis() -> u64 {
 mod tests {
     use std::{
         net::{TcpListener, UdpSocket},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
         time::{Duration, Instant},
     };
 
@@ -1718,7 +1790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_runtime_stop_sends_shutdown_commands_and_awaits_tasks() {
+    async fn active_runtime_stop_sends_release_all_when_remote_active() {
         let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
         let (session_commands_tx, mut session_commands_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -1729,7 +1801,7 @@ mod tests {
             connection_commands: connection_commands_tx,
             session_commands: session_commands_tx,
             hook_manager: None,
-            send_release_all_on_stop: true,
+            remote_control_active: Some(Arc::new(AtomicBool::new(true))),
             tasks: vec![task],
             stopped: false,
         };
@@ -1751,6 +1823,102 @@ mod tests {
             connection_commands_rx.recv().await,
             Some(ConnectionCommand::Stop)
         );
+    }
+
+    #[tokio::test]
+    async fn active_runtime_stop_skips_release_all_when_local() {
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (session_commands_tx, mut session_commands_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let _ = session_commands_rx.recv().await;
+        });
+        let mut runtime = ActiveRuntime {
+            session_id: 7,
+            connection_commands: connection_commands_tx,
+            session_commands: session_commands_tx,
+            hook_manager: None,
+            remote_control_active: Some(Arc::new(AtomicBool::new(false))),
+            tasks: vec![task],
+            stopped: false,
+        };
+
+        let outcome = runtime.stop().await;
+
+        assert_eq!(
+            outcome,
+            StopTaskOutcome {
+                completed: 1,
+                aborted: 0,
+            }
+        );
+        assert_eq!(
+            connection_commands_rx.recv().await,
+            Some(ConnectionCommand::Stop)
+        );
+        assert!(connection_commands_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn agent_disconnect_release_logs_released_pressed_input() {
+        let (connection_commands_tx, _connection_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, updates_rx) = unbounded();
+        let mut injector = Some(InputInjector::new(Rect::new(0, 0, 1920, 1080)));
+        let mut heartbeat = HeartbeatTracker::default();
+
+        handle_agent_connection_event(
+            ConnectionEvent::Disconnected("controller".to_string()),
+            Rect::new(0, 0, 1920, 1080),
+            &mut injector,
+            &connection_commands_tx,
+            &updates_tx,
+            42,
+            &mut heartbeat,
+        );
+
+        let updates = updates_rx.try_iter().collect::<Vec<_>>();
+        assert!(updates.iter().any(|update| {
+            matches!(
+                &update.update,
+                SessionUpdate::Log(message)
+                    if message == "released all pressed input after disconnect"
+            )
+        }));
+        assert!(injector.is_none());
+    }
+
+    #[test]
+    fn return_local_release_all_keeps_remote_active_until_actions_are_emitted() {
+        let remote_control_active = Arc::new(AtomicBool::new(true));
+        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let mut observed: Option<(bool, Vec<RemoteSendAction>)> = None;
+
+        emit_return_local_release_all(&mut buffer, &remote_control_active, |actions| {
+            observed = Some((remote_control_active.load(Ordering::SeqCst), actions));
+        });
+
+        assert_eq!(
+            observed,
+            Some((
+                true,
+                vec![RemoteSendAction::Command(ConnectionCommand::SendReliable(
+                    WireMessage::ReleaseAll
+                ))],
+            ))
+        );
+        assert!(!remote_control_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn recovery_release_all_keeps_remote_active_until_release_is_enqueued() {
+        let remote_control_active = Arc::new(AtomicBool::new(true));
+        let mut observed_remote_active = None;
+
+        emit_recovery_release_all(&remote_control_active, || {
+            observed_remote_active = Some(remote_control_active.load(Ordering::SeqCst));
+        });
+
+        assert_eq!(observed_remote_active, Some(true));
+        assert!(!remote_control_active.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+const RELIABLE_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 enum ReliableDriverCommand {
     Send(WireMessage),
     Stop,
@@ -362,8 +364,8 @@ where
     let reader_events = event_tx.clone();
     let reader_task = tokio::spawn(async move {
         loop {
-            match reader.read_frame().await {
-                Ok(frame) => {
+            match tokio::time::timeout(RELIABLE_READ_TIMEOUT, reader.read_frame()).await {
+                Ok(Ok(frame)) => {
                     if reader_events
                         .send(ReliableDriverEvent::Frame(frame.message))
                         .is_err()
@@ -371,8 +373,15 @@ where
                         break;
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     let _ = reader_events.send(ReliableDriverEvent::Error(err.to_string()));
+                    break;
+                }
+                Err(_) => {
+                    let _ = reader_events.send(ReliableDriverEvent::Error(format!(
+                        "reliable read timed out after {}ms",
+                        RELIABLE_READ_TIMEOUT.as_millis()
+                    )));
                     break;
                 }
             }
@@ -513,6 +522,40 @@ mod tests {
         .unwrap());
     }
 
+    #[tokio::test]
+    async fn agent_reports_disconnect_when_reliable_channel_is_idle() {
+        let reliable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reliable_port = reliable_listener.local_addr().unwrap().port();
+        drop(reliable_listener);
+        let pointer_port = unused_udp_port().await;
+
+        let settings = TransportSettings {
+            mode: TransportMode::Tcp,
+            host: "127.0.0.1".to_string(),
+            reliable_port,
+            pointer_port,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(run_agent_server(settings, event_tx, command_rx));
+
+        wait_for_connecting(&mut event_rx).await;
+        let client = tokio::net::TcpStream::connect(format!("127.0.0.1:{reliable_port}"))
+            .await
+            .unwrap();
+        let _client = client;
+
+        timeout(
+            Duration::from_millis(2_500),
+            wait_for_disconnected(&mut event_rx),
+        )
+        .await
+        .expect("agent should report disconnected after reliable idle timeout");
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        agent.await.unwrap().unwrap();
+    }
+
     #[test]
     fn kcp_pointer_peer_uses_reliable_peer_ip_and_configured_pointer_port() {
         let settings = TransportSettings {
@@ -585,6 +628,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn wait_for_disconnected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
+        loop {
+            match timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ConnectionEvent::Disconnected(_) => return,
+                _ => {}
+            }
+        }
+    }
+
+    async fn unused_udp_port() -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     async fn next_connected_or_error(

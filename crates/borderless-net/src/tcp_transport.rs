@@ -161,4 +161,19 @@ mod tests {
         assert!(err.to_string().contains("incoming frame too large"));
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn dropped_peer_causes_read_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client = crate::tcp_transport::TcpFramedTransport::new(stream).unwrap();
+        server.await.unwrap();
+        assert!(client.read_frame().await.is_err());
+    }
 }

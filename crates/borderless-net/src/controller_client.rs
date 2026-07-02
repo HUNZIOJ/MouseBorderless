@@ -20,6 +20,8 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+const RELIABLE_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 enum ReliableDriverCommand {
     Send(WireMessage),
     Stop,
@@ -357,8 +359,8 @@ where
     let reader_events = event_tx.clone();
     let reader_task = tokio::spawn(async move {
         loop {
-            match reader.read_frame().await {
-                Ok(frame) => {
+            match tokio::time::timeout(RELIABLE_READ_TIMEOUT, reader.read_frame()).await {
+                Ok(Ok(frame)) => {
                     if reader_events
                         .send(ReliableDriverEvent::Frame(frame.message))
                         .is_err()
@@ -366,8 +368,15 @@ where
                         break;
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     let _ = reader_events.send(ReliableDriverEvent::Error(err.to_string()));
+                    break;
+                }
+                Err(_) => {
+                    let _ = reader_events.send(ReliableDriverEvent::Error(format!(
+                        "reliable read timed out after {}ms",
+                        RELIABLE_READ_TIMEOUT.as_millis()
+                    )));
                     break;
                 }
             }
@@ -581,6 +590,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_reports_disconnect_when_reliable_channel_is_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reliable_port = listener.local_addr().unwrap().port();
+        let pointer_port = unused_udp_port().await;
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let settings = TransportSettings {
+            mode: TransportMode::Tcp,
+            host: "127.0.0.1".to_string(),
+            reliable_port,
+            pointer_port,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let controller = tokio::spawn(run_controller_client(settings, event_tx, command_rx));
+
+        wait_for_connected(&mut event_rx).await;
+        timeout(
+            Duration::from_millis(2_500),
+            wait_for_disconnected(&mut event_rx),
+        )
+        .await
+        .expect("controller should report disconnected after reliable idle timeout");
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        controller.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn kcp_controller_receives_fresh_latest_pointer_packets_on_configured_port() {
         let listener = KcpFramedTransport::bind("127.0.0.2:0").await.unwrap();
         let reliable_port = listener.local_addr().unwrap().port();
@@ -652,6 +695,78 @@ mod tests {
 
         command_tx.send(ConnectionCommand::Stop).unwrap();
         controller.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn kcp_controller_releases_and_reopens_pointer_socket_after_reliable_timeout() {
+        let listener = KcpFramedTransport::bind("127.0.0.2:0").await.unwrap();
+        let reliable_port = listener.local_addr().unwrap().port();
+        let pointer_port = unused_udp_port().await;
+        let server = tokio::spawn(async move {
+            loop {
+                let accepted = KcpFramedTransport::accept(&listener).await.unwrap();
+                tokio::spawn(async move {
+                    let _accepted = accepted;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let settings = TransportSettings {
+            mode: TransportMode::Kcp,
+            host: "127.0.0.2".to_string(),
+            reliable_port,
+            pointer_port,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let controller = tokio::spawn(run_controller_client(settings, event_tx, command_rx));
+
+        wait_for_connected(&mut event_rx).await;
+        timeout(
+            Duration::from_millis(2_500),
+            wait_for_disconnected(&mut event_rx),
+        )
+        .await
+        .expect("controller should disconnect the idle KCP reliable session");
+
+        let proof_socket = UdpSocket::bind(format!("0.0.0.0:{pointer_port}"))
+            .await
+            .expect("KCP pointer socket should close with the reliable session");
+        drop(proof_socket);
+
+        wait_for_connected(&mut event_rx).await;
+
+        let sender = UdpSocket::bind(format!("127.0.0.2:{pointer_port}"))
+            .await
+            .unwrap();
+        let target = format!("127.0.0.1:{pointer_port}");
+        send_pointer(
+            &sender,
+            &target,
+            PointerPacket {
+                session_id: 2,
+                sequence: 1,
+                x: 12,
+                y: 34,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            next_latest_pointer(&mut event_rx).await,
+            ConnectionEvent::LatestPointer {
+                x: 12,
+                y: 34,
+                sequence: 1,
+            }
+        );
+
+        command_tx.send(ConnectionCommand::Stop).unwrap();
+        controller.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
