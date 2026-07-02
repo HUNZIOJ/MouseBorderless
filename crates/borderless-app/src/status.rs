@@ -28,6 +28,23 @@ pub struct AppStatus {
 }
 
 impl AppStatus {
+    pub fn reset_runtime_fields(&mut self) {
+        self.transport_mode = None;
+        self.last_error = None;
+        self.recent_rtt_ms = None;
+        self.average_rtt_ms = None;
+        self.stale_pointer_packets = 0;
+        self.latest_pointer_sequence = None;
+    }
+
+    pub fn record_rtt(&mut self, rtt_ms: u64) {
+        self.recent_rtt_ms = Some(rtt_ms);
+        self.average_rtt_ms = Some(match self.average_rtt_ms {
+            Some(average) => (average.saturating_mul(3).saturating_add(rtt_ms)) / 4,
+            None => rtt_ms,
+        });
+    }
+
     pub fn push_log(&mut self, message: impl Into<String>) {
         if self.events.len() == 100 {
             self.events.pop_front();
@@ -56,5 +73,38 @@ mod tests {
         status.push_log("ready");
 
         assert_eq!(status.events.front().unwrap(), "ready");
+    }
+
+    #[test]
+    fn reset_runtime_fields_clears_live_metrics() {
+        let mut status = AppStatus {
+            transport_mode: Some(TransportMode::Kcp),
+            last_error: Some("boom".to_string()),
+            recent_rtt_ms: Some(10),
+            average_rtt_ms: Some(20),
+            stale_pointer_packets: 3,
+            latest_pointer_sequence: Some(99),
+            ..AppStatus::default()
+        };
+
+        status.reset_runtime_fields();
+
+        assert_eq!(status.transport_mode, None);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.recent_rtt_ms, None);
+        assert_eq!(status.average_rtt_ms, None);
+        assert_eq!(status.stale_pointer_packets, 0);
+        assert_eq!(status.latest_pointer_sequence, None);
+    }
+
+    #[test]
+    fn record_rtt_tracks_recent_and_weighted_average() {
+        let mut status = AppStatus::default();
+
+        status.record_rtt(100);
+        status.record_rtt(200);
+
+        assert_eq!(status.recent_rtt_ms, Some(200));
+        assert_eq!(status.average_rtt_ms, Some(125));
     }
 }
