@@ -15,7 +15,7 @@ pub enum RunState {
     Error,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AppStatus {
     pub run_state: RunState,
     pub transport_mode: Option<TransportMode>,
