@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::{
     runtime::{RuntimeCommand, RuntimeEvent, RuntimeHandle},
-    status::AppStatus,
+    status::{AppStatus, RunState},
 };
 
 const CONFIG_PATH: &str = "config.toml";
@@ -211,7 +211,10 @@ impl BorderlessApp {
                     .spacing([16.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("State");
-                        ui.label(format!("{:?}", self.status.run_state));
+                        ui.colored_label(
+                            state_color(&self.status.run_state),
+                            format!("{:?}", self.status.run_state),
+                        );
                         ui.end_row();
 
                         ui.label("Transport");
@@ -294,21 +297,40 @@ impl eframe::App for BorderlessApp {
                         self.save_config();
                     }
 
-                    if ui.button("Start").clicked() {
+                    if ui
+                        .add_enabled(can_start(self.status.run_state), egui::Button::new("Start"))
+                        .clicked()
+                    {
                         self.start_runtime();
                     }
 
-                    if ui.button("Stop").clicked() {
+                    if ui
+                        .add_enabled(can_stop(self.status.run_state), egui::Button::new("Stop"))
+                        .clicked()
+                    {
                         self.runtime.send(RuntimeCommand::Stop);
                     }
 
-                    if ui.button("Reconnect").clicked() {
+                    if ui
+                        .add_enabled(
+                            can_reconnect(self.status.run_state),
+                            egui::Button::new("Reconnect"),
+                        )
+                        .clicked()
+                    {
                         self.reconnect_runtime();
                     }
                 });
 
                 if let Some(error) = &self.config_error {
                     ui.colored_label(egui::Color32::RED, error);
+                }
+
+                if should_show_permission_guidance(&self.status) {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "If the target window runs as administrator, run Borderless as administrator on both computers.",
+                    );
                 }
 
                 self.show_status(ui);
@@ -350,6 +372,40 @@ fn option_number(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn state_color(state: &RunState) -> egui::Color32 {
+    match state {
+        RunState::Stopped => egui::Color32::GRAY,
+        RunState::Waiting | RunState::Connecting | RunState::Reconnecting => egui::Color32::YELLOW,
+        RunState::Connected | RunState::LocalControl => egui::Color32::GREEN,
+        RunState::RemoteControl => egui::Color32::LIGHT_BLUE,
+        RunState::Error => egui::Color32::RED,
+    }
+}
+
+fn can_start(state: RunState) -> bool {
+    matches!(state, RunState::Stopped | RunState::Error)
+}
+
+fn can_stop(state: RunState) -> bool {
+    state != RunState::Stopped
+}
+
+fn can_reconnect(state: RunState) -> bool {
+    state != RunState::Stopped
+}
+
+fn should_show_permission_guidance(status: &AppStatus) -> bool {
+    status
+        .last_error
+        .as_deref()
+        .is_some_and(is_permission_sensitive_error)
+}
+
+fn is_permission_sensitive_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("hook") || message.contains("input injection") || message.contains("sendinput")
 }
 
 #[cfg(test)]
@@ -399,6 +455,78 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("edge_trigger_px")));
         assert!(wait_for_events(&app.runtime, Duration::from_millis(100)).is_empty());
+    }
+
+    #[test]
+    fn action_buttons_follow_runtime_state() {
+        let states = [
+            RunState::Stopped,
+            RunState::Waiting,
+            RunState::Connecting,
+            RunState::Connected,
+            RunState::LocalControl,
+            RunState::RemoteControl,
+            RunState::Reconnecting,
+            RunState::Error,
+        ];
+
+        for state in states {
+            assert_eq!(
+                can_start(state),
+                matches!(state, RunState::Stopped | RunState::Error),
+                "unexpected Start enabled state for {state:?}"
+            );
+            assert_eq!(
+                can_stop(state),
+                state != RunState::Stopped,
+                "unexpected Stop enabled state for {state:?}"
+            );
+            assert_eq!(
+                can_reconnect(state),
+                state != RunState::Stopped,
+                "unexpected Reconnect enabled state for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_colors_cover_every_runtime_state() {
+        let cases = [
+            (RunState::Stopped, egui::Color32::GRAY),
+            (RunState::Waiting, egui::Color32::YELLOW),
+            (RunState::Connecting, egui::Color32::YELLOW),
+            (RunState::Connected, egui::Color32::GREEN),
+            (RunState::LocalControl, egui::Color32::GREEN),
+            (RunState::RemoteControl, egui::Color32::LIGHT_BLUE),
+            (RunState::Reconnecting, egui::Color32::YELLOW),
+            (RunState::Error, egui::Color32::RED),
+        ];
+
+        for (state, color) in cases {
+            assert_eq!(state_color(&state), color);
+        }
+    }
+
+    #[test]
+    fn permission_guidance_only_shows_for_input_or_hook_errors() {
+        let mut status = AppStatus {
+            last_error: Some("input injection failed: access denied".to_string()),
+            ..AppStatus::default()
+        };
+        assert!(should_show_permission_guidance(&status));
+
+        status.last_error = Some("access denied while opening config.toml".to_string());
+        assert!(!should_show_permission_guidance(&status));
+
+        status.last_error = Some("connection refused".to_string());
+        assert!(!should_show_permission_guidance(&status));
+
+        status.last_error = None;
+        status.push_log("failed to install hook");
+        assert!(!should_show_permission_guidance(&status));
+
+        status.last_error = Some("SendInput sent 0 of 1 input events".to_string());
+        assert!(should_show_permission_guidance(&status));
     }
 
     fn wait_for_events(runtime: &RuntimeHandle, timeout: Duration) -> Vec<RuntimeEvent> {
