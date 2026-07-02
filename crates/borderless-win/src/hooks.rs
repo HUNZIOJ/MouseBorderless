@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use borderless_core::input_event::{
     InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseWheelEvent,
 };
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use std::{
     cell::RefCell,
     sync::{
@@ -27,6 +27,8 @@ use windows::{
     },
 };
 
+const HOOK_EVENT_QUEUE_CAPACITY: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub enum HookEvent {
     PointerPosition { x: i32, y: i32 },
@@ -42,18 +44,21 @@ pub enum SuppressionMode {
 pub struct HookManager {
     mode: Arc<AtomicBool>,
     stop: Option<HookThreadHandle>,
+    forwarder: Option<JoinHandle<()>>,
 }
 
 impl HookManager {
     pub fn install(sender: Sender<HookEvent>) -> anyhow::Result<Self> {
         let mode = Arc::new(AtomicBool::new(false));
         let hook_mode = Arc::clone(&mode);
+        let (hook_tx, hook_rx) = crossbeam_channel::bounded(HOOK_EVENT_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let forwarder = spawn_hook_event_forwarder(hook_rx, sender)?;
 
         let join = thread::Builder::new()
             .name("borderless-input-hooks".to_owned())
             .spawn(move || {
-                if let Err(error) = run_hook_thread(sender, hook_mode, ready_tx) {
+                if let Err(error) = run_hook_thread(hook_tx, hook_mode, ready_tx) {
                     tracing::error!(?error, "input hook thread exited");
                 }
             })
@@ -63,6 +68,7 @@ impl HookManager {
             Ok(ready) => ready,
             Err(error) => {
                 let _ = join.join();
+                let _ = forwarder.join();
                 return Err(error)
                     .context("input hook thread exited before reporting hook installation");
             }
@@ -71,6 +77,7 @@ impl HookManager {
             Ok(thread_id) => thread_id,
             Err(error) => {
                 let _ = join.join();
+                let _ = forwarder.join();
                 return Err(error);
             }
         };
@@ -78,6 +85,7 @@ impl HookManager {
         Ok(Self {
             mode,
             stop: Some(HookThreadHandle::new(thread_id, join)),
+            forwarder: Some(forwarder),
         })
     }
 
@@ -92,6 +100,11 @@ impl Drop for HookManager {
         if let Some(stop) = self.stop.take() {
             if let Err(error) = stop.stop_and_join() {
                 tracing::warn!(?error, "failed to stop input hook thread");
+            }
+        }
+        if let Some(forwarder) = self.forwarder.take() {
+            if let Err(error) = join_hook_thread(forwarder) {
+                tracing::warn!(?error, "failed to join input hook event forwarder");
             }
         }
     }
@@ -129,50 +142,32 @@ impl HookThreadHandle {
     }
 
     fn stop_and_join(mut self) -> anyhow::Result<()> {
-        let stop_result = self.request_stop();
-        let join_result = self
-            .join
-            .take()
-            .map(join_hook_thread)
-            .unwrap_or_else(|| Ok(()));
-
-        stop_result?;
-        join_result
+        self.request_stop()?;
+        self.join.take().map(join_hook_thread).unwrap_or(Ok(()))
     }
 }
 
 struct HookThreadState {
     sender: Sender<HookEvent>,
     mode: Arc<AtomicBool>,
-    pointer_move_pending: bool,
 }
 
 impl HookThreadState {
     fn new(sender: Sender<HookEvent>, mode: Arc<AtomicBool>) -> Self {
-        Self {
-            sender,
-            mode,
-            pointer_move_pending: false,
-        }
+        Self { sender, mode }
     }
 
     fn emit_mouse_events(&mut self, message: u32, data: &MSLLHOOKSTRUCT) {
-        if message == WM_MOUSEMOVE && self.pointer_move_pending {
-            return;
-        }
-
         let events = mouse_hook_events(message, data);
         if events.is_empty() {
             return;
         }
 
-        self.pointer_move_pending = message == WM_MOUSEMOVE;
         self.emit_events(events);
     }
 
     fn emit_keyboard_event(&mut self, message: u32, data: &KBDLLHOOKSTRUCT) {
         if let Some(event) = keyboard_hook_event(message, data) {
-            self.pointer_move_pending = false;
             self.emit_event(event);
         }
     }
@@ -185,6 +180,25 @@ impl HookThreadState {
 
     fn emit_event(&self, event: HookEvent) {
         let _ = self.sender.try_send(event);
+    }
+}
+
+fn spawn_hook_event_forwarder(
+    receiver: Receiver<HookEvent>,
+    sender: Sender<HookEvent>,
+) -> anyhow::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("borderless-hook-events".to_owned())
+        .spawn(move || forward_hook_events(receiver, sender))
+        .context("spawn input hook event forwarder")
+}
+
+fn forward_hook_events(receiver: Receiver<HookEvent>, sender: Sender<HookEvent>) {
+    for event in receiver {
+        match sender.try_send(event) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+        }
     }
 }
 
@@ -558,6 +572,7 @@ mod tests {
         let manager = HookManager {
             mode: Arc::clone(&mode),
             stop: None,
+            forwarder: None,
         };
 
         manager.set_suppression_mode(SuppressionMode::Suppress);
@@ -574,6 +589,7 @@ mod tests {
         let manager = HookManager {
             mode: Arc::clone(&mode),
             stop: Some(HookThreadHandle::test(123, Arc::clone(&stop_requested))),
+            forwarder: None,
         };
 
         manager.set_suppression_mode(SuppressionMode::Suppress);
@@ -606,55 +622,61 @@ mod tests {
     }
 
     #[test]
-    fn callback_state_coalesces_pointer_moves_until_input_resets() {
+    fn callback_state_preserves_continuous_pointer_moves() {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = HookThreadState::new(sender, Arc::new(AtomicBool::new(false)));
 
         state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(1, 2, 0));
         state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(3, 4, 0));
 
-        let first_batch: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(first_batch.len(), 2);
+        let batch: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(batch.len(), 4);
         assert!(
-            matches!(first_batch[0], HookEvent::PointerPosition { x: 1, y: 2 }),
+            matches!(batch[0], HookEvent::PointerPosition { x: 1, y: 2 }),
             "first pointer position should be emitted, got {:?}",
-            first_batch[0]
+            batch[0]
         );
         assert!(
             matches!(
-                first_batch[1],
+                batch[1],
                 HookEvent::Input(InputEvent::MouseMoveAbs(event)) if event.x == 1 && event.y == 2
             ),
             "first absolute mouse move should be emitted, got {:?}",
-            first_batch[1]
+            batch[1]
         );
-
-        state.emit_keyboard_event(
-            WM_KEYDOWN,
-            &KBDLLHOOKSTRUCT {
-                vkCode: 0x41,
-                scanCode: 0,
-                flags: KBDLLHOOKSTRUCT_FLAGS(0),
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        );
-        let key_batch: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(key_batch.len(), 1);
-        assert!(matches!(
-            key_batch[0],
-            HookEvent::Input(InputEvent::Key(event)) if event.vk_code == 0x41 && event.pressed
-        ));
-
-        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(5, 6, 0));
-
-        let reset_batch: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(reset_batch.len(), 2);
         assert!(
-            matches!(reset_batch[0], HookEvent::PointerPosition { x: 5, y: 6 }),
-            "pointer movement should emit again after input reset, got {:?}",
-            reset_batch[0]
+            matches!(batch[2], HookEvent::PointerPosition { x: 3, y: 4 }),
+            "second pointer position should be emitted, got {:?}",
+            batch[2]
         );
+        assert!(
+            matches!(
+                batch[3],
+                HookEvent::Input(InputEvent::MouseMoveAbs(event)) if event.x == 3 && event.y == 4
+            ),
+            "second absolute mouse move should be emitted, got {:?}",
+            batch[3]
+        );
+    }
+
+    #[test]
+    fn callback_state_drops_events_when_bounded_queue_is_full() {
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        let mut state = HookThreadState::new(sender, Arc::new(AtomicBool::new(false)));
+
+        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(1, 2, 0));
+        state.emit_mouse_events(WM_MOUSEMOVE, &mouse_data_at(3, 4, 0));
+
+        let batch: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(
+            batch[0],
+            HookEvent::PointerPosition { x: 1, y: 2 }
+        ));
+        assert!(matches!(
+            batch[1],
+            HookEvent::Input(InputEvent::MouseMoveAbs(event)) if event.x == 1 && event.y == 2
+        ));
     }
 
     fn assert_mouse_button(message: u32, mouse_data: u32, button: MouseButton, pressed: bool) {
