@@ -581,7 +581,14 @@ fn handle_controller_connection_event(
         | ConnectionEvent::LatestPointer { .. }
         | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Input(_))
-        | ConnectionEvent::Message(WireMessage::ReleaseAll) => {}
+        | ConnectionEvent::Message(WireMessage::ReleaseAll)
+        | ConnectionEvent::Message(WireMessage::ClipboardOffer(_))
+        | ConnectionEvent::Message(WireMessage::ClipboardData(_))
+        | ConnectionEvent::Message(WireMessage::FileTransferOffer(_))
+        | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
+        | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropStart(_))
+        | ConnectionEvent::Message(WireMessage::DragDropCancel { .. }) => {}
     }
 }
 
@@ -1085,7 +1092,14 @@ fn handle_agent_connection_event(
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
         | ConnectionEvent::StalePointerPackets { .. }
-        | ConnectionEvent::Message(WireMessage::Hello(_)) => {}
+        | ConnectionEvent::Message(WireMessage::Hello(_))
+        | ConnectionEvent::Message(WireMessage::ClipboardOffer(_))
+        | ConnectionEvent::Message(WireMessage::ClipboardData(_))
+        | ConnectionEvent::Message(WireMessage::FileTransferOffer(_))
+        | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
+        | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropStart(_))
+        | ConnectionEvent::Message(WireMessage::DragDropCancel { .. }) => {}
     }
 }
 

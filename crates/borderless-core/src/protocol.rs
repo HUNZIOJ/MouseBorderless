@@ -27,6 +27,40 @@ pub enum WireMessage {
     Heartbeat(Heartbeat),
     ReleaseAll,
     Error(String),
+    ClipboardOffer(crate::clipboard::ClipboardEnvelope),
+    ClipboardData(crate::clipboard::ClipboardEnvelope),
+    FileTransferOffer(crate::file_transfer::FileTransferManifest),
+    FileTransferProgress {
+        transfer_id: uuid::Uuid,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
+    FileTransferComplete {
+        transfer_id: uuid::Uuid,
+        ok: bool,
+    },
+    DragDropStart(crate::drag_drop::DragDropSession),
+    DragDropCancel {
+        session_id: uuid::Uuid,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FileTransferProgressPayload {
+    transfer_id: uuid::Uuid,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FileTransferCompletePayload {
+    transfer_id: uuid::Uuid,
+    ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DragDropCancelPayload {
+    session_id: uuid::Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +185,13 @@ fn message_type(message: &WireMessage) -> u8 {
         WireMessage::Heartbeat(_) => 3,
         WireMessage::ReleaseAll => 4,
         WireMessage::Error(_) => 5,
+        WireMessage::ClipboardOffer(_) => 6,
+        WireMessage::ClipboardData(_) => 7,
+        WireMessage::FileTransferOffer(_) => 8,
+        WireMessage::FileTransferProgress { .. } => 9,
+        WireMessage::FileTransferComplete { .. } => 10,
+        WireMessage::DragDropStart(_) => 11,
+        WireMessage::DragDropCancel { .. } => 12,
     }
 }
 
@@ -161,6 +202,28 @@ fn encode_message(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
         WireMessage::Heartbeat(heartbeat) => encode_body(heartbeat),
         WireMessage::ReleaseAll => encode_body(&()),
         WireMessage::Error(message) => encode_body(message),
+        WireMessage::ClipboardOffer(envelope) => encode_body(envelope),
+        WireMessage::ClipboardData(envelope) => encode_body(envelope),
+        WireMessage::FileTransferOffer(manifest) => encode_body(manifest),
+        WireMessage::FileTransferProgress {
+            transfer_id,
+            bytes_done,
+            bytes_total,
+        } => encode_body(&FileTransferProgressPayload {
+            transfer_id: *transfer_id,
+            bytes_done: *bytes_done,
+            bytes_total: *bytes_total,
+        }),
+        WireMessage::FileTransferComplete { transfer_id, ok } => {
+            encode_body(&FileTransferCompletePayload {
+                transfer_id: *transfer_id,
+                ok: *ok,
+            })
+        }
+        WireMessage::DragDropStart(session) => encode_body(session),
+        WireMessage::DragDropCancel { session_id } => encode_body(&DragDropCancelPayload {
+            session_id: *session_id,
+        }),
     }
 }
 
@@ -175,6 +238,32 @@ fn decode_message(ty: u8, payload: &[u8]) -> Result<WireMessage, ProtocolError> 
         3 => decode_body::<Heartbeat>(ty, payload).map(WireMessage::Heartbeat),
         4 => decode_body::<()>(ty, payload).map(|()| WireMessage::ReleaseAll),
         5 => decode_body::<String>(ty, payload).map(WireMessage::Error),
+        6 => decode_body::<crate::clipboard::ClipboardEnvelope>(ty, payload)
+            .map(WireMessage::ClipboardOffer),
+        7 => decode_body::<crate::clipboard::ClipboardEnvelope>(ty, payload)
+            .map(WireMessage::ClipboardData),
+        8 => decode_body::<crate::file_transfer::FileTransferManifest>(ty, payload)
+            .map(WireMessage::FileTransferOffer),
+        9 => decode_body::<FileTransferProgressPayload>(ty, payload).map(|body| {
+            WireMessage::FileTransferProgress {
+                transfer_id: body.transfer_id,
+                bytes_done: body.bytes_done,
+                bytes_total: body.bytes_total,
+            }
+        }),
+        10 => decode_body::<FileTransferCompletePayload>(ty, payload).map(|body| {
+            WireMessage::FileTransferComplete {
+                transfer_id: body.transfer_id,
+                ok: body.ok,
+            }
+        }),
+        11 => decode_body::<crate::drag_drop::DragDropSession>(ty, payload)
+            .map(WireMessage::DragDropStart),
+        12 => decode_body::<DragDropCancelPayload>(ty, payload).map(|body| {
+            WireMessage::DragDropCancel {
+                session_id: body.session_id,
+            }
+        }),
         _ => Err(ProtocolError::UnknownMessageType { ty }),
     }
 }
@@ -213,7 +302,7 @@ fn decode_error_or_type_mismatch(
 }
 
 fn payload_message_type(payload: &[u8], expected_ty: u8) -> Option<u8> {
-    for ty in 1..=5 {
+    for ty in 1..=12 {
         if ty == expected_ty {
             continue;
         }
@@ -231,6 +320,13 @@ fn payload_matches_type(ty: u8, payload: &[u8]) -> bool {
         3 => strict_payload_matches::<Heartbeat>(payload),
         4 => strict_payload_matches::<()>(payload),
         5 => strict_payload_matches::<String>(payload),
+        6 => strict_payload_matches::<crate::clipboard::ClipboardEnvelope>(payload),
+        7 => strict_payload_matches::<crate::clipboard::ClipboardEnvelope>(payload),
+        8 => strict_payload_matches::<crate::file_transfer::FileTransferManifest>(payload),
+        9 => strict_payload_matches::<FileTransferProgressPayload>(payload),
+        10 => strict_payload_matches::<FileTransferCompletePayload>(payload),
+        11 => strict_payload_matches::<crate::drag_drop::DragDropSession>(payload),
+        12 => strict_payload_matches::<DragDropCancelPayload>(payload),
         _ => false,
     }
 }
@@ -337,6 +433,77 @@ mod tests {
             decode_frame(&raw),
             Err(ProtocolError::UnknownMessageType { ty: 99 })
         );
+    }
+
+    #[test]
+    fn clipboard_offer_round_trips_with_stable_message_type() {
+        let envelope = crate::clipboard::ClipboardEnvelope {
+            change_id: crate::clipboard::ClipboardChangeId::new(uuid::Uuid::new_v4(), 42),
+            payload: crate::clipboard::ClipboardPayload::UnicodeText("shared text".into()),
+        };
+        let msg = WireMessage::ClipboardOffer(envelope);
+
+        assert_eq!(message_type(&msg), 6);
+
+        let encoded = encode_frame(12, &msg).unwrap();
+        let decoded = decode_frame(&encoded).unwrap();
+
+        assert_eq!(decoded.sequence, 12);
+        assert_eq!(decoded.message, msg);
+    }
+
+    #[test]
+    fn new_message_type_ids_round_trip() {
+        let transfer_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let envelope = crate::clipboard::ClipboardEnvelope {
+            change_id: crate::clipboard::ClipboardChangeId::new(uuid::Uuid::new_v4(), 1),
+            payload: crate::clipboard::ClipboardPayload::UnicodeText("text".into()),
+        };
+        let manifest = crate::file_transfer::FileTransferManifest {
+            transfer_id,
+            root_name: "root".into(),
+            files: vec![],
+            total_bytes: 0,
+        };
+        let drag_session = crate::drag_drop::DragDropSession {
+            session_id,
+            transfer_id,
+            state: crate::drag_drop::DragDropState::LocalDragDetected,
+        };
+
+        let cases = [
+            (WireMessage::ClipboardOffer(envelope.clone()), 6),
+            (WireMessage::ClipboardData(envelope), 7),
+            (WireMessage::FileTransferOffer(manifest), 8),
+            (
+                WireMessage::FileTransferProgress {
+                    transfer_id,
+                    bytes_done: 1,
+                    bytes_total: 2,
+                },
+                9,
+            ),
+            (
+                WireMessage::FileTransferComplete {
+                    transfer_id,
+                    ok: true,
+                },
+                10,
+            ),
+            (WireMessage::DragDropStart(drag_session), 11),
+            (WireMessage::DragDropCancel { session_id }, 12),
+        ];
+
+        for (message, expected_ty) in cases {
+            assert_eq!(message_type(&message), expected_ty);
+
+            let encoded = encode_frame(expected_ty as u64, &message).unwrap();
+            let decoded = decode_frame(&encoded).unwrap();
+
+            assert_eq!(decoded.sequence, expected_ty as u64);
+            assert_eq!(decoded.message, message);
+        }
     }
 
     fn raw_frame(sequence: u64, ty: u8, payload_len: u32, payload: &[u8]) -> Vec<u8> {
