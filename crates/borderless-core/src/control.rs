@@ -51,6 +51,10 @@ impl ControlState {
         self.mode
     }
 
+    pub fn force_local(&mut self) {
+        self.mode = ControlMode::Local;
+    }
+
     pub fn observe_local_pointer(&mut self, point: Point) -> ControlOutput {
         if self.mode == ControlMode::Remote {
             return ControlOutput::None;
@@ -221,6 +225,17 @@ mod tests {
             state.observe_local_pointer(Point::new(1919, 540)),
             ControlOutput::None
         );
+        assert_eq!(state.mode(), ControlMode::Local);
+    }
+
+    #[test]
+    fn force_local_leaves_remote_mode_without_moving_pointer() {
+        let mut state = controller();
+        state.observe_local_pointer(Point::new(1919, 540));
+        assert_eq!(state.mode(), ControlMode::Remote);
+
+        state.force_local();
+
         assert_eq!(state.mode(), ControlMode::Local);
     }
 

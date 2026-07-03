@@ -17,7 +17,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-const RELIABLE_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
+const RELIABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum ReliableDriverCommand {
     Send(WireMessage),
@@ -546,7 +546,7 @@ mod tests {
         let _client = client;
 
         timeout(
-            Duration::from_millis(2_500),
+            RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
             wait_for_disconnected(&mut event_rx),
         )
         .await
@@ -554,6 +554,11 @@ mod tests {
 
         command_tx.send(ConnectionCommand::Stop).unwrap();
         agent.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn reliable_read_timeout_allows_drag_handoff_and_bulk_transfer_jitter() {
+        assert!(RELIABLE_READ_TIMEOUT >= Duration::from_secs(5));
     }
 
     #[test]
@@ -632,10 +637,13 @@ mod tests {
 
     async fn wait_for_disconnected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
         loop {
-            match timeout(Duration::from_secs(2), event_rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
+            match timeout(
+                RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
+                event_rx.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
             {
                 ConnectionEvent::Disconnected(_) => return,
                 _ => {}

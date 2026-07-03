@@ -10,11 +10,11 @@ use std::{
 
 use borderless_core::{
     clipboard::{ClipboardEnvelope, ClipboardPayload, RemoteFileOffer},
-    config::{AppConfig, Role, TransportMode},
+    config::{AppConfig, RemotePosition, Role, TransportMode},
     control::{ControlMode, ControlOutput, ControlState},
     file_transfer::FileManifestEntry,
-    geometry::{edge_for_position, Point, Rect},
-    input_event::{InputEvent, MouseMoveAbsEvent},
+    geometry::{detect_edge_for_position, edge_for_position, Point, Rect},
+    input_event::{InputEvent, MouseButton, MouseMoveAbsEvent},
     protocol::{
         encode_frame, Heartbeat, Hello, ProtocolError, WireMessage, MAX_PAYLOAD_LEN,
         PROTOCOL_VERSION,
@@ -706,6 +706,8 @@ async fn run_controller_event_pump(
     let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
     let mut clipboard_transport_ready = false;
     let mut drag_drop_runtime = ControllerDragDropRuntime::default();
+    let real_file_drag_drop_enabled = drag_events.is_some();
+    let mut local_left_button_down = false;
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     hook_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -730,9 +732,70 @@ async fn run_controller_event_pump(
                     &updates,
                     session_id,
                 );
+                if let Some(drag_events) = &drag_events {
+                    while let Ok(event) = drag_events.try_recv() {
+                        let ends_local_handoff = controller_drag_event_ends_local_handoff(&event);
+                        handle_controller_drag_drop_event(
+                            event,
+                            &config,
+                            &mut drag_drop_runtime,
+                            &connection_commands,
+                            &bulk_commands,
+                            &updates,
+                            session_id,
+                        );
+                        if ends_local_handoff {
+                            finish_controller_file_drag_pointer_mode(
+                                &mut control_state,
+                                &remote_control_active,
+                                &mut pending_remote_pointer_position,
+                            );
+                        }
+                    }
+                }
                 while let Ok(event) = hook_events.try_recv() {
-                    handle_controller_hook_event(
-                        event,
+                    update_local_left_button_state(&event, &mut local_left_button_down);
+                    match controller_hook_route(
+                        &event,
+                        drag_drop_runtime.has_active(),
+                        local_left_button_down,
+                        real_file_drag_drop_enabled,
+                        local_desktop,
+                        config.edge_trigger_px,
+                        &config.controller.remote_position,
+                    ) {
+                        ControllerHookRoute::Standard => handle_controller_hook_event(
+                            event,
+                            local_desktop,
+                            &mut control_state,
+                            &mut last_pointer,
+                            &mut pending_pointer_park,
+                            &mut pending_remote_pointer_position,
+                            &mut mouse_diagnostics,
+                            &mut remote_input_send_buffer,
+                            &hook_manager,
+                            &remote_control_active,
+                            &connection_commands,
+                            &updates,
+                            session_id,
+                        ),
+                        ControllerHookRoute::FileDrag => handle_controller_file_drag_hook_event(
+                            event,
+                            &mut control_state,
+                            &mut last_pointer,
+                            &mut pending_pointer_park,
+                            &mut mouse_diagnostics,
+                            &mut remote_input_send_buffer,
+                            &remote_control_active,
+                            &connection_commands,
+                            &updates,
+                            session_id,
+                        ),
+                        ControllerHookRoute::Ignore => {}
+                    }
+                }
+                if !drag_drop_runtime.has_active() {
+                    process_pending_remote_pointer_position(
                         local_desktop,
                         &mut control_state,
                         &mut last_pointer,
@@ -746,33 +809,6 @@ async fn run_controller_event_pump(
                         &updates,
                         session_id,
                     );
-                }
-                process_pending_remote_pointer_position(
-                    local_desktop,
-                    &mut control_state,
-                    &mut last_pointer,
-                    &mut pending_pointer_park,
-                    &mut pending_remote_pointer_position,
-                    &mut mouse_diagnostics,
-                    &mut remote_input_send_buffer,
-                    &hook_manager,
-                    &remote_control_active,
-                    &connection_commands,
-                    &updates,
-                    session_id,
-                );
-                if let Some(drag_events) = &drag_events {
-                    while let Ok(event) = drag_events.try_recv() {
-                        handle_controller_drag_drop_event(
-                            event,
-                            &config,
-                            &mut drag_drop_runtime,
-                            &connection_commands,
-                            &bulk_commands,
-                            &updates,
-                            session_id,
-                        );
-                    }
                 }
                 emit_remote_send_actions(
                     remote_input_send_buffer.flush_pending_move(),
@@ -827,6 +863,11 @@ async fn run_controller_event_pump(
                             session_id,
                             true,
                         );
+                        finish_controller_file_drag_pointer_mode(
+                            &mut control_state,
+                            &remote_control_active,
+                            &mut pending_remote_pointer_position,
+                        );
                     }
                 }
             }
@@ -861,6 +902,11 @@ async fn run_controller_event_pump(
                         session_id,
                         false,
                     );
+                    finish_controller_file_drag_pointer_mode(
+                        &mut control_state,
+                        &remote_control_active,
+                        &mut pending_remote_pointer_position,
+                    );
                 } else if matches!(
                     readiness_event,
                     ConnectionEvent::Disconnected(_)
@@ -872,6 +918,11 @@ async fn run_controller_event_pump(
                         &bulk_commands,
                         &updates,
                         session_id,
+                    );
+                    finish_controller_file_drag_pointer_mode(
+                        &mut control_state,
+                        &remote_control_active,
+                        &mut pending_remote_pointer_position,
                     );
                 }
                 clipboard_transport_ready = controller_clipboard_transport_ready_after_event(
@@ -1011,6 +1062,10 @@ impl ControllerDragDropRuntime {
         self.pending.push(session);
     }
 
+    fn has_active(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn cancel_session(&mut self, session_id: Uuid) -> Option<Uuid> {
         let index = self
             .pending
@@ -1019,12 +1074,94 @@ impl ControllerDragDropRuntime {
         Some(self.pending.remove(index).transfer_id)
     }
 
+    fn complete_session(&mut self, session_id: Uuid) -> bool {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.session_id == session_id)
+        else {
+            return false;
+        };
+        self.pending.remove(index);
+        true
+    }
+
     fn cancel_all(&mut self) -> Vec<(Uuid, Uuid)> {
         self.pending
             .drain(..)
             .map(|session| (session.session_id, session.transfer_id))
             .collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControllerHookRoute {
+    Standard,
+    FileDrag,
+    Ignore,
+}
+
+fn controller_hook_route(
+    event: &HookEvent,
+    file_drag_active: bool,
+    local_left_button_down: bool,
+    real_file_drag_drop_enabled: bool,
+    local_desktop: Rect,
+    edge_trigger_px: i32,
+    remote_position: &RemotePosition,
+) -> ControllerHookRoute {
+    if file_drag_active {
+        return match event {
+            HookEvent::PointerPosition { .. } | HookEvent::Input(InputEvent::MouseMoveDelta(_)) => {
+                ControllerHookRoute::FileDrag
+            }
+            _ => ControllerHookRoute::Ignore,
+        };
+    }
+
+    if real_file_drag_drop_enabled
+        && local_left_button_down
+        && file_drag_edge_guard_applies(event, local_desktop, edge_trigger_px, remote_position)
+    {
+        ControllerHookRoute::Ignore
+    } else {
+        ControllerHookRoute::Standard
+    }
+}
+
+fn file_drag_edge_guard_applies(
+    event: &HookEvent,
+    local_desktop: Rect,
+    edge_trigger_px: i32,
+    remote_position: &RemotePosition,
+) -> bool {
+    let HookEvent::PointerPosition { x, y } = event else {
+        return false;
+    };
+    detect_edge_for_position(
+        Point::new(*x, *y),
+        local_desktop,
+        edge_trigger_px,
+        remote_position.clone(),
+    )
+    .is_some()
+}
+
+fn update_local_left_button_state(event: &HookEvent, local_left_button_down: &mut bool) {
+    if let HookEvent::Input(InputEvent::MouseButton(button)) = event {
+        if button.button == MouseButton::Left {
+            *local_left_button_down = button.pressed;
+        }
+    }
+}
+
+fn controller_drag_event_ends_local_handoff(event: &DragDropEvent) -> bool {
+    matches!(
+        event,
+        DragDropEvent::LocalDragCancelled { .. }
+            | DragDropEvent::LocalDropCommitted { .. }
+            | DragDropEvent::Error { .. }
+    )
 }
 
 fn handle_controller_drag_drop_event(
@@ -1140,6 +1277,7 @@ fn handle_controller_drag_drop_event(
         }
         DragDropEvent::LocalDropCommitted { .. } => {
             if let DragDropEvent::LocalDropCommitted { session_id } = &event {
+                drag_drop_runtime.complete_session(*session_id);
                 let _ = connection_commands.send(ConnectionCommand::SendReliable(
                     WireMessage::DragDropCommit {
                         session_id: *session_id,
@@ -1166,6 +1304,12 @@ fn handle_controller_drag_drop_event(
         DragDropEvent::Error {
             session_id: None, ..
         } => {
+            cancel_all_controller_drag_drop_sessions(
+                drag_drop_runtime,
+                bulk_commands,
+                updates,
+                runtime_session_id,
+            );
             send_session_update(updates, runtime_session_id, SessionUpdate::DragDrop(event));
         }
         DragDropEvent::RemoteDropStarted { .. } | DragDropEvent::RemoteDropFinished { .. } => {}
@@ -1571,6 +1715,117 @@ fn handle_controller_hook_event(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_controller_file_drag_hook_event(
+    event: HookEvent,
+    control_state: &mut Option<ControlState>,
+    last_pointer: &mut Option<Point>,
+    pending_pointer_park: &mut Option<Point>,
+    mouse_diagnostics: &mut MouseDiagnostics,
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
+    remote_control_active: &Arc<AtomicBool>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) {
+    *pending_pointer_park = None;
+    match event {
+        HookEvent::PointerPosition { x, y } => {
+            let point = Point::new(x, y);
+            *last_pointer = Some(point);
+            let Some(state) = control_state.as_mut() else {
+                return;
+            };
+            if state.mode() == ControlMode::Local {
+                let output = state.observe_local_pointer(point);
+                handle_file_drag_control_output(
+                    output,
+                    mouse_diagnostics,
+                    remote_input_send_buffer,
+                    remote_control_active,
+                    connection_commands,
+                    updates,
+                    session_id,
+                );
+            }
+        }
+        HookEvent::Input(InputEvent::MouseMoveDelta(delta)) => {
+            let Some(state) = control_state.as_mut() else {
+                return;
+            };
+            if state.mode() != ControlMode::Remote {
+                return;
+            }
+            mouse_diagnostics.record_raw_delta(delta.dx, delta.dy, now_millis());
+            let output = state.apply_remote_delta(delta.dx, delta.dy);
+            handle_file_drag_control_output(
+                output,
+                mouse_diagnostics,
+                remote_input_send_buffer,
+                remote_control_active,
+                connection_commands,
+                updates,
+                session_id,
+            );
+        }
+        HookEvent::Input(_) => {}
+    }
+}
+
+fn handle_file_drag_control_output(
+    output: ControlOutput,
+    mouse_diagnostics: &mut MouseDiagnostics,
+    remote_input_send_buffer: &mut RemoteInputSendBuffer,
+    remote_control_active: &Arc<AtomicBool>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    updates: &Sender<TaggedSessionUpdate>,
+    session_id: u64,
+) {
+    match output {
+        ControlOutput::EnterRemote(point) => {
+            remote_control_active.store(true, Ordering::SeqCst);
+            mouse_diagnostics.record_remote_move(point);
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_pointer(point, now_millis()),
+                connection_commands,
+                updates,
+                session_id,
+            );
+            send_session_update(
+                updates,
+                session_id,
+                SessionUpdate::Log("file drag/drop controlling remote pointer".to_string()),
+            );
+        }
+        ControlOutput::MoveRemote(point) => {
+            remote_control_active.store(true, Ordering::SeqCst);
+            mouse_diagnostics.record_remote_move(point);
+            emit_remote_send_actions(
+                remote_input_send_buffer.send_pointer(point, now_millis()),
+                connection_commands,
+                updates,
+                session_id,
+            );
+        }
+        ControlOutput::ReturnLocal(_) => {
+            remote_control_active.store(false, Ordering::SeqCst);
+        }
+        ControlOutput::None => {}
+    }
+}
+
+fn finish_controller_file_drag_pointer_mode(
+    control_state: &mut Option<ControlState>,
+    remote_control_active: &Arc<AtomicBool>,
+    pending_remote_pointer_position: &mut Option<PendingRemotePointerPosition>,
+) {
+    if let Some(state) = control_state.as_mut() {
+        state.force_local();
+    }
+    remote_control_active.store(false, Ordering::SeqCst);
+    *pending_remote_pointer_position = None;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3959,7 +4214,10 @@ mod tests {
         config::{RemotePosition, Role, TransportMode},
         drag_drop::{DragDropSession, DragDropState},
         file_transfer::FileManifestEntry,
-        input_event::{InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseWheelEvent},
+        input_event::{
+            InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveDeltaEvent,
+            MouseWheelEvent,
+        },
         protocol::WireMessage,
     };
     use borderless_net::transport::ConnectionEvent;
@@ -4732,6 +4990,7 @@ mod tests {
             ))
         );
         assert!(bulk_commands_rx.try_recv().is_err());
+        assert!(!runtime.has_active());
         assert!(updates_rx.try_iter().any(|update| {
             matches!(
                 update.update,
@@ -4749,6 +5008,188 @@ mod tests {
         assert!(!runtime.remember_remote_drop_commit(session_id));
         assert!(runtime.take_remote_drop_commit(session_id));
         assert!(!runtime.take_remote_drop_commit(session_id));
+    }
+
+    #[test]
+    fn controller_unscoped_drag_error_clears_all_pending_drag_sessions() {
+        let mut runtime = ControllerDragDropRuntime::default();
+        let transfer_id = Uuid::from_u128(61);
+        runtime.remember_start(DragDropSession {
+            session_id: Uuid::from_u128(60),
+            transfer_id,
+            state: DragDropState::TransferringFiles,
+        });
+        let config = AppConfig::default();
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (bulk_commands_tx, mut bulk_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, updates_rx) = unbounded();
+
+        handle_controller_drag_drop_event(
+            DragDropEvent::Error {
+                session_id: None,
+                message: "drag source lost".to_string(),
+            },
+            &config,
+            &mut runtime,
+            &connection_commands_tx,
+            &[bulk_commands_tx],
+            &updates_tx,
+            7,
+        );
+
+        assert!(!runtime.has_active());
+        assert!(connection_commands_rx.try_recv().is_err());
+        assert_eq!(
+            bulk_commands_rx.try_recv(),
+            Ok(BulkTransferCommand::Cancel(transfer_id))
+        );
+        assert!(updates_rx.try_iter().any(|update| {
+            matches!(
+                update.update,
+                SessionUpdate::DragDrop(DragDropEvent::Error {
+                    session_id: None,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn controller_hook_route_defers_standard_edge_handoff_during_file_drag() {
+        let local_desktop = Rect::new(0, 0, 1920, 1080);
+        let pointer = HookEvent::PointerPosition { x: 1919, y: 540 };
+        let center_pointer = HookEvent::PointerPosition { x: 960, y: 540 };
+        let raw_delta = HookEvent::Input(InputEvent::MouseMoveDelta(MouseMoveDeltaEvent {
+            dx: 12,
+            dy: 0,
+        }));
+
+        assert_eq!(
+            controller_hook_route(
+                &pointer,
+                true,
+                true,
+                true,
+                local_desktop,
+                2,
+                &RemotePosition::Right
+            ),
+            ControllerHookRoute::FileDrag
+        );
+        assert_eq!(
+            controller_hook_route(
+                &raw_delta,
+                true,
+                true,
+                true,
+                local_desktop,
+                2,
+                &RemotePosition::Right
+            ),
+            ControllerHookRoute::FileDrag
+        );
+        assert_eq!(
+            controller_hook_route(
+                &pointer,
+                false,
+                true,
+                true,
+                local_desktop,
+                2,
+                &RemotePosition::Right
+            ),
+            ControllerHookRoute::Ignore
+        );
+        assert_eq!(
+            controller_hook_route(
+                &center_pointer,
+                false,
+                true,
+                true,
+                local_desktop,
+                2,
+                &RemotePosition::Right
+            ),
+            ControllerHookRoute::Standard
+        );
+        assert_eq!(
+            controller_hook_route(
+                &pointer,
+                false,
+                false,
+                true,
+                local_desktop,
+                2,
+                &RemotePosition::Right
+            ),
+            ControllerHookRoute::Standard
+        );
+    }
+
+    #[test]
+    fn controller_file_drag_pointer_position_enters_remote_without_parking_local_pointer() {
+        let mut control_state = Some(ControlState::new(
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1280, 720),
+            RemotePosition::Right,
+            2,
+        ));
+        let mut last_pointer = None;
+        let mut pending_pointer_park = None;
+        let mut mouse_diagnostics = MouseDiagnostics::default();
+        let mut remote_input_send_buffer = RemoteInputSendBuffer::new(TransportMode::Kcp);
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = unbounded();
+        let remote_control_active = Arc::new(AtomicBool::new(false));
+
+        handle_controller_file_drag_hook_event(
+            HookEvent::PointerPosition { x: 1919, y: 540 },
+            &mut control_state,
+            &mut last_pointer,
+            &mut pending_pointer_park,
+            &mut mouse_diagnostics,
+            &mut remote_input_send_buffer,
+            &remote_control_active,
+            &connection_commands_tx,
+            &updates_tx,
+            7,
+        );
+
+        assert_eq!(pending_pointer_park, None);
+        assert!(remote_control_active.load(Ordering::SeqCst));
+        assert_eq!(
+            connection_commands_rx.try_recv(),
+            Ok(ConnectionCommand::SendLatestPointer { x: 0, y: 359 })
+        );
+    }
+
+    #[test]
+    fn finish_controller_file_drag_pointer_mode_leaves_local_control() {
+        let mut control_state = Some(ControlState::new(
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1280, 720),
+            RemotePosition::Right,
+            2,
+        ));
+        control_state
+            .as_mut()
+            .unwrap()
+            .observe_local_pointer(Point::new(1919, 540));
+        let remote_control_active = Arc::new(AtomicBool::new(true));
+        let mut pending_remote_pointer_position = Some(PendingRemotePointerPosition {
+            point: Point::new(1918, 540),
+            observed_millis: 99,
+        });
+
+        finish_controller_file_drag_pointer_mode(
+            &mut control_state,
+            &remote_control_active,
+            &mut pending_remote_pointer_position,
+        );
+
+        assert_eq!(control_state.as_ref().unwrap().mode(), ControlMode::Local);
+        assert!(!remote_control_active.load(Ordering::SeqCst));
+        assert_eq!(pending_remote_pointer_position, None);
     }
 
     #[test]

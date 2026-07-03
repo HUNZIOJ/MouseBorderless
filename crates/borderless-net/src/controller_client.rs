@@ -20,7 +20,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-const RELIABLE_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
+const RELIABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum ReliableDriverCommand {
     Send(WireMessage),
@@ -623,7 +623,7 @@ mod tests {
 
         wait_for_connected(&mut event_rx).await;
         timeout(
-            Duration::from_millis(2_500),
+            RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
             wait_for_disconnected(&mut event_rx),
         )
         .await
@@ -723,6 +723,11 @@ mod tests {
         assert!(message.contains("os error 10061"));
     }
 
+    #[test]
+    fn reliable_read_timeout_allows_drag_handoff_and_bulk_transfer_jitter() {
+        assert!(RELIABLE_READ_TIMEOUT >= Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn kcp_controller_releases_and_reopens_pointer_socket_after_reliable_timeout() {
         let listener = KcpFramedTransport::bind("127.0.0.2:0").await.unwrap();
@@ -750,7 +755,7 @@ mod tests {
 
         wait_for_connected(&mut event_rx).await;
         timeout(
-            Duration::from_millis(2_500),
+            RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
             wait_for_disconnected(&mut event_rx),
         )
         .await
@@ -851,10 +856,13 @@ mod tests {
 
     async fn wait_for_disconnected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
         loop {
-            match timeout(Duration::from_secs(2), event_rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
+            match timeout(
+                RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
+                event_rx.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
             {
                 ConnectionEvent::Disconnected(_) => return,
                 _ => {}
