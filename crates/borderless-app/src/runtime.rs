@@ -12,7 +12,7 @@ use borderless_core::{
     clipboard::{ClipboardEnvelope, ClipboardPayload, RemoteFileOffer},
     config::{AppConfig, RemotePosition, Role, TransportMode},
     control::{ControlMode, ControlOutput, ControlState},
-    file_transfer::FileManifestEntry,
+    file_transfer::{FileManifestEntry, FileTransferManifest},
     geometry::{detect_edge_for_position, edge_for_position, Point, Rect},
     input_event::{InputEvent, MouseButton, MouseMoveAbsEvent},
     protocol::{
@@ -706,6 +706,7 @@ async fn run_controller_event_pump(
     let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
     let mut clipboard_transport_ready = false;
     let mut drag_drop_runtime = ControllerDragDropRuntime::default();
+    let (drag_manifest_results_tx, mut drag_manifest_results_rx) = mpsc::unbounded_channel();
     let real_file_drag_drop_enabled = drag_events.is_some();
     let mut local_left_button_down = false;
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -752,6 +753,10 @@ async fn run_controller_event_pump(
                             );
                         }
                     }
+                    drain_controller_drag_manifest_requests(
+                        &mut drag_drop_runtime,
+                        &drag_manifest_results_tx,
+                    );
                 }
                 while let Ok(event) = hook_events.try_recv() {
                     update_local_left_button_state(&event, &mut local_left_button_down);
@@ -835,6 +840,19 @@ async fn run_controller_event_pump(
                         &updates,
                         session_id,
                         clipboard_transport_ready,
+                    );
+                }
+            }
+            manifest_result = drag_manifest_results_rx.recv() => {
+                if let Some(result) = manifest_result {
+                    handle_controller_drag_manifest_result(
+                        result,
+                        &config,
+                        &mut drag_drop_runtime,
+                        &connection_commands,
+                        &bulk_commands,
+                        &updates,
+                        session_id,
                     );
                 }
             }
@@ -1052,6 +1070,10 @@ fn handle_controller_connection_event(
 #[derive(Default)]
 struct ControllerDragDropRuntime {
     pending: Vec<borderless_core::drag_drop::DragDropSession>,
+    active_handoffs: HashSet<Uuid>,
+    preparing_manifests: HashSet<Uuid>,
+    deferred_commits: HashSet<Uuid>,
+    manifest_requests: VecDeque<ControllerDragManifestRequest>,
 }
 
 impl ControllerDragDropRuntime {
@@ -1059,14 +1081,45 @@ impl ControllerDragDropRuntime {
         self.pending.retain(|pending| {
             pending.session_id != session.session_id && pending.transfer_id != session.transfer_id
         });
+        self.active_handoffs.insert(session.session_id);
+        self.preparing_manifests.remove(&session.session_id);
+        self.deferred_commits.remove(&session.session_id);
+        self.manifest_requests
+            .retain(|request| request.session.session_id != session.session_id);
         self.pending.push(session);
     }
 
+    fn prepare_start(
+        &mut self,
+        session: borderless_core::drag_drop::DragDropSession,
+        paths: Vec<String>,
+    ) {
+        self.remember_start(session.clone());
+        self.preparing_manifests.insert(session.session_id);
+        self.manifest_requests
+            .push_back(ControllerDragManifestRequest { session, paths });
+    }
+
     fn has_active(&self) -> bool {
-        !self.pending.is_empty()
+        !self.active_handoffs.is_empty()
+    }
+
+    fn take_manifest_request(&mut self) -> Option<ControllerDragManifestRequest> {
+        self.manifest_requests.pop_front()
+    }
+
+    fn contains_session(&self, session_id: Uuid) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.session_id == session_id)
     }
 
     fn cancel_session(&mut self, session_id: Uuid) -> Option<Uuid> {
+        self.active_handoffs.remove(&session_id);
+        self.preparing_manifests.remove(&session_id);
+        self.deferred_commits.remove(&session_id);
+        self.manifest_requests
+            .retain(|request| request.session.session_id != session_id);
         let index = self
             .pending
             .iter()
@@ -1075,6 +1128,13 @@ impl ControllerDragDropRuntime {
     }
 
     fn complete_session(&mut self, session_id: Uuid) -> bool {
+        self.active_handoffs.remove(&session_id);
+        if self.preparing_manifests.contains(&session_id) {
+            if self.contains_session(session_id) {
+                self.deferred_commits.insert(session_id);
+            }
+            return false;
+        }
         let Some(index) = self
             .pending
             .iter()
@@ -1083,15 +1143,51 @@ impl ControllerDragDropRuntime {
             return false;
         };
         self.pending.remove(index);
+        self.deferred_commits.remove(&session_id);
+        true
+    }
+
+    fn manifest_ready(&mut self, session_id: Uuid) -> bool {
+        self.preparing_manifests.remove(&session_id) && self.contains_session(session_id)
+    }
+
+    fn complete_deferred_after_manifest(&mut self, session_id: Uuid) -> bool {
+        if !self.deferred_commits.remove(&session_id) {
+            return false;
+        }
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.session_id == session_id)
+        {
+            self.pending.remove(index);
+        }
         true
     }
 
     fn cancel_all(&mut self) -> Vec<(Uuid, Uuid)> {
+        self.active_handoffs.clear();
+        self.preparing_manifests.clear();
+        self.deferred_commits.clear();
+        self.manifest_requests.clear();
         self.pending
             .drain(..)
             .map(|session| (session.session_id, session.transfer_id))
             .collect()
     }
+}
+
+#[derive(Clone, Debug)]
+struct ControllerDragManifestRequest {
+    session: borderless_core::drag_drop::DragDropSession,
+    paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ControllerDragManifestResult {
+    session: borderless_core::drag_drop::DragDropSession,
+    paths: Vec<String>,
+    manifest: Result<FileTransferManifest, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1166,7 +1262,7 @@ fn controller_drag_event_ends_local_handoff(event: &DragDropEvent) -> bool {
 
 fn handle_controller_drag_drop_event(
     event: DragDropEvent,
-    config: &AppConfig,
+    _config: &AppConfig,
     drag_drop_runtime: &mut ControllerDragDropRuntime,
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
@@ -1175,7 +1271,7 @@ fn handle_controller_drag_drop_event(
 ) {
     match &event {
         DragDropEvent::LocalFileDragEntered { session, paths } => {
-            let Some(commands) = bulk_commands.last() else {
+            if bulk_commands.last().is_none() {
                 send_session_update(
                     updates,
                     runtime_session_id,
@@ -1186,83 +1282,9 @@ fn handle_controller_drag_drop_event(
                     }),
                 );
                 return;
-            };
-
-            match manifest_from_source_paths(session.transfer_id, paths) {
-                Ok(manifest) if manifest.total_bytes <= config.sharing.max_file_transfer_bytes => {
-                    if connection_commands
-                        .send(ConnectionCommand::SendReliable(WireMessage::DragDropStart(
-                            session.clone(),
-                        )))
-                        .is_err()
-                    {
-                        send_session_update(
-                            updates,
-                            runtime_session_id,
-                            SessionUpdate::DragDrop(DragDropEvent::Error {
-                                session_id: Some(session.session_id),
-                                message: "file drag/drop failed: connection command channel closed"
-                                    .to_string(),
-                            }),
-                        );
-                        return;
-                    }
-
-                    if commands
-                        .send(BulkTransferCommand::SendFiles {
-                            manifest,
-                            source_paths: paths.clone(),
-                        })
-                        .is_err()
-                    {
-                        let _ = connection_commands.send(ConnectionCommand::SendReliable(
-                            WireMessage::DragDropCancel {
-                                session_id: session.session_id,
-                            },
-                        ));
-                        send_session_update(
-                            updates,
-                            runtime_session_id,
-                            SessionUpdate::DragDrop(DragDropEvent::Error {
-                                session_id: Some(session.session_id),
-                                message:
-                                    "file drag/drop failed: bulk transfer command channel closed"
-                                        .to_string(),
-                            }),
-                        );
-                        return;
-                    }
-                    drag_drop_runtime.remember_start(session.clone());
-                    send_session_update(
-                        updates,
-                        runtime_session_id,
-                        SessionUpdate::DragDrop(event),
-                    );
-                }
-                Ok(manifest) => {
-                    send_session_update(
-                        updates,
-                        runtime_session_id,
-                        SessionUpdate::DragDrop(DragDropEvent::Error {
-                            session_id: Some(session.session_id),
-                            message: format!(
-                                "file drag/drop ignored: files are {} bytes, file transfer limit is {}",
-                                manifest.total_bytes, config.sharing.max_file_transfer_bytes
-                            ),
-                        }),
-                    );
-                }
-                Err(error) => {
-                    send_session_update(
-                        updates,
-                        runtime_session_id,
-                        SessionUpdate::DragDrop(DragDropEvent::Error {
-                            session_id: Some(session.session_id),
-                            message: format!("file drag/drop failed: {error}"),
-                        }),
-                    );
-                }
             }
+            drag_drop_runtime.prepare_start(session.clone(), paths.clone());
+            send_session_update(updates, runtime_session_id, SessionUpdate::DragDrop(event));
         }
         DragDropEvent::LocalDragCancelled { session_id } => {
             cancel_controller_drag_drop_session(
@@ -1277,12 +1299,13 @@ fn handle_controller_drag_drop_event(
         }
         DragDropEvent::LocalDropCommitted { .. } => {
             if let DragDropEvent::LocalDropCommitted { session_id } = &event {
-                drag_drop_runtime.complete_session(*session_id);
-                let _ = connection_commands.send(ConnectionCommand::SendReliable(
-                    WireMessage::DragDropCommit {
-                        session_id: *session_id,
-                    },
-                ));
+                if drag_drop_runtime.complete_session(*session_id) {
+                    let _ = connection_commands.send(ConnectionCommand::SendReliable(
+                        WireMessage::DragDropCommit {
+                            session_id: *session_id,
+                        },
+                    ));
+                }
             }
             send_session_update(updates, runtime_session_id, SessionUpdate::DragDrop(event));
         }
@@ -1313,6 +1336,136 @@ fn handle_controller_drag_drop_event(
             send_session_update(updates, runtime_session_id, SessionUpdate::DragDrop(event));
         }
         DragDropEvent::RemoteDropStarted { .. } | DragDropEvent::RemoteDropFinished { .. } => {}
+    }
+}
+
+fn spawn_controller_drag_manifest_job(
+    request: ControllerDragManifestRequest,
+    results: mpsc::UnboundedSender<ControllerDragManifestResult>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let manifest = manifest_from_source_paths(request.session.transfer_id, &request.paths)
+            .map_err(|error| error.to_string());
+        let _ = results.send(ControllerDragManifestResult {
+            session: request.session,
+            paths: request.paths,
+            manifest,
+        });
+    });
+}
+
+fn drain_controller_drag_manifest_requests(
+    drag_drop_runtime: &mut ControllerDragDropRuntime,
+    manifest_results: &mpsc::UnboundedSender<ControllerDragManifestResult>,
+) {
+    while let Some(request) = drag_drop_runtime.take_manifest_request() {
+        spawn_controller_drag_manifest_job(request, manifest_results.clone());
+    }
+}
+
+fn handle_controller_drag_manifest_result(
+    result: ControllerDragManifestResult,
+    config: &AppConfig,
+    drag_drop_runtime: &mut ControllerDragDropRuntime,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
+    updates: &Sender<TaggedSessionUpdate>,
+    runtime_session_id: u64,
+) {
+    let session_id = result.session.session_id;
+    if !drag_drop_runtime.manifest_ready(session_id) {
+        return;
+    }
+
+    let Some(commands) = bulk_commands.last() else {
+        let _ = drag_drop_runtime.cancel_session(session_id);
+        send_session_update(
+            updates,
+            runtime_session_id,
+            SessionUpdate::DragDrop(DragDropEvent::Error {
+                session_id: Some(session_id),
+                message: "file drag/drop failed: bulk transfer channel is not available"
+                    .to_string(),
+            }),
+        );
+        return;
+    };
+
+    let manifest = match result.manifest {
+        Ok(manifest) if manifest.total_bytes <= config.sharing.max_file_transfer_bytes => manifest,
+        Ok(manifest) => {
+            let _ = drag_drop_runtime.cancel_session(session_id);
+            send_session_update(
+                updates,
+                runtime_session_id,
+                SessionUpdate::DragDrop(DragDropEvent::Error {
+                    session_id: Some(session_id),
+                    message: format!(
+                        "file drag/drop ignored: files are {} bytes, file transfer limit is {}",
+                        manifest.total_bytes, config.sharing.max_file_transfer_bytes
+                    ),
+                }),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = drag_drop_runtime.cancel_session(session_id);
+            send_session_update(
+                updates,
+                runtime_session_id,
+                SessionUpdate::DragDrop(DragDropEvent::Error {
+                    session_id: Some(session_id),
+                    message: format!("file drag/drop failed: {error}"),
+                }),
+            );
+            return;
+        }
+    };
+
+    if connection_commands
+        .send(ConnectionCommand::SendReliable(WireMessage::DragDropStart(
+            result.session.clone(),
+        )))
+        .is_err()
+    {
+        let _ = drag_drop_runtime.cancel_session(session_id);
+        send_session_update(
+            updates,
+            runtime_session_id,
+            SessionUpdate::DragDrop(DragDropEvent::Error {
+                session_id: Some(session_id),
+                message: "file drag/drop failed: connection command channel closed".to_string(),
+            }),
+        );
+        return;
+    }
+
+    if commands
+        .send(BulkTransferCommand::SendFiles {
+            manifest,
+            source_paths: result.paths,
+        })
+        .is_err()
+    {
+        let _ = drag_drop_runtime.cancel_session(session_id);
+        let _ = connection_commands.send(ConnectionCommand::SendReliable(
+            WireMessage::DragDropCancel { session_id },
+        ));
+        send_session_update(
+            updates,
+            runtime_session_id,
+            SessionUpdate::DragDrop(DragDropEvent::Error {
+                session_id: Some(session_id),
+                message: "file drag/drop failed: bulk transfer command channel closed".to_string(),
+            }),
+        );
+        return;
+    }
+
+    if drag_drop_runtime.complete_deferred_after_manifest(session_id) {
+        let _ = connection_commands.send(ConnectionCommand::SendReliable(
+            WireMessage::DragDropCommit { session_id },
+        ));
     }
 }
 
@@ -3785,7 +3938,7 @@ fn apply_drag_drop_status_update(
     match event {
         DragDropEvent::LocalFileDragEntered { session, paths } => {
             status.active_drag_session = Some(session.session_id);
-            status.drag_drop_state = Some("transferring files".to_string());
+            status.drag_drop_state = Some("preparing files".to_string());
             emit_log(
                 status,
                 events,
@@ -4913,6 +5066,55 @@ mod tests {
     }
 
     #[test]
+    fn controller_local_file_drag_enter_queues_manifest_without_blocking_control_channel() {
+        let session_id = Uuid::from_u128(70);
+        let transfer_id = Uuid::from_u128(71);
+        let session = DragDropSession {
+            session_id,
+            transfer_id,
+            state: DragDropState::LocalDragDetected,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "borderless-drag-async-manifest-{}",
+            unused_tcp_port()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("note.txt");
+        fs::write(&source_path, b"note").unwrap();
+        let config = AppConfig::default();
+        let mut runtime = ControllerDragDropRuntime::default();
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (bulk_commands_tx, mut bulk_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = unbounded();
+
+        handle_controller_drag_drop_event(
+            DragDropEvent::LocalFileDragEntered {
+                session,
+                paths: vec![source_path.to_string_lossy().to_string()],
+            },
+            &config,
+            &mut runtime,
+            &connection_commands_tx,
+            &[bulk_commands_tx.clone()],
+            &updates_tx,
+            7,
+        );
+
+        assert!(runtime.has_active());
+        let request = runtime.take_manifest_request().unwrap();
+        assert_eq!(request.session.session_id, session_id);
+        assert_eq!(
+            request.paths,
+            vec![source_path.to_string_lossy().to_string()]
+        );
+        assert!(runtime.take_manifest_request().is_none());
+        assert!(connection_commands_rx.try_recv().is_err());
+        assert!(bulk_commands_rx.try_recv().is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn controller_local_drag_cancel_notifies_peer_and_cancels_bulk_transfer() {
         let session_id = Uuid::from_u128(9);
         let transfer_id = Uuid::from_u128(10);
@@ -4933,7 +5135,7 @@ mod tests {
             &config,
             &mut runtime,
             &connection_commands_tx,
-            &[bulk_commands_tx],
+            &[bulk_commands_tx.clone()],
             &updates_tx,
             7,
         );
@@ -4978,7 +5180,7 @@ mod tests {
             &config,
             &mut runtime,
             &connection_commands_tx,
-            &[bulk_commands_tx],
+            &[bulk_commands_tx.clone()],
             &updates_tx,
             7,
         );
@@ -4998,6 +5200,129 @@ mod tests {
                     if id == session_id
             )
         }));
+    }
+
+    #[test]
+    fn controller_local_drop_commit_waits_for_manifest_before_notifying_peer() {
+        let session_id = Uuid::from_u128(72);
+        let transfer_id = Uuid::from_u128(73);
+        let session = DragDropSession {
+            session_id,
+            transfer_id,
+            state: DragDropState::LocalDragDetected,
+        };
+        let source_path = "C:/drag/note.txt".to_string();
+        let config = AppConfig::default();
+        let mut runtime = ControllerDragDropRuntime::default();
+        runtime.prepare_start(session.clone(), vec![source_path.clone()]);
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (bulk_commands_tx, mut bulk_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = unbounded();
+
+        handle_controller_drag_drop_event(
+            DragDropEvent::LocalDropCommitted { session_id },
+            &config,
+            &mut runtime,
+            &connection_commands_tx,
+            &[bulk_commands_tx.clone()],
+            &updates_tx,
+            7,
+        );
+
+        assert!(!runtime.has_active());
+        assert!(connection_commands_rx.try_recv().is_err());
+
+        handle_controller_drag_manifest_result(
+            ControllerDragManifestResult {
+                session,
+                paths: vec![source_path.clone()],
+                manifest: Ok(FileTransferManifest {
+                    transfer_id,
+                    root_name: "note.txt".to_string(),
+                    files: vec![FileManifestEntry::file("note.txt", 4)],
+                    total_bytes: 4,
+                }),
+            },
+            &config,
+            &mut runtime,
+            &connection_commands_tx,
+            &[bulk_commands_tx],
+            &updates_tx,
+            7,
+        );
+
+        assert_eq!(
+            connection_commands_rx.try_recv(),
+            Ok(ConnectionCommand::SendReliable(WireMessage::DragDropStart(
+                DragDropSession {
+                    session_id,
+                    transfer_id,
+                    state: DragDropState::LocalDragDetected,
+                }
+            )))
+        );
+        assert!(matches!(
+            bulk_commands_rx.try_recv(),
+            Ok(BulkTransferCommand::SendFiles { source_paths, .. }) if source_paths == vec![source_path]
+        ));
+        assert_eq!(
+            connection_commands_rx.try_recv(),
+            Ok(ConnectionCommand::SendReliable(
+                WireMessage::DragDropCommit { session_id }
+            ))
+        );
+        assert!(!runtime.contains_session(session_id));
+    }
+
+    #[test]
+    fn controller_stale_manifest_result_is_ignored_after_first_ready() {
+        let session_id = Uuid::from_u128(74);
+        let transfer_id = Uuid::from_u128(75);
+        let session = DragDropSession {
+            session_id,
+            transfer_id,
+            state: DragDropState::LocalDragDetected,
+        };
+        let config = AppConfig::default();
+        let mut runtime = ControllerDragDropRuntime::default();
+        runtime.prepare_start(session.clone(), vec!["C:/drag/note.txt".to_string()]);
+        let (connection_commands_tx, mut connection_commands_rx) = mpsc::unbounded_channel();
+        let (bulk_commands_tx, mut bulk_commands_rx) = mpsc::unbounded_channel();
+        let (updates_tx, _updates_rx) = unbounded();
+
+        for _ in 0..2 {
+            handle_controller_drag_manifest_result(
+                ControllerDragManifestResult {
+                    session: session.clone(),
+                    paths: vec!["C:/drag/note.txt".to_string()],
+                    manifest: Ok(FileTransferManifest {
+                        transfer_id,
+                        root_name: "note.txt".to_string(),
+                        files: vec![FileManifestEntry::file("note.txt", 4)],
+                        total_bytes: 4,
+                    }),
+                },
+                &config,
+                &mut runtime,
+                &connection_commands_tx,
+                &[bulk_commands_tx.clone()],
+                &updates_tx,
+                7,
+            );
+        }
+
+        assert_eq!(
+            connection_commands_rx.try_recv(),
+            Ok(ConnectionCommand::SendReliable(WireMessage::DragDropStart(
+                session
+            )))
+        );
+        assert!(matches!(
+            bulk_commands_rx.try_recv(),
+            Ok(BulkTransferCommand::SendFiles { .. })
+        ));
+        assert!(connection_commands_rx.try_recv().is_err());
+        assert!(bulk_commands_rx.try_recv().is_err());
     }
 
     #[test]
