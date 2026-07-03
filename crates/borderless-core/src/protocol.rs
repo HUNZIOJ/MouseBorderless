@@ -43,6 +43,9 @@ pub enum WireMessage {
     DragDropCancel {
         session_id: uuid::Uuid,
     },
+    DragDropCommit {
+        session_id: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +62,7 @@ struct FileTransferCompletePayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DragDropCancelPayload {
+struct DragDropSessionPayload {
     session_id: uuid::Uuid,
 }
 
@@ -192,6 +195,7 @@ fn message_type(message: &WireMessage) -> u8 {
         WireMessage::FileTransferComplete { .. } => 10,
         WireMessage::DragDropStart(_) => 11,
         WireMessage::DragDropCancel { .. } => 12,
+        WireMessage::DragDropCommit { .. } => 13,
     }
 }
 
@@ -221,7 +225,10 @@ fn encode_message(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
             })
         }
         WireMessage::DragDropStart(session) => encode_body(session),
-        WireMessage::DragDropCancel { session_id } => encode_body(&DragDropCancelPayload {
+        WireMessage::DragDropCancel { session_id } => encode_body(&DragDropSessionPayload {
+            session_id: *session_id,
+        }),
+        WireMessage::DragDropCommit { session_id } => encode_body(&DragDropSessionPayload {
             session_id: *session_id,
         }),
     }
@@ -259,8 +266,13 @@ fn decode_message(ty: u8, payload: &[u8]) -> Result<WireMessage, ProtocolError> 
         }),
         11 => decode_body::<crate::drag_drop::DragDropSession>(ty, payload)
             .map(WireMessage::DragDropStart),
-        12 => decode_body::<DragDropCancelPayload>(ty, payload).map(|body| {
+        12 => decode_body::<DragDropSessionPayload>(ty, payload).map(|body| {
             WireMessage::DragDropCancel {
+                session_id: body.session_id,
+            }
+        }),
+        13 => decode_body::<DragDropSessionPayload>(ty, payload).map(|body| {
+            WireMessage::DragDropCommit {
                 session_id: body.session_id,
             }
         }),
@@ -326,7 +338,8 @@ fn payload_matches_type(ty: u8, payload: &[u8]) -> bool {
         9 => strict_payload_matches::<FileTransferProgressPayload>(payload),
         10 => strict_payload_matches::<FileTransferCompletePayload>(payload),
         11 => strict_payload_matches::<crate::drag_drop::DragDropSession>(payload),
-        12 => strict_payload_matches::<DragDropCancelPayload>(payload),
+        12 => strict_payload_matches::<DragDropSessionPayload>(payload),
+        13 => strict_payload_matches::<DragDropSessionPayload>(payload),
         _ => false,
     }
 }
@@ -493,6 +506,7 @@ mod tests {
             ),
             (WireMessage::DragDropStart(drag_session), 11),
             (WireMessage::DragDropCancel { session_id }, 12),
+            (WireMessage::DragDropCommit { session_id }, 13),
         ];
 
         for (message, expected_ty) in cases {

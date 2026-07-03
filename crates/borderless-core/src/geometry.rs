@@ -73,13 +73,13 @@ pub fn detect_edge(point: Point, desktop: Rect, trigger_px: i32) -> Option<Edge>
         return None;
     }
 
-    if point.x <= desktop.left + trigger_px - 1 {
+    if point.x < desktop.left + trigger_px {
         Some(Edge::Left)
-    } else if point.x >= desktop.right() - trigger_px + 1 {
+    } else if point.x > desktop.right() - trigger_px {
         Some(Edge::Right)
-    } else if point.y <= desktop.top + trigger_px - 1 {
+    } else if point.y < desktop.top + trigger_px {
         Some(Edge::Top)
-    } else if point.y >= desktop.bottom() - trigger_px + 1 {
+    } else if point.y > desktop.bottom() - trigger_px {
         Some(Edge::Bottom)
     } else {
         None
@@ -97,12 +97,10 @@ pub fn detect_edge_for_position(
     }
 
     match position {
-        RemotePosition::Left if point.x <= desktop.left + trigger_px - 1 => Some(Edge::Left),
-        RemotePosition::Right if point.x >= desktop.right() - trigger_px + 1 => Some(Edge::Right),
-        RemotePosition::Top if point.y <= desktop.top + trigger_px - 1 => Some(Edge::Top),
-        RemotePosition::Bottom if point.y >= desktop.bottom() - trigger_px + 1 => {
-            Some(Edge::Bottom)
-        }
+        RemotePosition::Left if point.x < desktop.left + trigger_px => Some(Edge::Left),
+        RemotePosition::Right if point.x > desktop.right() - trigger_px => Some(Edge::Right),
+        RemotePosition::Top if point.y < desktop.top + trigger_px => Some(Edge::Top),
+        RemotePosition::Bottom if point.y > desktop.bottom() - trigger_px => Some(Edge::Bottom),
         _ => None,
     }
 }

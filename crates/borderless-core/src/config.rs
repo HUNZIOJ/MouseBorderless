@@ -7,45 +7,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    #[default]
     Controller,
     Agent,
 }
 
-impl Default for Role {
-    fn default() -> Self {
-        Self::Controller
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemotePosition {
     Left,
+    #[default]
     Right,
     Top,
     Bottom,
 }
 
-impl Default for RemotePosition {
-    fn default() -> Self {
-        Self::Right
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportMode {
+    #[default]
     Tcp,
     Kcp,
-}
-
-impl Default for TransportMode {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

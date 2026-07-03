@@ -256,7 +256,66 @@ impl BorderlessApp {
                         ui.label("Clipboard ignored");
                         ui.label(option_text(self.status.clipboard_ignored_reason.as_deref()));
                         ui.end_row();
+
+                        ui.label("Transfer");
+                        ui.label(if self.status.transfer_active {
+                            format!(
+                                "{}/{} bytes",
+                                self.status.transfer_bytes_done, self.status.transfer_bytes_total
+                            )
+                        } else {
+                            "-".to_string()
+                        });
+                        ui.end_row();
+
+                        ui.label("Transfer file");
+                        ui.label(option_text(self.status.transfer_current_file.as_deref()));
+                        ui.end_row();
+
+                        ui.label("Drag/drop enabled");
+                        ui.label(if self.status.drag_drop_enabled {
+                            "yes"
+                        } else {
+                            "no"
+                        });
+                        ui.end_row();
+
+                        ui.label("Drag/drop state");
+                        ui.label(option_text(self.status.drag_drop_state.as_deref()));
+                        ui.end_row();
+
+                        ui.label("Mouse diagnostics");
+                        ui.label(option_text(self.status.mouse_diagnostics.as_deref()));
+                        ui.end_row();
                     });
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.status.transfer_active && self.status.transfer_id.is_some(),
+                            egui::Button::new("Cancel transfer"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(transfer_id) = self.status.transfer_id {
+                            self.runtime
+                                .send(RuntimeCommand::CancelTransfer(transfer_id));
+                        }
+                    }
+
+                    if ui
+                        .add_enabled(
+                            self.status.active_drag_session.is_some(),
+                            egui::Button::new("Cancel drag"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(session_id) = self.status.active_drag_session {
+                            self.runtime
+                                .send(RuntimeCommand::CancelDragDrop(session_id));
+                        }
+                    }
+                });
             });
     }
 

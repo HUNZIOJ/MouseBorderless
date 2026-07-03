@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use borderless_core::input_event::{
-    InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseWheelEvent,
+    InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveAbsEvent, MouseMoveDeltaEvent,
+    MouseWheelEvent,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::{
@@ -16,19 +17,26 @@ use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        UI::Input::{
+            GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+            RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+        },
         UI::WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
+            CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+            GetClassInfoW, GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW,
             SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
-            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+            HWND_MESSAGE, KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+            WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
         },
     },
 };
 
 const HOOK_EVENT_QUEUE_CAPACITY: usize = 1024;
 const EXTERNAL_EVENT_BACKLOG_LIMIT: usize = 1024;
+const RAW_INPUT_WINDOW_CLASS: &str = "BorderlessRawInputWindow";
 
 #[derive(Clone, Debug)]
 pub enum HookEvent {
@@ -251,6 +259,24 @@ impl Drop for InstalledHooks {
     }
 }
 
+struct RawInputWindow(HWND);
+
+impl RawInputWindow {
+    fn create() -> anyhow::Result<Self> {
+        let hwnd = create_raw_input_window()?;
+        register_raw_mouse_input(hwnd)?;
+        Ok(Self(hwnd))
+    }
+}
+
+impl Drop for RawInputWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
 fn run_hook_thread(
     sender: Sender<HookEvent>,
     mode: Arc<AtomicBool>,
@@ -263,6 +289,17 @@ fn run_hook_thread(
         *state.borrow_mut() = Some(HookThreadState::new(sender, mode));
     });
     let _state_guard = HookThreadStateGuard;
+
+    let raw_input_window = match RawInputWindow::create() {
+        Ok(window) => Some(window),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "raw input registration failed; falling back to low-level mouse hook positions"
+            );
+            None
+        }
+    };
 
     let hooks = match install_low_level_hooks() {
         Ok(hooks) => {
@@ -277,6 +314,7 @@ fn run_hook_thread(
 
     let result = message_loop();
     drop(hooks);
+    drop(raw_input_window);
     result
 }
 
@@ -341,6 +379,69 @@ fn install_low_level_hooks() -> anyhow::Result<InstalledHooks> {
     Ok(InstalledHooks { mouse, keyboard })
 }
 
+fn create_raw_input_window() -> anyhow::Result<HWND> {
+    let class_name = wide_null(RAW_INPUT_WINDOW_CLASS);
+    let module: HINSTANCE = unsafe { GetModuleHandleW(PCWSTR::null()) }
+        .context("get current module handle for raw input")?
+        .into();
+    let window_class = WNDCLASSW {
+        lpfnWndProc: Some(raw_input_window_proc),
+        hInstance: module,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+
+    let atom = unsafe { RegisterClassW(&window_class) };
+    if atom == 0 {
+        let mut existing = WNDCLASSW::default();
+        unsafe {
+            GetClassInfoW(module, PCWSTR(class_name.as_ptr()), &mut existing)
+                .context("register raw input window class")?;
+        }
+    }
+
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(class_name.as_ptr()),
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            module,
+            None,
+        )
+    }
+    .context("create raw input message window")
+}
+
+fn register_raw_mouse_input(hwnd: HWND) -> anyhow::Result<()> {
+    unsafe {
+        RegisterRawInputDevices(
+            &[raw_mouse_input_device(hwnd)],
+            std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+        )
+    }
+    .context("register raw mouse input")
+}
+
+unsafe extern "system" fn raw_input_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn message_loop() -> anyhow::Result<()> {
     let mut message = MSG::default();
 
@@ -350,11 +451,62 @@ fn message_loop() -> anyhow::Result<()> {
             -1 => return Err(windows::core::Error::from_win32()).context("get hook message"),
             0 => return Ok(()),
             _ => unsafe {
+                if message.message == WM_INPUT {
+                    emit_raw_input_message(message.lParam);
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             },
         }
     }
+}
+
+fn emit_raw_input_message(lparam: LPARAM) {
+    let Some(event) = read_raw_input_event(lparam) else {
+        return;
+    };
+
+    HOOK_THREAD_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.emit_event(event);
+        }
+    });
+}
+
+fn read_raw_input_event(lparam: LPARAM) -> Option<HookEvent> {
+    let raw = read_raw_input(lparam).ok()?;
+    raw_input_event(&raw)
+}
+
+fn read_raw_input(lparam: LPARAM) -> anyhow::Result<RAWINPUT> {
+    let raw_input = HRAWINPUT(lparam.0 as *mut core::ffi::c_void);
+    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let mut size = 0;
+    let result = unsafe { GetRawInputData(raw_input, RID_INPUT, None, &mut size, header_size) };
+    if result == u32::MAX {
+        return Err(windows::core::Error::from_win32()).context("query raw input size");
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    let result = unsafe {
+        GetRawInputData(
+            raw_input,
+            RID_INPUT,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+            header_size,
+        )
+    };
+    if result == u32::MAX {
+        return Err(windows::core::Error::from_win32()).context("read raw input data");
+    }
+    if result != size || (size as usize) < std::mem::size_of::<RAWINPUT>() {
+        return Err(anyhow!(
+            "unexpected raw input size: read {result}, expected {size}"
+        ));
+    }
+
+    Ok(unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<RAWINPUT>()) })
 }
 
 unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -416,6 +568,10 @@ fn set_suppression_mode(mode: &AtomicBool, suppression_mode: SuppressionMode) {
 }
 
 fn mouse_hook_events(message: u32, data: &MSLLHOOKSTRUCT) -> Vec<HookEvent> {
+    if message == WM_MOUSEMOVE && injected_mouse_event(data) {
+        return Vec::new();
+    }
+
     match message {
         WM_MOUSEMOVE => vec![
             HookEvent::PointerPosition {
@@ -438,6 +594,44 @@ fn mouse_hook_events(message: u32, data: &MSLLHOOKSTRUCT) -> Vec<HookEvent> {
             }))]
         }
         _ => Vec::new(),
+    }
+}
+
+fn injected_mouse_event(data: &MSLLHOOKSTRUCT) -> bool {
+    data.flags & LLMHF_INJECTED != 0
+}
+
+fn raw_mouse_delta_event(mouse: &RAWMOUSE) -> Option<HookEvent> {
+    if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+        return None;
+    }
+
+    let dx = mouse.lLastX;
+    let dy = mouse.lLastY;
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+
+    Some(HookEvent::Input(InputEvent::MouseMoveDelta(
+        MouseMoveDeltaEvent { dx, dy },
+    )))
+}
+
+fn raw_input_event(raw: &RAWINPUT) -> Option<HookEvent> {
+    if raw.header.dwType != RIM_TYPEMOUSE.0 {
+        return None;
+    }
+
+    let mouse = unsafe { raw.data.mouse };
+    raw_mouse_delta_event(&mouse)
+}
+
+fn raw_mouse_input_device(hwnd: HWND) -> RAWINPUTDEVICE {
+    RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
     }
 }
 
@@ -498,10 +692,14 @@ mod tests {
         Arc,
     };
     use windows::Win32::{
-        Foundation::POINT,
+        Foundation::{HWND, POINT, WPARAM},
+        UI::Input::{
+            MOUSE_MOVE_RELATIVE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE, RIDEV_INPUTSINK,
+            RIM_TYPEMOUSE,
+        },
         UI::WindowsAndMessaging::{
-            KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, MSLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP,
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLMHF_INJECTED, MSLLHOOKSTRUCT, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
             WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
@@ -526,6 +724,57 @@ mod tests {
             "second event should report absolute mouse movement, got {:?}",
             events[1]
         );
+    }
+
+    #[test]
+    fn injected_mouse_move_is_ignored() {
+        let events = mouse_hook_events(
+            WM_MOUSEMOVE,
+            &mouse_data_with_flags(321, -45, 0, LLMHF_INJECTED),
+        );
+
+        assert!(events.is_empty(), "injected mouse move should be ignored");
+    }
+
+    #[test]
+    fn raw_relative_mouse_input_produces_delta_event() {
+        let event = raw_mouse_delta_event(&raw_mouse_delta(12, -5))
+            .expect("relative raw mouse movement should produce an event");
+
+        assert!(
+            matches!(
+                event,
+                HookEvent::Input(InputEvent::MouseMoveDelta(delta))
+                    if delta.dx == 12 && delta.dy == -5
+            ),
+            "relative raw input should report dx/dy, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mouse_input_produces_delta_event() {
+        let event = raw_input_event(&raw_mouse_input(7, -3))
+            .expect("raw mouse input should produce an event");
+
+        assert!(
+            matches!(
+                event,
+                HookEvent::Input(InputEvent::MouseMoveDelta(delta))
+                    if delta.dx == 7 && delta.dy == -3
+            ),
+            "raw mouse input should report dx/dy, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mouse_input_device_targets_background_mouse_deltas() {
+        let hwnd = HWND(123usize as *mut core::ffi::c_void);
+        let device = raw_mouse_input_device(hwnd);
+
+        assert_eq!(device.usUsagePage, 0x01);
+        assert_eq!(device.usUsage, 0x02);
+        assert_eq!(device.dwFlags.0 & RIDEV_INPUTSINK.0, RIDEV_INPUTSINK.0);
+        assert_eq!(device.hwndTarget, hwnd);
     }
 
     #[test]
@@ -768,12 +1017,41 @@ mod tests {
     }
 
     fn mouse_data_at(x: i32, y: i32, mouse_data: u32) -> MSLLHOOKSTRUCT {
+        mouse_data_with_flags(x, y, mouse_data, 0)
+    }
+
+    fn mouse_data_with_flags(x: i32, y: i32, mouse_data: u32, flags: u32) -> MSLLHOOKSTRUCT {
         MSLLHOOKSTRUCT {
             pt: POINT { x, y },
             mouseData: mouse_data,
-            flags: 0,
+            flags,
             time: 0,
             dwExtraInfo: 0,
+        }
+    }
+
+    fn raw_mouse_delta(dx: i32, dy: i32) -> RAWMOUSE {
+        RAWMOUSE {
+            usFlags: MOUSE_MOVE_RELATIVE,
+            Anonymous: Default::default(),
+            ulRawButtons: 0,
+            lLastX: dx,
+            lLastY: dy,
+            ulExtraInformation: 0,
+        }
+    }
+
+    fn raw_mouse_input(dx: i32, dy: i32) -> RAWINPUT {
+        RAWINPUT {
+            header: RAWINPUTHEADER {
+                dwType: RIM_TYPEMOUSE.0,
+                dwSize: std::mem::size_of::<RAWINPUT>() as u32,
+                hDevice: Default::default(),
+                wParam: WPARAM(0),
+            },
+            data: RAWINPUT_0 {
+                mouse: raw_mouse_delta(dx, dy),
+            },
         }
     }
 }

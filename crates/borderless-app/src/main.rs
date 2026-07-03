@@ -4,6 +4,7 @@ mod runtime;
 mod status;
 
 fn main() -> eframe::Result<()> {
+    let _logging_guard = logging::init_logging(false).ok();
     let _ = borderless_win::dpi::enable_per_monitor_dpi_awareness();
 
     let native_options = eframe::NativeOptions::default();

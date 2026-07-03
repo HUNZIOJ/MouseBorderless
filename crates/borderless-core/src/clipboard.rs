@@ -42,7 +42,7 @@ pub enum ClipboardPayload {
 impl ClipboardPayload {
     pub fn total_bytes(&self) -> u64 {
         match self {
-            Self::UnicodeText(value) | Self::Html(value) => value.as_bytes().len() as u64,
+            Self::UnicodeText(value) | Self::Html(value) => value.len() as u64,
             Self::ImagePng(bytes) | Self::ImageDib(bytes) => bytes.len() as u64,
             Self::Files(offer) => offer
                 .files
