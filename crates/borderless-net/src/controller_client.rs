@@ -73,7 +73,10 @@ pub async fn run_controller_client(
                         true
                     }
                     ConnectAttempt::Failed(error) => {
-                        emit(&events, ConnectionEvent::Error(error));
+                        emit(
+                            &events,
+                            ConnectionEvent::Error(connection_failure_message(&peer, &error)),
+                        );
                         if wait_before_reconnect(&mut commands).await {
                             return Ok(());
                         }
@@ -118,7 +121,10 @@ pub async fn run_controller_client(
                         }
                     }
                     ConnectAttempt::Failed(error) => {
-                        emit(&events, ConnectionEvent::Error(error));
+                        emit(
+                            &events,
+                            ConnectionEvent::Error(connection_failure_message(&peer, &error)),
+                        );
                         if wait_before_reconnect(&mut commands).await {
                             return Ok(());
                         }
@@ -134,6 +140,12 @@ pub async fn run_controller_client(
             return Ok(());
         }
     }
+}
+
+fn connection_failure_message(peer: &str, error: &str) -> String {
+    format!(
+        "connection to {peer} failed: {error}. Check that Borderless is running as Agent on the target computer, the IP/port match, and Windows firewall allows the configured port."
+    )
 }
 
 async fn connect_or_stop<T, F>(
@@ -695,6 +707,20 @@ mod tests {
 
         command_tx.send(ConnectionCommand::Stop).unwrap();
         controller.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn connection_failure_message_names_target_and_setup_checks() {
+        let message = connection_failure_message(
+            "192.168.1.2:24800",
+            "由于目标计算机积极拒绝，无法连接。 (os error 10061)",
+        );
+
+        assert!(message.contains("192.168.1.2:24800"));
+        assert!(message.contains("Agent"));
+        assert!(message.contains("firewall"));
+        assert!(message.contains("port"));
+        assert!(message.contains("os error 10061"));
     }
 
     #[tokio::test]
