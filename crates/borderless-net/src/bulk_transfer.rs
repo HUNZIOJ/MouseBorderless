@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -114,7 +114,7 @@ struct ActiveReceiveFile {
     expected_hash: String,
     written: u64,
     hasher: blake3::Hasher,
-    file: File,
+    file: tokio::fs::File,
 }
 
 pub fn rename_conflict(name: &str, index: u32) -> String {
@@ -430,7 +430,14 @@ where
         }
 
         let size_bytes = source.size_bytes;
-        let final_hash = match hash_file_hex(&source.path, transfer_id, cancelled) {
+        let source_path = source.path.clone();
+        let cancelled_for_hash = Arc::clone(cancelled);
+        let hash_result = tokio::task::spawn_blocking(move || {
+            hash_file_hex(&source_path, transfer_id, &cancelled_for_hash)
+        })
+        .await
+        .context("hash computation task panicked")?;
+        let final_hash = match hash_result {
             Ok(hash) => hash,
             Err(_) if is_cancelled(cancelled, transfer_id) => {
                 send_wire(writer, &BulkWireMessage::Cancel { transfer_id }).await?;
@@ -450,7 +457,8 @@ where
         )
         .await?;
 
-        let mut file = File::open(&source.path)
+        let mut file = tokio::fs::File::open(&source.path)
+            .await
             .with_context(|| format!("open source file {}", source.path.display()))?;
         let mut offset = 0_u64;
         let mut buffer = vec![0; CHUNK_SIZE];
@@ -464,6 +472,7 @@ where
 
             let read = file
                 .read(&mut buffer)
+                .await
                 .with_context(|| format!("read source file {}", source.path.display()))?;
             if read == 0 {
                 break;
@@ -515,7 +524,8 @@ async fn read_incoming(
     cancelled: Arc<Mutex<HashSet<Uuid>>>,
 ) -> anyhow::Result<()> {
     let cache_dir = PathBuf::from(incoming_cache_dir);
-    fs::create_dir_all(&cache_dir)
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
         .with_context(|| format!("create incoming cache {}", cache_dir.display()))?;
     let mut book = ReceiveBook::default();
     let mut active_file: Option<ActiveReceiveFile> = None;
@@ -525,7 +535,8 @@ async fn read_incoming(
         match message {
             BulkWireMessage::Manifest(manifest) => {
                 let transfer_id = manifest.transfer_id;
-                if let Err(error) = handle_manifest(&cache_dir, &events, &mut book, manifest) {
+                if let Err(error) = handle_manifest(&cache_dir, &events, &mut book, manifest).await
+                {
                     emit_bulk_failed(&events, transfer_id, &error);
                     return Err(error);
                 }
@@ -543,7 +554,9 @@ async fn read_incoming(
                     relative_path,
                     size_bytes,
                     blake3_hex,
-                ) {
+                )
+                .await
+                {
                     Ok(file) => file,
                     Err(error) => {
                         emit_bulk_failed(&events, transfer_id, &error);
@@ -557,7 +570,7 @@ async fn read_incoming(
                 }
                 if let Some(file) = active_file.as_mut() {
                     let transfer_id = chunk.transfer_id;
-                    if let Err(error) = receive_chunk(&events, &mut book, file, chunk) {
+                    if let Err(error) = receive_chunk(&events, &mut book, file, chunk).await {
                         emit_bulk_failed(&events, transfer_id, &error);
                         return Err(error);
                     }
@@ -580,7 +593,9 @@ async fn read_incoming(
                         transfer_id,
                         &relative_path,
                         &blake3_hex,
-                    ) {
+                    )
+                    .await
+                    {
                         emit_bulk_failed(&events, transfer_id, &error);
                         return Err(error);
                     }
@@ -601,12 +616,15 @@ async fn read_incoming(
     }
 }
 
-fn handle_manifest(
+async fn handle_manifest(
     cache_dir: &Path,
     events: &mpsc::UnboundedSender<BulkTransferEvent>,
     book: &mut ReceiveBook,
     manifest: FileTransferManifest,
 ) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
     let resolved_roots = resolve_manifest_roots(cache_dir, &manifest)?;
     let cache_paths = top_level_cache_paths(&manifest, &resolved_roots)?;
 
@@ -634,14 +652,16 @@ fn handle_manifest(
         .context("manifest transfer should be present")?;
     for entry in &manifest.files {
         if entry.is_dir {
-            fs::create_dir_all(resolved_cache_path(transfer, &entry.relative_path)?)?;
+            tokio::fs::create_dir_all(resolved_cache_path(transfer, &entry.relative_path)?)
+                .await
+                .with_context(|| format!("create directory for {}", entry.relative_path))?;
         }
     }
     let _ = events.send(BulkTransferEvent::Offered(manifest));
     Ok(())
 }
 
-fn prepare_receive_file(
+async fn prepare_receive_file(
     book: &ReceiveBook,
     cancelled: &Arc<Mutex<HashSet<Uuid>>>,
     transfer_id: Uuid,
@@ -664,13 +684,18 @@ fn prepare_receive_file(
         .with_context(|| format!("transfer manifest not found for {transfer_id}"))?;
     let final_path = resolved_cache_path(transfer, &relative_path)?;
     if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create directory for {}", final_path.display()))?;
     }
     let temp_path = temp_part_path(&final_path);
     if temp_path.exists() {
-        fs::remove_file(&temp_path)?;
+        tokio::fs::remove_file(&temp_path)
+            .await
+            .with_context(|| format!("remove stale temp file {}", temp_path.display()))?;
     }
-    let file = File::create(&temp_path)
+    let file = tokio::fs::File::create(&temp_path)
+        .await
         .with_context(|| format!("create temporary file {}", temp_path.display()))?;
 
     Ok(Some(ActiveReceiveFile {
@@ -686,7 +711,7 @@ fn prepare_receive_file(
     }))
 }
 
-fn receive_chunk(
+async fn receive_chunk(
     events: &mpsc::UnboundedSender<BulkTransferEvent>,
     book: &mut ReceiveBook,
     active: &mut ActiveReceiveFile,
@@ -706,7 +731,7 @@ fn receive_chunk(
         "chunk checksum mismatch"
     );
 
-    active.file.write_all(&chunk.bytes)?;
+    active.file.write_all(&chunk.bytes).await?;
     active.hasher.update(&chunk.bytes);
     active.written = active.written.saturating_add(chunk.bytes.len() as u64);
 
@@ -724,7 +749,7 @@ fn receive_chunk(
     Ok(())
 }
 
-fn complete_receive_file(
+async fn complete_receive_file(
     events: &mpsc::UnboundedSender<BulkTransferEvent>,
     book: &mut ReceiveBook,
     mut active: ActiveReceiveFile,
@@ -742,8 +767,8 @@ fn complete_receive_file(
     );
     ensure!(active.written == active.expected_size, "file size mismatch");
 
-    active.file.flush()?;
-    active.file.sync_all()?;
+    active.file.flush().await?;
+    active.file.sync_all().await?;
     drop(active.file);
     let actual_hash = active.hasher.finalize().to_hex().to_string();
     ensure!(
@@ -755,7 +780,8 @@ fn complete_receive_file(
         !active.final_path.exists(),
         "cache path appeared before final rename"
     );
-    fs::rename(&active.temp_path, &active.final_path)
+    tokio::fs::rename(&active.temp_path, &active.final_path)
+        .await
         .with_context(|| format!("rename {}", active.final_path.display()))?;
 
     if let Some(transfer) = book.transfers.get_mut(&transfer_id) {
@@ -1536,6 +1562,43 @@ mod tests {
         let _ = server_commands_tx.send(BulkTransferCommand::Stop);
         client.await.unwrap().unwrap();
         server.await.unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incoming_manifest_ignores_removed_target_directory_field() {
+        let root = temp_dir("incoming_manifest_ignores_removed_target_directory_field");
+        let cache_dir = root.join("server-cache");
+        let stale_target = root.join("stale-target");
+        let transfer_id = Uuid::new_v4();
+        let manifest: FileTransferManifest = toml::from_str(&format!(
+            r#"
+transfer_id = "{transfer_id}"
+root_name = "note.txt"
+total_bytes = 4
+target_directory = "{}"
+
+[[files]]
+relative_path = "note.txt"
+size_bytes = 4
+is_dir = false
+"#,
+            stale_target.to_string_lossy().replace('\\', "\\\\")
+        ))
+        .unwrap();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let mut book = ReceiveBook::default();
+
+        handle_manifest(&cache_dir, &events_tx, &mut book, manifest)
+            .await
+            .unwrap();
+
+        let transfer = book.transfers.get(&transfer_id).unwrap();
+        assert_eq!(
+            transfer.cache_paths,
+            vec![cache_dir.join("note.txt").to_string_lossy().to_string()]
+        );
+        assert!(!stale_target.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use borderless_core::config::TransportMode;
 use uuid::Uuid;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunState {
     #[default]
@@ -34,9 +33,6 @@ pub struct AppStatus {
     pub transfer_bytes_done: u64,
     pub transfer_bytes_total: u64,
     pub transfer_current_file: Option<String>,
-    pub drag_drop_enabled: bool,
-    pub active_drag_session: Option<Uuid>,
-    pub drag_drop_state: Option<String>,
     pub mouse_diagnostics: Option<String>,
     pub events: VecDeque<String>,
 }
@@ -58,9 +54,6 @@ impl AppStatus {
         self.transfer_bytes_done = 0;
         self.transfer_bytes_total = 0;
         self.transfer_current_file = None;
-        self.drag_drop_enabled = false;
-        self.active_drag_session = None;
-        self.drag_drop_state = None;
         self.mouse_diagnostics = None;
     }
 
@@ -120,9 +113,6 @@ mod tests {
             transfer_bytes_done: 1,
             transfer_bytes_total: 2,
             transfer_current_file: Some("a.txt".to_string()),
-            drag_drop_enabled: true,
-            active_drag_session: Some(Uuid::nil()),
-            drag_drop_state: Some("ready".to_string()),
             mouse_diagnostics: Some("raw=1".to_string()),
             ..AppStatus::default()
         };
@@ -144,9 +134,6 @@ mod tests {
         assert_eq!(status.transfer_bytes_done, 0);
         assert_eq!(status.transfer_bytes_total, 0);
         assert_eq!(status.transfer_current_file, None);
-        assert!(!status.drag_drop_enabled);
-        assert_eq!(status.active_drag_session, None);
-        assert_eq!(status.drag_drop_state, None);
         assert_eq!(status.mouse_diagnostics, None);
     }
 

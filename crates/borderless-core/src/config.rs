@@ -82,7 +82,6 @@ pub struct SharingConfig {
     pub clipboard_html: bool,
     pub clipboard_images: bool,
     pub file_copy_paste: bool,
-    pub real_file_drag_drop: bool,
     pub max_clipboard_bytes: u64,
     pub max_file_transfer_bytes: u64,
     pub bulk_transfer_port: u16,
@@ -96,7 +95,6 @@ impl Default for SharingConfig {
             clipboard_html: true,
             clipboard_images: true,
             file_copy_paste: true,
-            real_file_drag_drop: true,
             max_clipboard_bytes: 32 * 1024 * 1024,
             max_file_transfer_bytes: 20 * 1024 * 1024 * 1024,
             bulk_transfer_port: 24802,
@@ -303,7 +301,6 @@ mod tests {
         assert_eq!(decoded.controller.pointer_port, 24801);
         assert!(decoded.sharing.clipboard_text);
         assert!(decoded.sharing.file_copy_paste);
-        assert!(decoded.sharing.real_file_drag_drop);
     }
 
     #[test]
@@ -319,6 +316,15 @@ mod tests {
         assert_eq!(decoded.agent.pointer_port, 24801);
         assert!(decoded.sharing.clipboard_text);
         assert_eq!(decoded.sharing.bulk_transfer_port, 24802);
+    }
+
+    #[test]
+    fn serialized_config_omits_removed_drag_drop_setting() {
+        let config = AppConfig::default();
+
+        let encoded = toml::to_string_pretty(&config).unwrap();
+
+        assert!(!encoded.contains("real_file_drag_drop"));
     }
 
     #[test]

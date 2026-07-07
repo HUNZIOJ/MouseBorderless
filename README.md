@@ -1,6 +1,6 @@
 # Borderless
 
-Borderless shares one keyboard, mouse, clipboard, copied files, and file drag/drop workflows between two Windows computers on the same LAN.
+Borderless shares one keyboard, mouse, clipboard, and copied files between two Windows computers on the same LAN.
 
 ## Requirements
 
@@ -10,7 +10,7 @@ Borderless shares one keyboard, mouse, clipboard, copied files, and file drag/dr
 - Same privilege level on both computers when controlling elevated windows
 - TCP mode requires the agent listen port.
 - KCP mode requires the reliable UDP port and the pointer UDP port.
-- File copy/paste and file drag/drop require the bulk transfer TCP port.
+- File copy/paste requires the bulk transfer TCP port.
 
 ## Run
 
@@ -25,8 +25,8 @@ cargo run -p borderless-app
 3. Choose transport mode: `TCP` for stable default behavior, `KCP` for low-latency UDP behavior.
 4. If using KCP, confirm the pointer UDP port.
 5. Choose the agent position: left, right, top, or bottom.
-6. Enable clipboard text, HTML, image sync, file copy/paste, and real file drag/drop as needed.
-7. Confirm bulk transfer port, incoming cache folder, and transfer limits.
+6. Enable clipboard text, HTML, image sync, and file copy/paste as needed.
+7. Confirm bulk transfer port, incoming cache folder for copy/paste cache, and transfer limits.
 8. Click `Save`.
 9. Click `Start`.
 
@@ -38,19 +38,19 @@ cargo run -p borderless-app
 4. Choose the same transport mode as the controller.
 5. If using KCP, confirm the pointer UDP port.
 6. Enable matching clipboard and file sharing options.
-7. Confirm bulk transfer port and incoming cache folder.
+7. Confirm bulk transfer port and the incoming cache folder for copy/paste cache.
 8. Click `Save`.
 9. Click `Start`.
 
 ## Firewall
 
-Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port. For file copy/paste and real file drag/drop, allow the bulk transfer TCP port.
+Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port. For file copy/paste, allow the bulk transfer TCP port.
 
 ## Clipboard and Files
 
 - Text, HTML, and image clipboard sync can be toggled separately.
 - Copied files and folders are transferred to the peer cache folder, then written to the peer clipboard as local paths.
-- Real file drag/drop uses a screen-edge handoff, transfers files to the peer cache folder, and starts a remote Windows file drag with the cached files.
+- `incoming_cache_dir` is used for copy/paste file cache and clipboard-backed file offers.
 - Large transfer progress, cancellation, and errors appear in the GUI.
 
 ## Permissions

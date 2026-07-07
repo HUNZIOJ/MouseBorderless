@@ -162,10 +162,6 @@ impl BorderlessApp {
                         "Clipboard images",
                     );
                     ui.checkbox(&mut self.config.sharing.file_copy_paste, "File copy paste");
-                    ui.checkbox(
-                        &mut self.config.sharing.real_file_drag_drop,
-                        "Real file drag drop",
-                    );
                 });
 
                 ui.separator();
@@ -272,18 +268,6 @@ impl BorderlessApp {
                         ui.label(option_text(self.status.transfer_current_file.as_deref()));
                         ui.end_row();
 
-                        ui.label("Drag/drop enabled");
-                        ui.label(if self.status.drag_drop_enabled {
-                            "yes"
-                        } else {
-                            "no"
-                        });
-                        ui.end_row();
-
-                        ui.label("Drag/drop state");
-                        ui.label(option_text(self.status.drag_drop_state.as_deref()));
-                        ui.end_row();
-
                         ui.label("Mouse diagnostics");
                         ui.label(option_text(self.status.mouse_diagnostics.as_deref()));
                         ui.end_row();
@@ -300,19 +284,6 @@ impl BorderlessApp {
                         if let Some(transfer_id) = self.status.transfer_id {
                             self.runtime
                                 .send(RuntimeCommand::CancelTransfer(transfer_id));
-                        }
-                    }
-
-                    if ui
-                        .add_enabled(
-                            self.status.active_drag_session.is_some(),
-                            egui::Button::new("Cancel drag"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(session_id) = self.status.active_drag_session {
-                            self.runtime
-                                .send(RuntimeCommand::CancelDragDrop(session_id));
                         }
                     }
                 });
