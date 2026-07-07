@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Build and release artifacts
+/dist/
+*.exe
+*.pdb
+*.dll
+*.lib
+*.exp
+*.msi
+*.zip
+
+# Local runtime files
+config.toml
+*.log
+/logs/
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
