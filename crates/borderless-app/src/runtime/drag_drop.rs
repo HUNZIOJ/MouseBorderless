@@ -394,10 +394,13 @@ impl DragDropCoordinator {
                         && session.release_at(point).is_ok()
                     {
                         self.active_deadline = Some(Instant::now() + TARGET_AUTHORIZATION_TIMEOUT);
-                        return vec![DragEffect::Status {
-                            state: "正在解析目标目录".to_string(),
-                            destination: None,
-                        }];
+                        return vec![
+                            DragEffect::RestoreLocalInput,
+                            DragEffect::Status {
+                                state: "正在解析目标目录".to_string(),
+                                destination: None,
+                            },
+                        ];
                     }
                     return Vec::new();
                 }
@@ -848,6 +851,27 @@ mod tests {
         let effects = coordinator.native_drop_released(Uuid::from_u128(1));
 
         assert!(coordinator.active_session().is_some());
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, DragEffect::Send(WireMessage::DragDropCancel { .. }))));
+    }
+
+    #[test]
+    fn peer_release_ends_the_native_drag_for_an_agent_source() {
+        let session_id = Uuid::from_u128(1);
+        let mut coordinator = DragDropCoordinator::new(Role::Agent);
+        coordinator.begin_local_drag(
+            session_id,
+            Uuid::from_u128(2),
+            vec!["C:\\src\\report.pdf".to_string()],
+        );
+
+        let effects = coordinator.handle_peer_message(WireMessage::DragDropReleased {
+            session_id,
+            point: Point::new(20, 30),
+        });
+
+        assert!(effects.contains(&DragEffect::RestoreLocalInput));
         assert!(effects
             .iter()
             .all(|effect| !matches!(effect, DragEffect::Send(WireMessage::DragDropCancel { .. }))));

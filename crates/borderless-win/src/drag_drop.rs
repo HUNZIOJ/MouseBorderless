@@ -47,16 +47,15 @@ const EDGE_WINDOW_THICKNESS_PX: i32 = 2;
 /// Events emitted by the edge drop target. In the targeted drag-drop model
 /// the native OLE drag never leaves the source machine: once the drag parks
 /// over the edge window, the runtime drives remote target selection, and the
-/// local `Drop`/`DragLeave` become the release/cancel signals.
+/// local `Drop` handles a release over the edge. `DragLeave` only clears the
+/// native target state because pointer parking moves the cursor away during
+/// a normal remote handoff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DragDropEvent {
     LocalFileDragEntered {
         session_id: Uuid,
         transfer_id: Uuid,
         paths: Vec<String>,
-    },
-    LocalDragCancelled {
-        session_id: Uuid,
     },
     LocalDropReleased {
         session_id: Uuid,
@@ -178,7 +177,7 @@ struct LocalDropTarget {
 #[derive(Clone, Copy)]
 enum LocalDragFinish {
     Released,
-    Cancelled,
+    LeftEdge,
 }
 
 fn finish_local_drag(
@@ -186,10 +185,10 @@ fn finish_local_drag(
     finish: LocalDragFinish,
 ) -> Option<DragDropEvent> {
     let session_id = active.lock().ok()?.take()?;
-    Some(match finish {
-        LocalDragFinish::Released => DragDropEvent::LocalDropReleased { session_id },
-        LocalDragFinish::Cancelled => DragDropEvent::LocalDragCancelled { session_id },
-    })
+    match finish {
+        LocalDragFinish::Released => Some(DragDropEvent::LocalDropReleased { session_id }),
+        LocalDragFinish::LeftEdge => None,
+    }
 }
 
 #[allow(non_snake_case)]
@@ -263,7 +262,7 @@ impl IDropTarget_Impl for LocalDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
-        if let Some(event) = finish_local_drag(&self.active_session, LocalDragFinish::Cancelled) {
+        if let Some(event) = finish_local_drag(&self.active_session, LocalDragFinish::LeftEdge) {
             let _ = self.sender.send(event);
         }
         Ok(())
@@ -513,7 +512,15 @@ mod tests {
             finish_local_drag(&active, LocalDragFinish::Released),
             Some(DragDropEvent::LocalDropReleased { session_id })
         );
-        assert_eq!(finish_local_drag(&active, LocalDragFinish::Cancelled), None);
+        assert_eq!(finish_local_drag(&active, LocalDragFinish::LeftEdge), None);
+    }
+
+    #[test]
+    fn leaving_edge_consumes_native_target_without_cancelling_handoff() {
+        let active = Mutex::new(Some(Uuid::from_u128(42)));
+
+        assert_eq!(finish_local_drag(&active, LocalDragFinish::LeftEdge), None);
+        assert_eq!(*active.lock().unwrap(), None);
     }
 
     #[test]

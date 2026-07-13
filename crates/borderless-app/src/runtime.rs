@@ -3059,9 +3059,6 @@ fn drain_local_drag_events(
                 transfer_id,
                 paths,
             } => coordinator.begin_local_drag(session_id, transfer_id, paths),
-            DragDropEvent::LocalDragCancelled { session_id } => {
-                coordinator.cancel_local_drag(session_id, "本机拖拽已取消")
-            }
             DragDropEvent::LocalDropReleased { session_id } => {
                 coordinator.native_drop_released(session_id)
             }
