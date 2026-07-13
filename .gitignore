@@ -20,6 +20,7 @@ config.toml
 # Editors and OS files
 .vscode/
 .idea/
+.superpowers/
 *.swp
 *.swo
 Thumbs.db
