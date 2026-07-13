@@ -68,6 +68,17 @@ pub enum Edge {
     Bottom,
 }
 
+impl Edge {
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+            Self::Top => Self::Bottom,
+            Self::Bottom => Self::Top,
+        }
+    }
+}
+
 pub fn detect_edge(point: Point, desktop: Rect, trigger_px: i32) -> Option<Edge> {
     if !desktop.is_valid() || trigger_px <= 0 {
         return None;
@@ -115,12 +126,7 @@ pub fn edge_for_position(position: RemotePosition) -> Edge {
 }
 
 pub fn opposite_edge(edge: Edge) -> Edge {
-    match edge {
-        Edge::Left => Edge::Right,
-        Edge::Right => Edge::Left,
-        Edge::Top => Edge::Bottom,
-        Edge::Bottom => Edge::Top,
-    }
+    edge.opposite()
 }
 
 /// Maps a point onto the remote entry edge. Invalid rectangles return the original local point.
@@ -259,5 +265,13 @@ mod tests {
 
         let serialized = toml::to_string(&Wrapper { edge: Edge::Top }).unwrap();
         assert_eq!(serialized, "edge = \"top\"\n");
+    }
+
+    #[test]
+    fn opposite_edge_is_symmetric() {
+        assert_eq!(Edge::Left.opposite(), Edge::Right);
+        assert_eq!(Edge::Right.opposite(), Edge::Left);
+        assert_eq!(Edge::Top.opposite(), Edge::Bottom);
+        assert_eq!(Edge::Bottom.opposite(), Edge::Top);
     }
 }

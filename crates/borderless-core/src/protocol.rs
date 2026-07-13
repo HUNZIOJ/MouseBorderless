@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const MAGIC: u32 = 0x4244_524c;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 4 + 2 + 1 + 8 + 4;
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_FRAME_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN;
@@ -39,28 +39,39 @@ pub enum WireMessage {
         transfer_id: uuid::Uuid,
         ok: bool,
     },
+    PeerLayout {
+        controller_remote_position: crate::config::RemotePosition,
+    },
+    DragDropEntered {
+        session_id: uuid::Uuid,
+        transfer_id: uuid::Uuid,
+        item_count: u32,
+    },
     DragDropReleased {
         session_id: uuid::Uuid,
         point: crate::geometry::Point,
     },
     DragDropTargetResolved {
         session_id: uuid::Uuid,
-        target: crate::drag_drop::DropTarget,
+        target: crate::drag_drop::DropTargetSummary,
     },
     DragDropTargetFailed {
         session_id: uuid::Uuid,
         reason: String,
     },
-    DragDropTransferStart {
-        session_id: uuid::Uuid,
-        manifest: crate::file_transfer::FileTransferManifest,
-        target: crate::drag_drop::DropTarget,
-    },
     DragDropCancel {
         session_id: uuid::Uuid,
+        reason: String,
     },
-    DragDropEntered {
+    DragDropTransferStarted {
         session_id: uuid::Uuid,
+        transfer_id: uuid::Uuid,
+    },
+    DragDropTransferResult {
+        session_id: uuid::Uuid,
+        transfer_id: uuid::Uuid,
+        ok: bool,
+        reason: Option<String>,
     },
 }
 
@@ -77,6 +88,18 @@ struct FileTransferCompletePayload {
     ok: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PeerLayoutPayload {
+    controller_remote_position: crate::config::RemotePosition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DragDropEnteredPayload {
+    session_id: uuid::Uuid,
+    transfer_id: uuid::Uuid,
+    item_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DragDropReleasedPayload {
     session_id: uuid::Uuid,
@@ -86,7 +109,7 @@ struct DragDropReleasedPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DragDropTargetResolvedPayload {
     session_id: uuid::Uuid,
-    target: crate::drag_drop::DropTarget,
+    target: crate::drag_drop::DropTargetSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,20 +119,23 @@ struct DragDropTargetFailedPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DragDropTransferStartPayload {
-    session_id: uuid::Uuid,
-    manifest: crate::file_transfer::FileTransferManifest,
-    target: crate::drag_drop::DropTarget,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DragDropCancelPayload {
     session_id: uuid::Uuid,
+    reason: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DragDropEnteredPayload {
+struct DragDropTransferStartedPayload {
     session_id: uuid::Uuid,
+    transfer_id: uuid::Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DragDropTransferResultPayload {
+    session_id: uuid::Uuid,
+    transfer_id: uuid::Uuid,
+    ok: bool,
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,12 +265,14 @@ fn message_type(message: &WireMessage) -> u8 {
         WireMessage::FileTransferOffer(_) => 8,
         WireMessage::FileTransferProgress { .. } => 9,
         WireMessage::FileTransferComplete { .. } => 10,
-        WireMessage::DragDropReleased { .. } => 11,
-        WireMessage::DragDropTargetResolved { .. } => 12,
-        WireMessage::DragDropTargetFailed { .. } => 13,
-        WireMessage::DragDropTransferStart { .. } => 14,
-        WireMessage::DragDropCancel { .. } => 15,
-        WireMessage::DragDropEntered { .. } => 16,
+        WireMessage::PeerLayout { .. } => 11,
+        WireMessage::DragDropEntered { .. } => 12,
+        WireMessage::DragDropReleased { .. } => 13,
+        WireMessage::DragDropTargetResolved { .. } => 14,
+        WireMessage::DragDropTargetFailed { .. } => 15,
+        WireMessage::DragDropCancel { .. } => 16,
+        WireMessage::DragDropTransferStarted { .. } => 17,
+        WireMessage::DragDropTransferResult { .. } => 18,
     }
 }
 
@@ -273,6 +301,20 @@ fn encode_message(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
                 ok: *ok,
             })
         }
+        WireMessage::PeerLayout {
+            controller_remote_position,
+        } => encode_body(&PeerLayoutPayload {
+            controller_remote_position: controller_remote_position.clone(),
+        }),
+        WireMessage::DragDropEntered {
+            session_id,
+            transfer_id,
+            item_count,
+        } => encode_body(&DragDropEnteredPayload {
+            session_id: *session_id,
+            transfer_id: *transfer_id,
+            item_count: *item_count,
+        }),
         WireMessage::DragDropReleased { session_id, point } => {
             encode_body(&DragDropReleasedPayload {
                 session_id: *session_id,
@@ -291,20 +333,27 @@ fn encode_message(message: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
                 reason: reason.clone(),
             })
         }
-        WireMessage::DragDropTransferStart {
+        WireMessage::DragDropCancel { session_id, reason } => encode_body(&DragDropCancelPayload {
+            session_id: *session_id,
+            reason: reason.clone(),
+        }),
+        WireMessage::DragDropTransferStarted {
             session_id,
-            manifest,
-            target,
-        } => encode_body(&DragDropTransferStartPayload {
+            transfer_id,
+        } => encode_body(&DragDropTransferStartedPayload {
             session_id: *session_id,
-            manifest: manifest.clone(),
-            target: target.clone(),
+            transfer_id: *transfer_id,
         }),
-        WireMessage::DragDropCancel { session_id } => encode_body(&DragDropCancelPayload {
+        WireMessage::DragDropTransferResult {
+            session_id,
+            transfer_id,
+            ok,
+            reason,
+        } => encode_body(&DragDropTransferResultPayload {
             session_id: *session_id,
-        }),
-        WireMessage::DragDropEntered { session_id } => encode_body(&DragDropEnteredPayload {
-            session_id: *session_id,
+            transfer_id: *transfer_id,
+            ok: *ok,
+            reason: reason.clone(),
         }),
     }
 }
@@ -339,39 +388,52 @@ fn decode_message(ty: u8, payload: &[u8]) -> Result<WireMessage, ProtocolError> 
                 ok: body.ok,
             }
         }),
-        11 => decode_body::<DragDropReleasedPayload>(ty, payload).map(|body| {
+        11 => decode_body::<PeerLayoutPayload>(ty, payload).map(|body| WireMessage::PeerLayout {
+            controller_remote_position: body.controller_remote_position,
+        }),
+        12 => decode_body::<DragDropEnteredPayload>(ty, payload).map(|body| {
+            WireMessage::DragDropEntered {
+                session_id: body.session_id,
+                transfer_id: body.transfer_id,
+                item_count: body.item_count,
+            }
+        }),
+        13 => decode_body::<DragDropReleasedPayload>(ty, payload).map(|body| {
             WireMessage::DragDropReleased {
                 session_id: body.session_id,
                 point: body.point,
             }
         }),
-        12 => decode_body::<DragDropTargetResolvedPayload>(ty, payload).map(|body| {
+        14 => decode_body::<DragDropTargetResolvedPayload>(ty, payload).map(|body| {
             WireMessage::DragDropTargetResolved {
                 session_id: body.session_id,
                 target: body.target,
             }
         }),
-        13 => decode_body::<DragDropTargetFailedPayload>(ty, payload).map(|body| {
+        15 => decode_body::<DragDropTargetFailedPayload>(ty, payload).map(|body| {
             WireMessage::DragDropTargetFailed {
                 session_id: body.session_id,
                 reason: body.reason,
             }
         }),
-        14 => decode_body::<DragDropTransferStartPayload>(ty, payload).map(|body| {
-            WireMessage::DragDropTransferStart {
-                session_id: body.session_id,
-                manifest: body.manifest,
-                target: body.target,
-            }
-        }),
-        15 => decode_body::<DragDropCancelPayload>(ty, payload).map(|body| {
+        16 => decode_body::<DragDropCancelPayload>(ty, payload).map(|body| {
             WireMessage::DragDropCancel {
                 session_id: body.session_id,
+                reason: body.reason,
             }
         }),
-        16 => decode_body::<DragDropEnteredPayload>(ty, payload).map(|body| {
-            WireMessage::DragDropEntered {
+        17 => decode_body::<DragDropTransferStartedPayload>(ty, payload).map(|body| {
+            WireMessage::DragDropTransferStarted {
                 session_id: body.session_id,
+                transfer_id: body.transfer_id,
+            }
+        }),
+        18 => decode_body::<DragDropTransferResultPayload>(ty, payload).map(|body| {
+            WireMessage::DragDropTransferResult {
+                session_id: body.session_id,
+                transfer_id: body.transfer_id,
+                ok: body.ok,
+                reason: body.reason,
             }
         }),
         _ => Err(ProtocolError::UnknownMessageType { ty }),
@@ -412,7 +474,7 @@ fn decode_error_or_type_mismatch(
 }
 
 fn payload_message_type(payload: &[u8], expected_ty: u8) -> Option<u8> {
-    for ty in 1..=16 {
+    for ty in 1..=18 {
         if ty == expected_ty {
             continue;
         }
@@ -435,12 +497,14 @@ fn payload_matches_type(ty: u8, payload: &[u8]) -> bool {
         8 => strict_payload_matches::<crate::file_transfer::FileTransferManifest>(payload),
         9 => strict_payload_matches::<FileTransferProgressPayload>(payload),
         10 => strict_payload_matches::<FileTransferCompletePayload>(payload),
-        11 => strict_payload_matches::<DragDropReleasedPayload>(payload),
-        12 => strict_payload_matches::<DragDropTargetResolvedPayload>(payload),
-        13 => strict_payload_matches::<DragDropTargetFailedPayload>(payload),
-        14 => strict_payload_matches::<DragDropTransferStartPayload>(payload),
-        15 => strict_payload_matches::<DragDropCancelPayload>(payload),
-        16 => strict_payload_matches::<DragDropEnteredPayload>(payload),
+        11 => strict_payload_matches::<PeerLayoutPayload>(payload),
+        12 => strict_payload_matches::<DragDropEnteredPayload>(payload),
+        13 => strict_payload_matches::<DragDropReleasedPayload>(payload),
+        14 => strict_payload_matches::<DragDropTargetResolvedPayload>(payload),
+        15 => strict_payload_matches::<DragDropTargetFailedPayload>(payload),
+        16 => strict_payload_matches::<DragDropCancelPayload>(payload),
+        17 => strict_payload_matches::<DragDropTransferStartedPayload>(payload),
+        18 => strict_payload_matches::<DragDropTransferResultPayload>(payload),
         _ => false,
     }
 }
@@ -568,54 +632,77 @@ mod tests {
 
     #[test]
     fn drag_drop_messages_round_trip_with_stable_types() {
-        use crate::drag_drop::{DropResolutionKind, DropTarget};
+        use crate::config::RemotePosition;
+        use crate::drag_drop::{DropResolutionKind, DropTargetSummary};
         use crate::geometry::Point;
 
         let session_id = uuid::Uuid::from_u128(42);
-        let target = DropTarget {
-            destination_dir: "C:\\Users\\demo\\Desktop".to_string(),
-            resolution_kind: DropResolutionKind::ExplorerHit,
-        };
-        let manifest = crate::file_transfer::FileTransferManifest {
-            transfer_id: uuid::Uuid::from_u128(7),
-            root_name: "drop".to_string(),
-            files: vec![crate::file_transfer::FileManifestEntry::file("a.txt", 3)],
-            total_bytes: 3,
-            destination_directory: Some(target.destination_dir.clone()),
+        let transfer_id = uuid::Uuid::from_u128(7);
+        let target = DropTargetSummary {
+            display_name: "Desktop".to_string(),
+            resolution_kind: DropResolutionKind::Desktop,
+            authorization: uuid::Uuid::from_u128(99),
         };
 
         let cases = [
+            (
+                WireMessage::PeerLayout {
+                    controller_remote_position: RemotePosition::Right,
+                },
+                11,
+            ),
+            (
+                WireMessage::DragDropEntered {
+                    session_id,
+                    transfer_id,
+                    item_count: 2,
+                },
+                12,
+            ),
             (
                 WireMessage::DragDropReleased {
                     session_id,
                     point: Point::new(10, 20),
                 },
-                11,
+                13,
             ),
             (
                 WireMessage::DragDropTargetResolved {
                     session_id,
                     target: target.clone(),
                 },
-                12,
+                14,
             ),
             (
                 WireMessage::DragDropTargetFailed {
                     session_id,
                     reason: "no destination".to_string(),
                 },
-                13,
+                15,
             ),
             (
-                WireMessage::DragDropTransferStart {
+                WireMessage::DragDropCancel {
                     session_id,
-                    manifest,
-                    target,
+                    reason: "cancelled".to_string(),
                 },
-                14,
+                16,
             ),
-            (WireMessage::DragDropCancel { session_id }, 15),
-            (WireMessage::DragDropEntered { session_id }, 16),
+            (
+                WireMessage::DragDropTransferStarted {
+                    session_id,
+                    transfer_id,
+                },
+                17,
+            ),
+            (
+                WireMessage::DragDropTransferResult {
+                    session_id,
+                    transfer_id,
+                    ok: true,
+                    reason: None,
+                },
+                18,
+            ),
         ];
 
         for (msg, expected_ty) in cases {
@@ -625,6 +712,21 @@ mod tests {
             assert_eq!(decoded.sequence, 3);
             assert_eq!(decoded.message, msg);
         }
+    }
+
+    #[test]
+    fn old_protocol_header_is_rejected_before_payload_decode() {
+        let mut frame =
+            encode_frame(1, &WireMessage::Heartbeat(Heartbeat { sent_millis: 1 })).unwrap();
+        frame[4..6].copy_from_slice(&1_u16.to_be_bytes());
+
+        assert_eq!(
+            decode_frame(&frame),
+            Err(ProtocolError::VersionMismatch {
+                expected: PROTOCOL_VERSION,
+                actual: 1,
+            })
+        );
     }
 
     fn raw_frame(sequence: u64, ty: u8, payload_len: u32, payload: &[u8]) -> Vec<u8> {

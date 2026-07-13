@@ -2,17 +2,24 @@ use crate::geometry::Point;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragDirection {
+    ControllerToAgent,
+    AgentToController,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DropResolutionKind {
-    DesktopHit,
-    ExplorerHit,
-    ExplorerFallback,
+    Desktop,
+    ExplorerDirectory,
+    FolderIcon,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DropTarget {
-    pub destination_dir: String,
+pub struct DropTargetSummary {
+    pub display_name: String,
     pub resolution_kind: DropResolutionKind,
+    pub authorization: Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,10 +27,10 @@ pub enum DragDropPhase {
     LocalDragDetected,
     RemoteTargetSelecting,
     RemoteDropReleased { release_point: Point },
-    RemoteTargetResolved { target: DropTarget },
-    Transferring { target: DropTarget },
+    RemoteTargetResolved { target: DropTargetSummary },
+    Transferring,
     Completed,
-    Cancelled,
+    Cancelled { reason: String },
     Failed { reason: String },
 }
 
@@ -31,15 +38,22 @@ pub enum DragDropPhase {
 pub struct DragDropSession {
     session_id: Uuid,
     transfer_id: Uuid,
+    direction: DragDirection,
     source_paths: Vec<String>,
     phase: DragDropPhase,
 }
 
 impl DragDropSession {
-    pub fn new(session_id: Uuid, transfer_id: Uuid, source_paths: Vec<String>) -> Self {
+    pub fn new(
+        session_id: Uuid,
+        transfer_id: Uuid,
+        direction: DragDirection,
+        source_paths: Vec<String>,
+    ) -> Self {
         Self {
             session_id,
             transfer_id,
+            direction,
             source_paths,
             phase: DragDropPhase::LocalDragDetected,
         }
@@ -53,6 +67,10 @@ impl DragDropSession {
         self.transfer_id
     }
 
+    pub fn direction(&self) -> DragDirection {
+        self.direction
+    }
+
     pub fn source_paths(&self) -> &[String] {
         &self.source_paths
     }
@@ -64,7 +82,9 @@ impl DragDropSession {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.phase,
-            DragDropPhase::Completed | DragDropPhase::Cancelled | DragDropPhase::Failed { .. }
+            DragDropPhase::Completed
+                | DragDropPhase::Cancelled { .. }
+                | DragDropPhase::Failed { .. }
         )
     }
 
@@ -82,7 +102,7 @@ impl DragDropSession {
         )
     }
 
-    pub fn resolve_target(&mut self, target: DropTarget) -> Result<(), DragDropStateError> {
+    pub fn resolve_target(&mut self, target: DropTargetSummary) -> Result<(), DragDropStateError> {
         self.transition(
             matches!(self.phase, DragDropPhase::RemoteDropReleased { .. }),
             DragDropPhase::RemoteTargetResolved { target },
@@ -90,27 +110,26 @@ impl DragDropSession {
     }
 
     pub fn begin_transfer(&mut self) -> Result<(), DragDropStateError> {
-        let DragDropPhase::RemoteTargetResolved { target } = &self.phase else {
-            return Err(self.invalid("begin_transfer"));
-        };
-        self.phase = DragDropPhase::Transferring {
-            target: target.clone(),
-        };
-        Ok(())
+        self.transition(
+            matches!(self.phase, DragDropPhase::RemoteTargetResolved { .. }),
+            DragDropPhase::Transferring,
+        )
     }
 
     pub fn complete(&mut self) -> Result<(), DragDropStateError> {
         self.transition(
-            matches!(self.phase, DragDropPhase::Transferring { .. }),
+            matches!(self.phase, DragDropPhase::Transferring),
             DragDropPhase::Completed,
         )
     }
 
-    pub fn cancel(&mut self) -> Result<(), DragDropStateError> {
+    pub fn cancel(&mut self, reason: impl Into<String>) -> Result<(), DragDropStateError> {
         if self.is_terminal() {
             return Err(self.invalid("cancel"));
         }
-        self.phase = DragDropPhase::Cancelled;
+        self.phase = DragDropPhase::Cancelled {
+            reason: reason.into(),
+        };
         Ok(())
     }
 
@@ -168,67 +187,87 @@ impl std::error::Error for DragDropStateError {}
 mod tests {
     use super::*;
 
-    fn session() -> DragDropSession {
+    fn test_session(direction: DragDirection) -> DragDropSession {
         DragDropSession::new(
             Uuid::from_u128(1),
             Uuid::from_u128(2),
+            direction,
             vec!["C:\\src\\a.txt".to_string()],
         )
     }
 
-    fn target() -> DropTarget {
-        DropTarget {
-            destination_dir: "C:\\Users\\demo\\Desktop".to_string(),
-            resolution_kind: DropResolutionKind::DesktopHit,
+    fn test_target() -> DropTargetSummary {
+        DropTargetSummary {
+            display_name: "Desktop".to_string(),
+            resolution_kind: DropResolutionKind::Desktop,
+            authorization: Uuid::from_u128(3),
         }
     }
 
     #[test]
-    fn happy_path_walks_all_phases() {
-        let mut s = session();
-        assert_eq!(*s.phase(), DragDropPhase::LocalDragDetected);
+    fn both_directions_follow_the_same_happy_path() {
+        for direction in [
+            DragDirection::ControllerToAgent,
+            DragDirection::AgentToController,
+        ] {
+            let mut session = DragDropSession::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                direction,
+                vec!["C:\\src\\report.pdf".to_string()],
+            );
+            session.begin_remote_target_selection().unwrap();
+            session.release_at(Point::new(200, 300)).unwrap();
+            session.resolve_target(test_target()).unwrap();
+            session.begin_transfer().unwrap();
+            session.complete().unwrap();
+            assert_eq!(session.phase(), &DragDropPhase::Completed);
+        }
+    }
 
-        s.begin_remote_target_selection().unwrap();
-        s.release_at(Point::new(100, 200)).unwrap();
-        assert_eq!(
-            *s.phase(),
-            DragDropPhase::RemoteDropReleased {
-                release_point: Point::new(100, 200)
-            }
-        );
+    #[test]
+    fn sent_bytes_do_not_complete_the_drag_session() {
+        let mut session = test_session(DragDirection::ControllerToAgent);
+        session.begin_remote_target_selection().unwrap();
+        session.release_at(Point::new(10, 20)).unwrap();
+        session.resolve_target(test_target()).unwrap();
+        session.begin_transfer().unwrap();
 
-        s.resolve_target(target()).unwrap();
-        s.begin_transfer().unwrap();
-        s.complete().unwrap();
-        assert!(s.is_terminal());
+        assert_eq!(session.phase(), &DragDropPhase::Transferring);
+        assert!(!session.is_terminal());
     }
 
     #[test]
     fn release_before_remote_selection_is_rejected() {
-        let mut s = session();
+        let mut s = test_session(DragDirection::ControllerToAgent);
         assert!(s.release_at(Point::new(0, 0)).is_err());
         assert_eq!(*s.phase(), DragDropPhase::LocalDragDetected);
     }
 
     #[test]
     fn transfer_requires_resolved_target() {
-        let mut s = session();
+        let mut s = test_session(DragDirection::ControllerToAgent);
         s.begin_remote_target_selection().unwrap();
         assert!(s.begin_transfer().is_err());
     }
 
     #[test]
     fn cancel_allowed_in_any_non_terminal_phase() {
-        let mut s = session();
+        let mut s = test_session(DragDirection::ControllerToAgent);
         s.begin_remote_target_selection().unwrap();
-        s.cancel().unwrap();
-        assert_eq!(*s.phase(), DragDropPhase::Cancelled);
-        assert!(s.cancel().is_err());
+        s.cancel("user cancelled").unwrap();
+        assert_eq!(
+            *s.phase(),
+            DragDropPhase::Cancelled {
+                reason: "user cancelled".to_string()
+            }
+        );
+        assert!(s.cancel("again").is_err());
     }
 
     #[test]
     fn fail_records_reason_and_is_terminal() {
-        let mut s = session();
+        let mut s = test_session(DragDirection::AgentToController);
         s.begin_remote_target_selection().unwrap();
         s.release_at(Point::new(5, 5)).unwrap();
         s.fail("no destination resolved").unwrap();
