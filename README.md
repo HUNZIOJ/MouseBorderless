@@ -8,9 +8,8 @@ Borderless shares one keyboard, mouse, clipboard, and files (copy/paste and drag
 - Rust stable MSVC toolchain
 - Both computers on the same LAN
 - Same privilege level on both computers when controlling elevated windows
-- TCP mode requires the agent listen port.
-- KCP mode requires the reliable UDP port and the pointer UDP port.
-- File copy/paste requires the bulk transfer TCP port.
+- Control traffic uses the agent TCP listen port (`24800` by default).
+- File copy/paste and drag/drop use the bulk transfer TCP port (`24802` by default).
 
 ## Run
 
@@ -22,29 +21,25 @@ cargo run -p borderless-app
 
 1. Choose `Controller`.
 2. Enter the agent computer IP and port.
-3. Choose transport mode: `TCP` for stable default behavior, `KCP` for low-latency UDP behavior.
-4. If using KCP, confirm the pointer UDP port.
-5. Choose the agent position: left, right, top, or bottom.
-6. Enable clipboard text, HTML, image sync, and file copy/paste as needed.
-7. Confirm bulk transfer port, incoming cache folder for copy/paste cache, and transfer limits.
-8. Click `Save`.
-9. Click `Start`.
+3. Choose the agent position: left, right, top, or bottom.
+4. Enable clipboard text, HTML, image sync, and file copy/paste as needed.
+5. Confirm bulk transfer port, incoming cache folder for copy/paste cache, and transfer limits.
+6. Click `Save`.
+7. Click `Start`.
 
 ## Agent Setup
 
 1. Choose `Agent`.
 2. Set listen IP to `0.0.0.0`.
 3. Set listen port to match the controller.
-4. Choose the same transport mode as the controller.
-5. If using KCP, confirm the pointer UDP port.
-6. Enable matching clipboard and file sharing options.
-7. Confirm bulk transfer port and the incoming cache folder for copy/paste cache.
-8. Click `Save`.
-9. Click `Start`.
+4. Enable matching clipboard and file sharing options.
+5. Confirm bulk transfer port and the incoming cache folder for copy/paste cache.
+6. Click `Save`.
+7. Click `Start`.
 
 ## Firewall
 
-Allow the app to listen on the configured port on the agent computer. In KCP mode, also allow the pointer UDP port. For file copy/paste, allow the bulk transfer TCP port.
+Allow the app on the agent computer to listen on the control TCP port (`24800` by default) and the bulk transfer TCP port (`24802` by default).
 
 ## Clipboard and Files
 

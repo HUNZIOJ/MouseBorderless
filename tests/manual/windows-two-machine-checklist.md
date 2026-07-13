@@ -4,7 +4,7 @@
 
 - Controller computer has physical keyboard and mouse.
 - Agent computer is on the same LAN.
-- Agent firewall allows the configured listen port.
+- Agent firewall allows the control TCP port and bulk transfer TCP port.
 - Both apps are running at the same privilege level.
 
 ## Connection
@@ -13,9 +13,7 @@
 - [ ] Controller connects to agent IP and port.
 - [ ] Both GUIs show connected state.
 - [ ] RTT appears and updates.
-- [ ] TCP mode connects and reports TCP in the GUI.
-- [ ] KCP mode connects and reports KCP in the GUI.
-- [ ] KCP mode shows latest pointer sequence updates during remote mouse movement.
+- [ ] The connection reports TCP in the GUI.
 
 ## Edge Switching
 
@@ -72,8 +70,7 @@
 - [ ] Stop restores local controller input.
 - [ ] Agent disconnect releases pressed state.
 - [ ] Controller reconnects after agent restarts.
-- [ ] KCP mode recovers after agent restart and reopens the pointer UDP channel.
 - [ ] Bulk transfer reconnects or fails clearly after agent restart.
 - [ ] GUI logs explain permission errors.
-- [ ] GUI logs explain likely firewall issues when KCP UDP ports are blocked.
+- [ ] GUI logs explain likely firewall issues when the control TCP port is blocked.
 - [ ] GUI logs explain likely firewall issues when the bulk transfer port is blocked.

@@ -5,15 +5,11 @@ debug_logging = false
 [controller]
 agent_host = "192.168.1.2"
 agent_port = 24800
-transport_mode = "tcp"
-pointer_port = 24801
 remote_position = "right"
 
 [agent]
 listen_host = "0.0.0.0"
 listen_port = 24800
-transport_mode = "tcp"
-pointer_port = 24801
 
 [sharing]
 clipboard_text = true

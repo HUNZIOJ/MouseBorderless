@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use borderless_core::config::{AppConfig, RemotePosition, Role, TransportMode};
+use borderless_core::config::{AppConfig, RemotePosition, Role};
 use eframe::egui;
 
 use crate::{
@@ -93,21 +93,13 @@ impl BorderlessApp {
                         ui.end_row();
 
                         ui.label("Port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.controller.agent_port)
-                                .range(1..=u16::MAX),
-                        );
-                        ui.end_row();
-
-                        ui.label("Transport");
-                        transport_selector(ui, &mut self.config.controller.transport_mode);
-                        ui.end_row();
-
-                        ui.label("Pointer UDP");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.controller.pointer_port)
-                                .range(1..=u16::MAX),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.controller.agent_port)
+                                    .range(1..=u16::MAX),
+                            );
+                            ui.label("TCP");
+                        });
                         ui.end_row();
 
                         ui.label("Remote position");
@@ -130,21 +122,13 @@ impl BorderlessApp {
                         ui.end_row();
 
                         ui.label("Port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.agent.listen_port)
-                                .range(1..=u16::MAX),
-                        );
-                        ui.end_row();
-
-                        ui.label("Transport");
-                        transport_selector(ui, &mut self.config.agent.transport_mode);
-                        ui.end_row();
-
-                        ui.label("Pointer UDP");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.agent.pointer_port)
-                                .range(1..=u16::MAX),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.agent.listen_port)
+                                    .range(1..=u16::MAX),
+                            );
+                            ui.label("TCP");
+                        });
                         ui.end_row();
                     });
             });
@@ -319,12 +303,6 @@ impl eframe::App for BorderlessApp {
                 self.show_controller(ui);
                 self.show_agent(ui);
 
-                if self.config.controller.transport_mode == TransportMode::Kcp
-                    || self.config.agent.transport_mode == TransportMode::Kcp
-                {
-                    ui.label("KCP uses UDP for reliable control and a separate UDP port for pointer updates.");
-                }
-
                 ui.separator();
 
                 ui.horizontal(|ui| {
@@ -385,13 +363,6 @@ impl eframe::App for BorderlessApp {
             });
         });
     }
-}
-
-fn transport_selector(ui: &mut egui::Ui, transport_mode: &mut TransportMode) {
-    ui.horizontal(|ui| {
-        ui.radio_value(transport_mode, TransportMode::Tcp, "TCP");
-        ui.radio_value(transport_mode, TransportMode::Kcp, "KCP");
-    });
 }
 
 fn remote_position_selector(ui: &mut egui::Ui, remote_position: &mut RemotePosition) {

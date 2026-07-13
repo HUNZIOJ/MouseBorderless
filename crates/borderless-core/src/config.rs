@@ -25,21 +25,11 @@ pub enum RemotePosition {
     Bottom,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportMode {
-    #[default]
-    Tcp,
-    Kcp,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControllerConfig {
     pub agent_host: String,
     pub agent_port: u16,
-    pub transport_mode: TransportMode,
-    pub pointer_port: u16,
     pub remote_position: RemotePosition,
 }
 
@@ -48,8 +38,6 @@ impl Default for ControllerConfig {
         Self {
             agent_host: "192.168.1.2".to_string(),
             agent_port: 24800,
-            transport_mode: TransportMode::Tcp,
-            pointer_port: 24801,
             remote_position: RemotePosition::Right,
         }
     }
@@ -60,8 +48,6 @@ impl Default for ControllerConfig {
 pub struct AgentConfig {
     pub listen_host: String,
     pub listen_port: u16,
-    pub transport_mode: TransportMode,
-    pub pointer_port: u16,
 }
 
 impl Default for AgentConfig {
@@ -69,8 +55,6 @@ impl Default for AgentConfig {
         Self {
             listen_host: "0.0.0.0".to_string(),
             listen_port: 24800,
-            transport_mode: TransportMode::Tcp,
-            pointer_port: 24801,
         }
     }
 }
@@ -168,21 +152,9 @@ impl AppConfig {
             });
         }
 
-        if self.controller.pointer_port == 0 {
-            return Err(ConfigError::Validation {
-                message: "controller.pointer_port must be greater than 0".to_string(),
-            });
-        }
-
         if self.agent.listen_port == 0 {
             return Err(ConfigError::Validation {
                 message: "agent.listen_port must be greater than 0".to_string(),
-            });
-        }
-
-        if self.agent.pointer_port == 0 {
-            return Err(ConfigError::Validation {
-                message: "agent.pointer_port must be greater than 0".to_string(),
             });
         }
 
@@ -278,6 +250,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_transport_fields_are_ignored_and_not_reserialized() {
+        let legacy = r#"
+role = "controller"
+
+[controller]
+agent_host = "192.168.1.20"
+agent_port = 24800
+transport_mode = "kcp"
+pointer_port = 24801
+remote_position = "right"
+
+[agent]
+listen_host = "0.0.0.0"
+listen_port = 24800
+transport_mode = "kcp"
+pointer_port = 24801
+"#;
+
+        let config: AppConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(config.controller.agent_host, "192.168.1.20");
+        assert_eq!(config.controller.agent_port, 24800);
+        assert_eq!(config.agent.listen_port, 24800);
+
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert!(!encoded.contains("transport_mode"));
+        assert!(!encoded.contains("pointer_port"));
+    }
+
+    #[test]
     fn default_config_is_valid_controller_config() {
         let config = AppConfig::default();
         assert_eq!(config.role, Role::Controller);
@@ -299,8 +300,7 @@ mod tests {
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.role, Role::Controller);
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
-        assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
-        assert_eq!(decoded.controller.pointer_port, 24801);
+        assert_eq!(decoded.controller.agent_port, 24800);
         assert!(decoded.sharing.clipboard_text);
         assert!(decoded.sharing.file_copy_paste);
     }
@@ -313,9 +313,9 @@ mod tests {
         assert_eq!(decoded.edge_trigger_px, 2);
         assert!(!decoded.debug_logging);
         assert_eq!(decoded.controller.remote_position, RemotePosition::Right);
-        assert_eq!(decoded.controller.transport_mode, TransportMode::Tcp);
+        assert_eq!(decoded.controller.agent_port, 24800);
         assert_eq!(decoded.agent.listen_host, "0.0.0.0");
-        assert_eq!(decoded.agent.pointer_port, 24801);
+        assert_eq!(decoded.agent.listen_port, 24800);
         assert!(decoded.sharing.clipboard_text);
         assert_eq!(decoded.sharing.bulk_transfer_port, 24802);
     }

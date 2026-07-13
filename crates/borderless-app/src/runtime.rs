@@ -3767,7 +3767,7 @@ mod tests {
 
     use borderless_core::{
         clipboard::{ClipboardChangeId, ClipboardEnvelope, ClipboardPayload},
-        config::{RemotePosition, Role, TransportMode},
+        config::{RemotePosition, Role},
         file_transfer::FileManifestEntry,
         input_event::{InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseWheelEvent},
         protocol::WireMessage,
@@ -3784,8 +3784,6 @@ mod tests {
         };
         config.controller.agent_host = "agent.local".to_string();
         config.controller.agent_port = 34567;
-        config.controller.transport_mode = TransportMode::Kcp;
-        config.controller.pointer_port = 34568;
 
         let settings = controller_connection_settings(&config);
 
@@ -3801,8 +3799,6 @@ mod tests {
         };
         config.agent.listen_host = "127.0.0.1".to_string();
         config.agent.listen_port = 45678;
-        config.agent.transport_mode = TransportMode::Kcp;
-        config.agent.pointer_port = 45679;
 
         let settings = agent_connection_settings(&config);
 
