@@ -21,14 +21,21 @@ impl FileManifestEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTransferDestination {
+    IncomingCache,
+    AuthorizedDrop {
+        session_id: Uuid,
+        authorization: Uuid,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransferManifest {
     pub transfer_id: Uuid,
     pub root_name: String,
     pub files: Vec<FileManifestEntry>,
     pub total_bytes: u64,
-    /// Drag-drop transfers write directly into this directory on the
-    /// receiving side; `None` keeps the incoming cache directory behavior.
-    pub destination_directory: Option<String>,
+    pub destination: FileTransferDestination,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context};
 use borderless_core::file_transfer::{
-    FileChunk, FileManifestEntry, FileTransferManifest, FileTransferState,
+    FileChunk, FileManifestEntry, FileTransferDestination, FileTransferManifest, FileTransferState,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -147,7 +147,7 @@ pub fn manifest_from_source_paths(
         root_name,
         files: entries,
         total_bytes,
-        destination_directory: None,
+        destination: FileTransferDestination::IncomingCache,
     })
 }
 
@@ -625,23 +625,18 @@ async fn handle_manifest(
     book: &mut ReceiveBook,
     manifest: FileTransferManifest,
 ) -> anyhow::Result<()> {
-    let destination_dir = match manifest.destination_directory.as_deref() {
-        Some(dir) => {
-            let dir = PathBuf::from(dir);
-            // A bad drop destination fails this transfer only; the bulk
-            // session stays alive and later frames for it are ignored.
-            if let Err(error) = validate_destination_dir(&dir).await {
-                mark_cancelled(cancelled, manifest.transfer_id);
-                emit_bulk_failed(events, manifest.transfer_id, &error);
-                return Ok(());
-            }
-            dir
-        }
-        None => {
+    let destination_dir = match &manifest.destination {
+        FileTransferDestination::IncomingCache => {
             tokio::fs::create_dir_all(cache_dir)
                 .await
                 .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
             cache_dir.to_path_buf()
+        }
+        FileTransferDestination::AuthorizedDrop { .. } => {
+            let error = anyhow::anyhow!("drop destination authorization is not available");
+            mark_cancelled(cancelled, manifest.transfer_id);
+            emit_bulk_failed(events, manifest.transfer_id, &error);
+            return Ok(());
         }
     };
     let resolved_roots = resolve_manifest_roots(&destination_dir, &manifest)?;
@@ -1055,23 +1050,6 @@ fn emit_bulk_failed(
         transfer_id,
         error: error.to_string(),
     });
-}
-
-async fn validate_destination_dir(dir: &Path) -> anyhow::Result<()> {
-    let metadata = tokio::fs::metadata(dir)
-        .await
-        .with_context(|| format!("destination directory missing: {}", dir.display()))?;
-    anyhow::ensure!(
-        metadata.is_dir(),
-        "destination is not a directory: {}",
-        dir.display()
-    );
-    let probe = dir.join(format!(".borderless-probe-{}", Uuid::new_v4()));
-    tokio::fs::File::create(&probe)
-        .await
-        .with_context(|| format!("destination not writable: {}", dir.display()))?;
-    let _ = tokio::fs::remove_file(&probe).await;
-    Ok(())
 }
 
 fn resolve_manifest_roots(
@@ -1538,7 +1516,7 @@ mod tests {
             root_name: "note.txt".to_string(),
             files: vec![FileManifestEntry::file("note.txt", 21)],
             total_bytes: 21,
-            destination_directory: None,
+            destination: FileTransferDestination::IncomingCache,
         };
         let port = unused_tcp_port();
         let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
@@ -1641,18 +1619,16 @@ is_dir = false
     }
 
     #[tokio::test]
-    async fn manifest_destination_directory_receives_files_directly() {
-        let root = temp_dir("manifest_destination_directory_receives_files_directly");
+    async fn incoming_cache_manifest_resolves_into_cache() {
+        let root = temp_dir("incoming_cache_manifest_resolves_into_cache");
         let cache_dir = root.join("server-cache");
-        let destination = root.join("drop-target");
-        fs::create_dir_all(&destination).unwrap();
         let transfer_id = Uuid::new_v4();
         let manifest = FileTransferManifest {
             transfer_id,
             root_name: "note.txt".to_string(),
             files: vec![FileManifestEntry::file("note.txt", 4)],
             total_bytes: 4,
-            destination_directory: Some(destination.to_string_lossy().to_string()),
+            destination: FileTransferDestination::IncomingCache,
         };
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let mut book = ReceiveBook::default();
@@ -1665,24 +1641,26 @@ is_dir = false
         let transfer = book.transfers.get(&transfer_id).unwrap();
         assert_eq!(
             transfer.cache_paths,
-            vec![destination.join("note.txt").to_string_lossy().to_string()]
+            vec![cache_dir.join("note.txt").to_string_lossy().to_string()]
         );
-        assert!(!cache_dir.exists());
+        assert!(cache_dir.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn missing_destination_directory_fails_transfer_without_killing_session() {
-        let root = temp_dir("missing_destination_directory_fails_transfer");
+    async fn authorized_drop_is_rejected_without_registry() {
+        let root = temp_dir("authorized_drop_is_rejected_without_registry");
         let cache_dir = root.join("server-cache");
-        let missing = root.join("does-not-exist");
         let transfer_id = Uuid::new_v4();
         let manifest = FileTransferManifest {
             transfer_id,
             root_name: "note.txt".to_string(),
             files: vec![FileManifestEntry::file("note.txt", 4)],
             total_bytes: 4,
-            destination_directory: Some(missing.to_string_lossy().to_string()),
+            destination: FileTransferDestination::AuthorizedDrop {
+                session_id: Uuid::from_u128(1),
+                authorization: Uuid::from_u128(2),
+            },
         };
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let mut book = ReceiveBook::default();
@@ -1698,7 +1676,6 @@ is_dir = false
             events_rx.try_recv().unwrap(),
             BulkTransferEvent::Failed { transfer_id: id, .. } if id == transfer_id
         ));
-        assert!(!missing.exists());
         if root.exists() {
             fs::remove_dir_all(root).unwrap();
         }
