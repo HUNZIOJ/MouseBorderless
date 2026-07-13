@@ -1,6 +1,6 @@
 import {
     Button, CheckBox, ComboBox, LineEdit, ListView, ProgressIndicator,
-    SpinBox, Switch
+    ScrollView, SpinBox, Switch
 } from "std-widgets.slint";
 
 export struct ActivityRow {
@@ -65,58 +65,60 @@ export component AppWindow inherits Window {
             height: 58px;
             background: #172126;
 
-            HorizontalLayout {
-                padding-left: 20px;
-                padding-right: 20px;
-                alignment: space-between;
+            Text {
+                x: 20px;
+                width: 120px;
+                height: parent.height;
+                text: "Borderless";
+                color: white;
+                font-size: 18px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
 
-                Text {
-                    text: "Borderless";
-                    color: white;
-                    font-size: 18px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
+            Text {
+                x: parent.width - 402px;
+                width: 150px;
+                height: parent.height;
+                text: root.connection-label + " · TCP · " + root.latency-label;
+                color: root.connected ? #bdebd8 : #d7dde0;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
 
-                HorizontalLayout {
-                    spacing: 10px;
-                    alignment: center;
+            Button {
+                x: parent.width - 242px;
+                y: 12px;
+                width: 38px;
+                height: 34px;
+                icon: @image-url("../assets/icons/settings.svg");
+                accessible-label: "高级设置";
+                clicked => { root.advanced-visible = true; }
+            }
 
-                    Text {
-                        text: root.connection-label + " · TCP · " + root.latency-label;
-                        color: root.connected ? #bdebd8 : #d7dde0;
-                        vertical-alignment: center;
-                    }
+            Button {
+                visible: root.running;
+                x: parent.width - 194px;
+                y: 12px;
+                width: 38px;
+                height: 34px;
+                icon: @image-url("../assets/icons/refresh-cw.svg");
+                accessible-label: "重新连接";
+                clicked => { root.reconnect-requested(); }
+            }
 
-                    Button {
-                        width: 38px;
-                        height: 34px;
-                        icon: @image-url("../assets/icons/settings.svg");
-                        accessible-label: "高级设置";
-                        clicked => { root.advanced-visible = true; }
-                    }
-
-                    Button {
-                        visible: root.running;
-                        width: 38px;
-                        height: 34px;
-                        icon: @image-url("../assets/icons/refresh-cw.svg");
-                        accessible-label: "重新连接";
-                        clicked => { root.reconnect-requested(); }
-                    }
-
-                    Button {
-                        min-width: 126px;
-                        height: 34px;
-                        text: root.running ? "停止共享" : "开始共享";
-                        icon: root.running
-                            ? @image-url("../assets/icons/square.svg")
-                            : @image-url("../assets/icons/play.svg");
-                        clicked => {
-                            if root.running { root.stop-requested(); }
-                            else { root.start-requested(); }
-                        }
-                    }
+            Button {
+                x: parent.width - 146px;
+                y: 12px;
+                width: 126px;
+                height: 34px;
+                text: root.running ? "停止共享" : "开始共享";
+                icon: root.running
+                    ? @image-url("../assets/icons/square.svg")
+                    : @image-url("../assets/icons/play.svg");
+                clicked => {
+                    if root.running { root.stop-requested(); }
+                    else { root.start-requested(); }
                 }
             }
         }
@@ -130,77 +132,107 @@ export component AppWindow inherits Window {
 
                 VerticalLayout {
                     padding: 20px;
-                    spacing: 12px;
+                    spacing: 10px;
 
-                    Text {
-                        text: "连接设置";
-                        font-size: 16px;
-                        font-weight: 700;
+                    HorizontalLayout {
+                        height: 36px;
+                        alignment: space-between;
+                        Text {
+                            width: 120px;
+                            horizontal-stretch: 0;
+                            text: "连接设置";
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Button {
+                            width: 116px;
+                            height: 36px;
+                            horizontal-stretch: 0;
+                            text: "保存设置";
+                            icon: @image-url("../assets/icons/save.svg");
+                            clicked => { root.save-requested(); }
+                        }
                     }
 
                     HorizontalLayout {
+                        height: 38px;
                         spacing: 8px;
                         Button {
+                            height: 38px;
                             text: "控制端";
                             enabled: !root.controller-role;
                             clicked => { root.controller-role = true; }
                         }
                         Button {
+                            height: 38px;
                             text: "被控端";
                             enabled: root.controller-role;
                             clicked => { root.controller-role = false; }
                         }
                     }
 
-                    Text {
-                        text: root.controller-role ? "目标电脑" : "监听地址";
-                        color: #55646b;
-                    }
-                    if root.controller-role : LineEdit { text <=> root.target-host; }
-                    if !root.controller-role : LineEdit { text <=> root.listen-host; }
+                    ScrollView {
+                        min-height: 0px;
+                        vertical-stretch: 1;
 
-                    Text { text: "TCP 端口"; color: #55646b; }
-                    if root.controller-role : SpinBox {
-                        value <=> root.target-port;
-                        minimum: 1;
-                        maximum: 65535;
-                    }
-                    if !root.controller-role : SpinBox {
-                        value <=> root.listen-port;
-                        minimum: 1;
-                        maximum: 65535;
-                    }
+                        VerticalLayout {
+                            padding-right: 8px;
+                            spacing: 8px;
 
-                    if root.controller-role : VerticalLayout {
-                        spacing: 8px;
-                        Text { text: "目标电脑的位置"; color: #55646b; }
-                        ComboBox {
-                            model: ["左侧", "右侧", "上方", "下方"];
-                            current-index <=> root.remote-position-index;
+                            Text {
+                                text: root.controller-role ? "目标电脑" : "监听地址";
+                                color: #55646b;
+                            }
+                            if root.controller-role : LineEdit {
+                                height: 38px;
+                                text <=> root.target-host;
+                            }
+                            if !root.controller-role : LineEdit {
+                                height: 38px;
+                                text <=> root.listen-host;
+                            }
+
+                            Text { text: "TCP 端口"; color: #55646b; }
+                            if root.controller-role : SpinBox {
+                                height: 38px;
+                                value <=> root.target-port;
+                                minimum: 1;
+                                maximum: 65535;
+                            }
+                            if !root.controller-role : SpinBox {
+                                height: 38px;
+                                value <=> root.listen-port;
+                                minimum: 1;
+                                maximum: 65535;
+                            }
+
+                            if root.controller-role : VerticalLayout {
+                                height: 66px;
+                                spacing: 6px;
+                                Text { text: "目标电脑的位置"; color: #55646b; }
+                                ComboBox {
+                                    height: 38px;
+                                    model: ["左侧", "右侧", "上方", "下方"];
+                                    current-index <=> root.remote-position-index;
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: #e2e6e8; }
+
+                            Text {
+                                text: "共享内容";
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Switch { height: 28px; text: "文本"; checked <=> root.clipboard-text; }
+                            Switch { height: 28px; text: "富文本"; checked <=> root.clipboard-html; }
+                            Switch { height: 28px; text: "图片"; checked <=> root.clipboard-images; }
+                            Switch { height: 28px; text: "复制文件"; checked <=> root.file-copy-paste; }
+                            Switch { height: 28px; text: "文件拖放"; checked <=> root.file-drag-drop; }
                         }
                     }
 
-                    Rectangle { height: 1px; background: #e2e6e8; }
-
-                    Text {
-                        text: "共享内容";
-                        font-size: 16px;
-                        font-weight: 700;
-                    }
-                    Switch { text: "文本"; checked <=> root.clipboard-text; }
-                    Switch { text: "富文本"; checked <=> root.clipboard-html; }
-                    Switch { text: "图片"; checked <=> root.clipboard-images; }
-                    Switch { text: "复制文件"; checked <=> root.file-copy-paste; }
-                    Switch { text: "文件拖放"; checked <=> root.file-drag-drop; }
-
-                    Rectangle { vertical-stretch: 1; }
-
-                    Button {
-                        height: 36px;
-                        text: "保存设置";
-                        icon: @image-url("../assets/icons/save.svg");
-                        clicked => { root.save-requested(); }
-                    }
                 }
             }
 
@@ -230,24 +262,30 @@ export component AppWindow inherits Window {
                     border-color: #d2d9dc;
                     border-radius: 6px;
 
-                    HorizontalLayout {
-                        padding: 16px;
-                        alignment: space-between;
-                        Text {
-                            text: "本机\n" + (root.controller-role ? "控制端" : "被控端");
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: "TCP";
-                            color: #137d66;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: "远程电脑\n" + root.control-label;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        x: 16px;
+                        width: 100px;
+                        height: parent.height;
+                        text: "本机\n" + (root.controller-role ? "控制端" : "被控端");
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: (parent.width - self.width) / 2;
+                        width: 60px;
+                        height: parent.height;
+                        text: "TCP";
+                        color: #137d66;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: parent.width - self.width - 16px;
+                        width: 100px;
+                        height: parent.height;
+                        text: "远程电脑\n" + root.control-label;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
                     }
                 }
 
