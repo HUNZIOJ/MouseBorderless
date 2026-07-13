@@ -1,14 +1,14 @@
-use std::{cell::RefCell, path::Path, rc::Rc};
+use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
 use anyhow::{anyhow, Context};
 use borderless_core::config::{AppConfig, RemotePosition, Role};
 use slint::ComponentHandle;
 
 use crate::{
-    runtime::{RuntimeCommand, RuntimeHandle},
+    runtime::{RuntimeCommand, RuntimeEvent, RuntimeHandle},
     status::AppStatus,
     ui::AppWindow,
-    ui_model::ConfigDraft,
+    ui_model::{activity_rows, ConfigDraft, UiSnapshot},
 };
 
 const CONFIG_PATH: &str = "config.toml";
@@ -190,6 +190,31 @@ fn wire_callbacks(
     });
 }
 
+fn apply_status_to_window(window: &AppWindow, status: &AppStatus) {
+    let view = UiSnapshot::from_status(status);
+    window.set_connection_label(view.connection_label.into());
+    window.set_latency_label(view.latency_label.into());
+    window.set_control_label(view.control_label.into());
+    window.set_connected(view.connected);
+    window.set_running(view.running);
+    window.set_transfer_active(view.transfer_active);
+    window.set_transfer_progress(view.transfer_progress);
+    window.set_transfer_file(view.transfer_file.into());
+    window.set_transfer_detail(view.transfer_detail.into());
+    window.set_transfer_destination(view.transfer_destination.into());
+    window.set_runtime_error_message(view.last_error.into());
+
+    let rows = activity_rows(status)
+        .into_iter()
+        .map(|row| crate::ui::ActivityRow {
+            time: row.time.into(),
+            kind: row.kind.into(),
+            message: row.message.into(),
+        })
+        .collect::<Vec<_>>();
+    window.set_activities(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
 pub fn run_app() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
     let (config, load_error) = match AppConfig::load_from_path(CONFIG_PATH) {
@@ -209,6 +234,33 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
     let config = Rc::new(RefCell::new(config));
     let status = Rc::new(RefCell::new(AppStatus::default()));
     wire_callbacks(&window, &runtime, &config, &status);
+    apply_status_to_window(&window, &status.borrow());
+
+    let timer = slint::Timer::default();
+    let weak = window.as_weak();
+    let runtime_for_timer = runtime.clone();
+    let status_for_timer = Rc::clone(&status);
+    timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(100),
+        move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            for event in runtime_for_timer.drain_events() {
+                match event {
+                    RuntimeEvent::Status(mut next) => {
+                        next.events = status_for_timer.borrow().events.clone();
+                        *status_for_timer.borrow_mut() = next;
+                    }
+                    RuntimeEvent::Log(message) => {
+                        status_for_timer.borrow_mut().push_log(message);
+                    }
+                }
+            }
+            apply_status_to_window(&window, &status_for_timer.borrow());
+        },
+    );
     window.run()
 }
 

@@ -17,6 +17,41 @@ pub struct UiSnapshot {
     pub last_error: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityView {
+    pub time: String,
+    pub kind: String,
+    pub message: String,
+}
+
+pub fn activity_rows(status: &AppStatus) -> Vec<ActivityView> {
+    status
+        .events
+        .iter()
+        .rev()
+        .take(100)
+        .map(|message| {
+            let lower = message.to_ascii_lowercase();
+            let kind = if lower.contains("transfer") || lower.contains("file") {
+                "文件"
+            } else if lower.contains("clipboard") {
+                "剪贴板"
+            } else if lower.contains("control") {
+                "控制"
+            } else if lower.contains("connect") {
+                "连接"
+            } else {
+                "系统"
+            };
+            ActivityView {
+                time: String::new(),
+                kind: kind.to_string(),
+                message: message.clone(),
+            }
+        })
+        .collect()
+}
+
 impl UiSnapshot {
     pub fn from_status(status: &AppStatus) -> Self {
         let connection_label = match status.run_state {
@@ -147,5 +182,18 @@ mod tests {
         assert_eq!(config.controller.agent_port, 24880);
         assert_eq!(config.controller.remote_position, RemotePosition::Left);
         assert!(!config.sharing.clipboard_text);
+    }
+
+    #[test]
+    fn event_log_projects_newest_items_first_with_kind_labels() {
+        let mut status = AppStatus::default();
+        status.push_log("connected 192.168.1.2 via TCP");
+        status.push_log("bulk transfer started: design.pdf");
+
+        let rows = activity_rows(&status);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "文件");
+        assert!(rows[0].message.contains("design.pdf"));
+        assert_eq!(rows[1].kind, "连接");
     }
 }
