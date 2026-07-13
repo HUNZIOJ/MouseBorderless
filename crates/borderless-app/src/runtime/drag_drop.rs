@@ -5,6 +5,7 @@ use borderless_core::{
     geometry::{edge_for_position, Edge, Point},
     protocol::WireMessage,
 };
+use borderless_net::bulk_transfer::BulkTransferEvent;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,12 +19,15 @@ pub enum DragEffect {
     },
     ResolveTarget {
         session_id: Uuid,
+        transfer_id: Uuid,
         point: Point,
     },
     BeginTransfer {
         session_id: Uuid,
         transfer_id: Uuid,
         authorization: Uuid,
+        source_paths: Vec<String>,
+        destination: String,
     },
     CancelBulk {
         transfer_id: Uuid,
@@ -40,9 +44,10 @@ pub enum DragEffect {
 
 struct PeerDragOffer {
     session_id: Uuid,
-    _transfer_id: Uuid,
+    transfer_id: Uuid,
     _item_count: u32,
     handed_off: bool,
+    released: bool,
 }
 
 pub struct DragDropCoordinator {
@@ -199,6 +204,56 @@ impl DragDropCoordinator {
         }]
     }
 
+    pub fn local_left_released(&mut self, point: Point) -> Vec<DragEffect> {
+        if self.role != Role::Controller {
+            return Vec::new();
+        }
+
+        if self.control_mode == ControlMode::Remote {
+            let Some(session) = self.active.as_mut() else {
+                return Vec::new();
+            };
+            if session.phase() != &DragDropPhase::RemoteTargetSelecting {
+                return Vec::new();
+            }
+            let session_id = session.session_id();
+            if session.release_at(point).is_err() {
+                return Vec::new();
+            }
+            return vec![
+                DragEffect::Send(WireMessage::DragDropReleased { session_id, point }),
+                DragEffect::RestoreLocalInput,
+                DragEffect::Status {
+                    state: "正在解析目标目录".to_string(),
+                    destination: None,
+                },
+            ];
+        }
+
+        let Some(offer) = self.peer_offer.as_mut().filter(|offer| offer.handed_off) else {
+            return Vec::new();
+        };
+        if offer.released {
+            return Vec::new();
+        }
+        offer.released = true;
+        vec![
+            DragEffect::Send(WireMessage::DragDropReleased {
+                session_id: offer.session_id,
+                point,
+            }),
+            DragEffect::ResolveTarget {
+                session_id: offer.session_id,
+                transfer_id: offer.transfer_id,
+                point,
+            },
+            DragEffect::Status {
+                state: "正在解析目标目录".to_string(),
+                destination: None,
+            },
+        ]
+    }
+
     pub fn reset(&mut self) {
         self.active = None;
         self.peer_offer = None;
@@ -230,13 +285,264 @@ impl DragDropCoordinator {
                 }
                 self.peer_offer = Some(PeerDragOffer {
                     session_id,
-                    _transfer_id: transfer_id,
+                    transfer_id,
                     _item_count: item_count,
                     handed_off: false,
+                    released: false,
                 });
                 self.local_release_handoff_effects()
             }
+            WireMessage::DragDropReleased { session_id, point } => {
+                if let Some(session) = self
+                    .active
+                    .as_mut()
+                    .filter(|session| session.session_id() == session_id)
+                {
+                    if session.phase() == &DragDropPhase::RemoteTargetSelecting
+                        && session.release_at(point).is_ok()
+                    {
+                        return vec![DragEffect::Status {
+                            state: "正在解析目标目录".to_string(),
+                            destination: None,
+                        }];
+                    }
+                    return Vec::new();
+                }
+
+                let Some(offer) = self
+                    .peer_offer
+                    .as_mut()
+                    .filter(|offer| offer.session_id == session_id && !offer.released)
+                else {
+                    return Vec::new();
+                };
+                offer.released = true;
+                vec![
+                    DragEffect::ResolveTarget {
+                        session_id,
+                        transfer_id: offer.transfer_id,
+                        point,
+                    },
+                    DragEffect::Status {
+                        state: "正在解析目标目录".to_string(),
+                        destination: None,
+                    },
+                ]
+            }
+            WireMessage::DragDropTargetResolved { session_id, target } => {
+                let Some(session) = self
+                    .active
+                    .as_mut()
+                    .filter(|session| session.session_id() == session_id)
+                else {
+                    return Vec::new();
+                };
+                if session.resolve_target(target.clone()).is_err()
+                    || session.begin_transfer().is_err()
+                {
+                    return Vec::new();
+                }
+                vec![
+                    DragEffect::BeginTransfer {
+                        session_id,
+                        transfer_id: session.transfer_id(),
+                        authorization: target.authorization,
+                        source_paths: session.source_paths().to_vec(),
+                        destination: target.display_name.clone(),
+                    },
+                    DragEffect::Status {
+                        state: "正在传输到目标目录".to_string(),
+                        destination: Some(target.display_name),
+                    },
+                ]
+            }
+            WireMessage::DragDropTargetFailed { session_id, reason } => {
+                let Some(mut session) = self
+                    .active
+                    .take_if(|session| session.session_id() == session_id)
+                else {
+                    return Vec::new();
+                };
+                let _ = session.fail(reason.clone());
+                vec![DragEffect::Status {
+                    state: format!("拖放失败：{reason}"),
+                    destination: None,
+                }]
+            }
+            WireMessage::DragDropTransferStarted {
+                session_id,
+                transfer_id,
+            } => {
+                let matches_offer = self.peer_offer.as_ref().is_some_and(|offer| {
+                    offer.session_id == session_id && offer.transfer_id == transfer_id
+                });
+                if matches_offer {
+                    vec![DragEffect::Status {
+                        state: "正在接收拖放文件".to_string(),
+                        destination: None,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            WireMessage::DragDropTransferResult {
+                session_id,
+                transfer_id,
+                ok,
+                reason,
+            } => {
+                let Some(mut session) = self.active.take_if(|session| {
+                    session.session_id() == session_id
+                        && session.transfer_id() == transfer_id
+                        && session.phase() == &DragDropPhase::Transferring
+                }) else {
+                    return Vec::new();
+                };
+                if ok {
+                    let _ = session.complete();
+                    vec![DragEffect::Status {
+                        state: "拖放完成".to_string(),
+                        destination: None,
+                    }]
+                } else {
+                    let reason = reason.unwrap_or_else(|| "接收端未能完成传输".to_string());
+                    let _ = session.fail(reason.clone());
+                    vec![DragEffect::Status {
+                        state: format!("拖放失败：{reason}"),
+                        destination: None,
+                    }]
+                }
+            }
+            WireMessage::DragDropCancel { session_id, reason } => {
+                let source_cancelled = self
+                    .active
+                    .take_if(|session| session.session_id() == session_id)
+                    .is_some();
+                let target_cancelled = self
+                    .peer_offer
+                    .take_if(|offer| offer.session_id == session_id)
+                    .is_some();
+                if source_cancelled || target_cancelled {
+                    vec![DragEffect::Status {
+                        state: format!("拖放已取消：{reason}"),
+                        destination: None,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
+        }
+    }
+
+    pub fn handle_bulk_event(&mut self, event: BulkTransferEvent) -> Vec<DragEffect> {
+        let transfer_id = match &event {
+            BulkTransferEvent::Offered(manifest) => manifest.transfer_id,
+            BulkTransferEvent::Progress { transfer_id, .. }
+            | BulkTransferEvent::Sent { transfer_id }
+            | BulkTransferEvent::Completed { transfer_id, .. }
+            | BulkTransferEvent::Failed { transfer_id, .. } => *transfer_id,
+            BulkTransferEvent::Cancelled(transfer_id) => *transfer_id,
+        };
+
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|session| session.transfer_id() == transfer_id)
+        {
+            return match event {
+                BulkTransferEvent::Sent { .. } => vec![DragEffect::Status {
+                    state: "文件已发送，等待接收端确认".to_string(),
+                    destination: None,
+                }],
+                BulkTransferEvent::Failed { error, .. } => vec![DragEffect::Status {
+                    state: format!("拖放失败：{error}"),
+                    destination: None,
+                }],
+                BulkTransferEvent::Cancelled(_) => vec![DragEffect::Status {
+                    state: "拖放已取消".to_string(),
+                    destination: None,
+                }],
+                _ => Vec::new(),
+            };
+        }
+
+        let Some(offer) = self
+            .peer_offer
+            .as_ref()
+            .filter(|offer| offer.transfer_id == transfer_id)
+        else {
+            return Vec::new();
+        };
+        let session_id = offer.session_id;
+        let result = match event {
+            BulkTransferEvent::Completed { .. } => Some((true, None, "拖放完成".to_string())),
+            BulkTransferEvent::Failed { error, .. } => {
+                Some((false, Some(error.clone()), format!("拖放失败：{error}")))
+            }
+            BulkTransferEvent::Cancelled(_) => Some((
+                false,
+                Some("接收端已取消传输".to_string()),
+                "拖放已取消".to_string(),
+            )),
+            _ => None,
+        };
+        let Some((ok, reason, state)) = result else {
+            return Vec::new();
+        };
+        self.peer_offer = None;
+        vec![
+            DragEffect::Send(WireMessage::DragDropTransferResult {
+                session_id,
+                transfer_id,
+                ok,
+                reason,
+            }),
+            DragEffect::Status {
+                state,
+                destination: None,
+            },
+        ]
+    }
+
+    pub fn complete_target_resolution(
+        &mut self,
+        session_id: Uuid,
+        transfer_id: Uuid,
+        result: Result<borderless_core::drag_drop::DropTargetSummary, String>,
+    ) -> Vec<DragEffect> {
+        let matches_offer = self.peer_offer.as_ref().is_some_and(|offer| {
+            offer.session_id == session_id && offer.transfer_id == transfer_id && offer.released
+        });
+        if !matches_offer {
+            return Vec::new();
+        }
+
+        match result {
+            Ok(target) => vec![
+                DragEffect::Send(WireMessage::DragDropTargetResolved {
+                    session_id,
+                    target: target.clone(),
+                }),
+                DragEffect::Status {
+                    state: "目标目录已确认".to_string(),
+                    destination: Some(target.display_name),
+                },
+            ],
+            Err(reason) => {
+                self.peer_offer = None;
+                vec![
+                    DragEffect::Send(WireMessage::DragDropTargetFailed {
+                        session_id,
+                        reason: reason.clone(),
+                    }),
+                    DragEffect::RevokeAuthorization { session_id },
+                    DragEffect::Status {
+                        state: format!("拖放失败：{reason}"),
+                        destination: None,
+                    },
+                ]
+            }
         }
     }
 
@@ -263,11 +569,42 @@ mod tests {
     use borderless_core::{
         config::{RemotePosition, Role},
         control::ControlMode,
-        drag_drop::{DragDirection, DragDropPhase},
-        geometry::Edge,
+        drag_drop::{DragDirection, DragDropPhase, DropResolutionKind, DropTargetSummary},
+        geometry::{Edge, Point},
         protocol::WireMessage,
     };
+    use borderless_net::bulk_transfer::BulkTransferEvent;
     use uuid::Uuid;
+
+    fn transferring_source() -> (DragDropCoordinator, Uuid, Uuid) {
+        let session_id = Uuid::from_u128(1);
+        let transfer_id = Uuid::from_u128(2);
+        let mut coordinator = DragDropCoordinator::new(Role::Controller);
+        coordinator.begin_local_drag(
+            session_id,
+            transfer_id,
+            vec!["C:\\src\\report.pdf".to_string()],
+        );
+        coordinator.set_control_mode(ControlMode::Remote);
+        coordinator.local_left_released(Point::new(20, 30));
+        let effects = coordinator.handle_peer_message(WireMessage::DragDropTargetResolved {
+            session_id,
+            target: DropTargetSummary {
+                display_name: "Reports".to_string(),
+                resolution_kind: DropResolutionKind::FolderIcon,
+                authorization: Uuid::from_u128(3),
+            },
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            DragEffect::BeginTransfer {
+                session_id: candidate_session,
+                transfer_id: candidate_transfer,
+                ..
+            } if *candidate_session == session_id && *candidate_transfer == transfer_id
+        )));
+        (coordinator, session_id, transfer_id)
+    }
 
     #[test]
     fn agent_entered_after_control_returns_is_immediately_handed_to_controller() {
@@ -430,6 +767,123 @@ mod tests {
 
         assert!(coordinator.active_session().is_some());
         assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, DragEffect::Send(WireMessage::DragDropCancel { .. }))));
+    }
+
+    #[test]
+    fn sender_completes_only_after_matching_target_result() {
+        let (mut coordinator, session_id, transfer_id) = transferring_source();
+
+        assert!(coordinator
+            .handle_bulk_event(BulkTransferEvent::Sent { transfer_id })
+            .iter()
+            .all(|effect| !matches!(
+                effect,
+                DragEffect::Status { state, .. } if state == "拖放完成"
+            )));
+
+        let effects = coordinator.handle_peer_message(WireMessage::DragDropTransferResult {
+            session_id,
+            transfer_id,
+            ok: true,
+            reason: None,
+        });
+        assert!(effects.contains(&DragEffect::Status {
+            state: "拖放完成".to_string(),
+            destination: None,
+        }));
+    }
+
+    #[test]
+    fn wrong_transfer_result_is_ignored() {
+        let (mut coordinator, session_id, _) = transferring_source();
+        let effects = coordinator.handle_peer_message(WireMessage::DragDropTransferResult {
+            session_id,
+            transfer_id: Uuid::from_u128(999),
+            ok: true,
+            reason: None,
+        });
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn target_resolution_and_bulk_completion_send_verified_result() {
+        let session_id = Uuid::from_u128(10);
+        let transfer_id = Uuid::from_u128(11);
+        let target = DropTargetSummary {
+            display_name: "Reports".to_string(),
+            resolution_kind: DropResolutionKind::FolderIcon,
+            authorization: Uuid::from_u128(12),
+        };
+        let mut coordinator = DragDropCoordinator::new(Role::Controller);
+        coordinator.handle_peer_message(WireMessage::DragDropEntered {
+            session_id,
+            transfer_id,
+            item_count: 1,
+        });
+        coordinator.local_left_released(Point::new(40, 50));
+
+        let resolved =
+            coordinator.complete_target_resolution(session_id, transfer_id, Ok(target.clone()));
+        assert!(
+            resolved.contains(&DragEffect::Send(WireMessage::DragDropTargetResolved {
+                session_id,
+                target
+            }))
+        );
+
+        coordinator.handle_peer_message(WireMessage::DragDropTransferStarted {
+            session_id,
+            transfer_id,
+        });
+        let completed = coordinator.handle_bulk_event(BulkTransferEvent::Completed {
+            transfer_id,
+            cache_paths: vec!["C:\\drop\\report.pdf".to_string()],
+        });
+        assert!(
+            completed.contains(&DragEffect::Send(WireMessage::DragDropTransferResult {
+                session_id,
+                transfer_id,
+                ok: true,
+                reason: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn failed_target_resolution_clears_the_peer_offer() {
+        let session_id = Uuid::from_u128(10);
+        let transfer_id = Uuid::from_u128(11);
+        let mut coordinator = DragDropCoordinator::new(Role::Agent);
+        coordinator.handle_peer_message(WireMessage::DragDropEntered {
+            session_id,
+            transfer_id,
+            item_count: 1,
+        });
+        coordinator.handle_peer_message(WireMessage::DragDropReleased {
+            session_id,
+            point: Point::new(40, 50),
+        });
+
+        let effects = coordinator.complete_target_resolution(
+            session_id,
+            transfer_id,
+            Err("目标目录不可写".to_string()),
+        );
+
+        assert!(
+            effects.contains(&DragEffect::Send(WireMessage::DragDropTargetFailed {
+                session_id,
+                reason: "目标目录不可写".to_string(),
+            }))
+        );
+        let next = coordinator.handle_peer_message(WireMessage::DragDropEntered {
+            session_id: Uuid::from_u128(20),
+            transfer_id: Uuid::from_u128(21),
+            item_count: 1,
+        });
+        assert!(next
             .iter()
             .all(|effect| !matches!(effect, DragEffect::Send(WireMessage::DragDropCancel { .. }))));
     }

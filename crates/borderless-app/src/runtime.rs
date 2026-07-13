@@ -14,9 +14,9 @@ use borderless_core::{
     clipboard::{ClipboardEnvelope, ClipboardPayload, RemoteFileOffer},
     config::{AppConfig, Role},
     control::{ControlMode, ControlOutput, ControlState},
-    file_transfer::{FileManifestEntry, FileTransferDestination},
+    file_transfer::{FileManifestEntry, FileTransferDestination, FileTransferManifest},
     geometry::{Edge, Point, Rect},
-    input_event::{InputEvent, MouseMoveAbsEvent},
+    input_event::{InputEvent, MouseButton, MouseMoveAbsEvent},
     protocol::{
         encode_frame, Heartbeat, Hello, ProtocolError, WireMessage, MAX_PAYLOAD_LEN,
         PROTOCOL_VERSION,
@@ -35,8 +35,9 @@ use borderless_net::{
 use borderless_win::{
     clipboard::{write_clipboard, ClipboardEvent, ClipboardMonitor, ClipboardReadOptions},
     drag_drop::{DragDropEvent, EdgeDropTarget},
+    drop_resolver::{resolve_drop_target, ResolvedDropTarget},
     hooks::{HookEvent, HookManager, SuppressionMode},
-    inject::{move_local_pointer_to, InputInjector},
+    inject::{move_local_pointer_to, release_local_left_button, InputInjector},
     monitor::virtual_desktop_rect,
 };
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -384,6 +385,11 @@ fn start_controller_session(
         BulkClientPeer::Configured(config.controller.agent_host.clone()),
     )?;
     let bulk_commands = bulk_runtime.commands.clone();
+    let bulk_events = bulk_runtime
+        .drag_events
+        .take()
+        .expect("bulk drag event receiver is available");
+    let drop_authorizations = bulk_runtime.drop_authorizations.clone();
 
     let transport_updates = updates.clone();
     tasks.push(tokio::spawn(async move {
@@ -414,6 +420,8 @@ fn start_controller_session(
             pump_commands,
             session_commands_rx,
             bulk_commands,
+            bulk_events,
+            drop_authorizations,
             pump_updates,
         )
         .await;
@@ -446,6 +454,11 @@ fn start_agent_session(
     let mut bulk_runtime =
         start_configured_bulk_runtime(session_id, &config, updates.clone(), BulkClientPeer::None)?;
     let bulk_commands = bulk_runtime.commands.clone();
+    let bulk_events = bulk_runtime
+        .drag_events
+        .take()
+        .expect("bulk drag event receiver is available");
+    let drop_authorizations = bulk_runtime.drop_authorizations.clone();
 
     let transport_updates = updates.clone();
     tasks.push(tokio::spawn(async move {
@@ -471,6 +484,8 @@ fn start_agent_session(
             pump_commands,
             session_commands_rx,
             bulk_commands,
+            bulk_events,
+            drop_authorizations,
             pump_updates,
         )
         .await;
@@ -492,6 +507,14 @@ fn start_agent_session(
 struct BulkRuntime {
     commands: Vec<mpsc::UnboundedSender<BulkTransferCommand>>,
     tasks: Vec<JoinHandle<()>>,
+    drag_events: Option<mpsc::UnboundedReceiver<BulkTransferEvent>>,
+    drop_authorizations: DropAuthorizationRegistry,
+}
+
+#[derive(Clone)]
+struct BulkEndpointContext {
+    drop_authorizations: DropAuthorizationRegistry,
+    drag_events: mpsc::UnboundedSender<BulkTransferEvent>,
 }
 
 enum BulkClientPeer {
@@ -506,6 +529,11 @@ fn start_configured_bulk_runtime(
     client_peer: BulkClientPeer,
 ) -> Result<BulkRuntime, String> {
     let drop_authorizations = DropAuthorizationRegistry::default();
+    let (drag_events_tx, drag_events_rx) = mpsc::unbounded_channel();
+    let endpoint_context = BulkEndpointContext {
+        drop_authorizations: drop_authorizations.clone(),
+        drag_events: drag_events_tx,
+    };
     let cache_dir = config
         .resolved_incoming_cache_dir()
         .map_err(|error| error.to_string())?
@@ -514,6 +542,8 @@ fn start_configured_bulk_runtime(
     let mut runtime = BulkRuntime {
         commands: Vec::new(),
         tasks: Vec::new(),
+        drag_events: Some(drag_events_rx),
+        drop_authorizations: drop_authorizations.clone(),
     };
 
     let server_host = match config.role {
@@ -526,7 +556,7 @@ fn start_configured_bulk_runtime(
         server_host,
         config.sharing.bulk_transfer_port,
         cache_dir.clone(),
-        drop_authorizations.clone(),
+        endpoint_context.clone(),
         updates.clone(),
     );
 
@@ -537,7 +567,7 @@ fn start_configured_bulk_runtime(
             host,
             config.sharing.bulk_transfer_port,
             cache_dir,
-            drop_authorizations,
+            endpoint_context,
             updates,
         );
     }
@@ -551,9 +581,13 @@ fn push_bulk_server(
     listen_host: String,
     port: u16,
     cache_dir: String,
-    drop_authorizations: DropAuthorizationRegistry,
+    context: BulkEndpointContext,
     updates: Sender<TaggedSessionUpdate>,
 ) {
+    let BulkEndpointContext {
+        drop_authorizations,
+        drag_events,
+    } = context;
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let server_updates = updates.clone();
@@ -580,7 +614,10 @@ fn push_bulk_server(
     runtime
         .tasks
         .push(tokio::spawn(forward_bulk_transfer_events(
-            session_id, events_rx, updates,
+            session_id,
+            events_rx,
+            drag_events,
+            updates,
         )));
 }
 
@@ -590,9 +627,13 @@ fn push_bulk_client(
     host: String,
     port: u16,
     cache_dir: String,
-    drop_authorizations: DropAuthorizationRegistry,
+    context: BulkEndpointContext,
     updates: Sender<TaggedSessionUpdate>,
 ) {
+    let BulkEndpointContext {
+        drop_authorizations,
+        drag_events,
+    } = context;
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let client_updates = updates.clone();
@@ -619,16 +660,21 @@ fn push_bulk_client(
     runtime
         .tasks
         .push(tokio::spawn(forward_bulk_transfer_events(
-            session_id, events_rx, updates,
+            session_id,
+            events_rx,
+            drag_events,
+            updates,
         )));
 }
 
 async fn forward_bulk_transfer_events(
     session_id: u64,
     mut events: mpsc::UnboundedReceiver<BulkTransferEvent>,
+    drag_events: mpsc::UnboundedSender<BulkTransferEvent>,
     updates: Sender<TaggedSessionUpdate>,
 ) {
     while let Some(event) = events.recv().await {
+        let _ = drag_events.send(event.clone());
         send_session_update(&updates, session_id, SessionUpdate::BulkTransfer(event));
     }
 }
@@ -645,6 +691,8 @@ async fn run_controller_event_pump(
     connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
     mut session_commands: mpsc::UnboundedReceiver<SessionCommand>,
     bulk_commands: Vec<mpsc::UnboundedSender<BulkTransferCommand>>,
+    mut bulk_events: mpsc::UnboundedReceiver<BulkTransferEvent>,
+    drop_authorizations: DropAuthorizationRegistry,
     updates: Sender<TaggedSessionUpdate>,
 ) {
     let mut control_state: Option<ControlState> = None;
@@ -661,6 +709,17 @@ async fn run_controller_event_pump(
     let mut clipboard_transport_ready = false;
     let mut drag_runtime = start_drag_drop_runtime(&config);
     let mut drag_drop = DragDropCoordinator::new(Role::Controller);
+    let (target_resolution_tx, mut target_resolution_rx) = mpsc::unbounded_channel();
+    let mut bulk_events_open = true;
+    let drag_context = || DragEffectContext {
+        config: &config,
+        drop_authorizations: &drop_authorizations,
+        target_resolution_results: &target_resolution_tx,
+        connection_commands: &connection_commands,
+        bulk_commands: &bulk_commands,
+        updates: &updates,
+        runtime_session_id: session_id,
+    };
     let mut drag_was_remote = false;
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     hook_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -687,6 +746,20 @@ async fn run_controller_event_pump(
                     session_id,
                 );
                 while let Ok(event) = hook_events.try_recv() {
+                    let drag_release_point = match &event {
+                        HookEvent::Input(InputEvent::MouseButton(button))
+                            if button.button == MouseButton::Left && !button.pressed =>
+                        {
+                            control_state.as_ref().and_then(|state| {
+                                if state.mode() == ControlMode::Remote {
+                                    Some(state.remote_point())
+                                } else {
+                                    last_pointer
+                                }
+                            })
+                        }
+                        _ => None,
+                    };
                     handle_controller_hook_event(
                         event,
                         local_desktop,
@@ -702,14 +775,27 @@ async fn run_controller_event_pump(
                         &updates,
                         session_id,
                     );
+                    let drag_now_remote = control_state
+                        .as_ref()
+                        .is_some_and(|state| state.mode() == ControlMode::Remote);
+                    if drag_now_remote != drag_was_remote {
+                        drag_was_remote = drag_now_remote;
+                        let effects = drag_drop.set_control_mode(if drag_now_remote {
+                            ControlMode::Remote
+                        } else {
+                            ControlMode::Local
+                        });
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    }
+                    if let Some(point) = drag_release_point {
+                        let effects = drag_drop.local_left_released(point);
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    }
                 }
                 drain_local_drag_events(
                     &mut drag_drop,
                     &mut drag_runtime,
-                    &connection_commands,
-                    &bulk_commands,
-                    &updates,
-                    session_id,
+                    drag_context(),
                 );
                 let drag_now_remote = control_state
                     .as_ref()
@@ -721,14 +807,7 @@ async fn run_controller_event_pump(
                     } else {
                         ControlMode::Local
                     });
-                    apply_drag_effects(
-                        effects,
-                        &mut drag_runtime,
-                        &connection_commands,
-                        &bulk_commands,
-                        &updates,
-                        session_id,
-                    );
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
                 }
                 emit_remote_send_actions(
                     remote_input_send_buffer.flush_pending_move(),
@@ -758,6 +837,25 @@ async fn run_controller_event_pump(
                     );
                 }
             }
+            event = bulk_events.recv(), if bulk_events_open => {
+                match event {
+                    Some(event) => {
+                        let effects = drag_drop.handle_bulk_event(event);
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    }
+                    None => bulk_events_open = false,
+                }
+            }
+            event = target_resolution_rx.recv() => {
+                if let Some(event) = event {
+                    let effects = finish_drag_target_resolution(
+                        &mut drag_drop,
+                        &drop_authorizations,
+                        event,
+                    );
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                }
+            }
             command = session_commands.recv() => {
                 match command {
                     Some(SessionCommand::Stop) | None => {
@@ -783,28 +881,14 @@ async fn run_controller_event_pump(
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
                     let effects = drag_drop.handle_peer_message(message.clone());
-                    apply_drag_effects(
-                        effects,
-                        &mut drag_runtime,
-                        &connection_commands,
-                        &bulk_commands,
-                        &updates,
-                        session_id,
-                    );
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
                     if matches!(message, WireMessage::Hello(hello) if hello.protocol_version == PROTOCOL_VERSION) {
                         let layout = WireMessage::PeerLayout {
                             controller_remote_position: config.controller.remote_position.clone(),
                         };
                         let _ = connection_commands.send(ConnectionCommand::Send(layout.clone()));
                         let effects = drag_drop.handle_peer_message(layout);
-                        apply_drag_effects(
-                            effects,
-                            &mut drag_runtime,
-                            &connection_commands,
-                            &bulk_commands,
-                            &updates,
-                            session_id,
-                        );
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
                     }
                 }
                 if matches!(
@@ -1579,6 +1663,8 @@ async fn run_agent_event_pump(
     connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
     mut session_commands: mpsc::UnboundedReceiver<SessionCommand>,
     bulk_commands: Vec<mpsc::UnboundedSender<BulkTransferCommand>>,
+    mut bulk_events: mpsc::UnboundedReceiver<BulkTransferEvent>,
+    drop_authorizations: DropAuthorizationRegistry,
     updates: Sender<TaggedSessionUpdate>,
 ) {
     let mut injector: Option<InputInjector> = None;
@@ -1588,6 +1674,17 @@ async fn run_agent_event_pump(
     let mut clipboard_transport_ready = false;
     let mut drag_runtime = start_drag_drop_runtime(&config);
     let mut drag_drop = DragDropCoordinator::new(Role::Agent);
+    let (target_resolution_tx, mut target_resolution_rx) = mpsc::unbounded_channel();
+    let mut bulk_events_open = true;
+    let drag_context = || DragEffectContext {
+        config: &config,
+        drop_authorizations: &drop_authorizations,
+        target_resolution_results: &target_resolution_tx,
+        connection_commands: &connection_commands,
+        bulk_commands: &bulk_commands,
+        updates: &updates,
+        runtime_session_id: session_id,
+    };
     let mut drag_interval = interval(DRAG_DROP_POLL_INTERVAL);
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     drag_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1598,10 +1695,7 @@ async fn run_agent_event_pump(
                 drain_local_drag_events(
                     &mut drag_drop,
                     &mut drag_runtime,
-                    &connection_commands,
-                    &bulk_commands,
-                    &updates,
-                    session_id,
+                    drag_context(),
                 );
             }
             _ = clipboard_interval.tick(), if clipboard_runtime.is_some() => {
@@ -1615,6 +1709,25 @@ async fn run_agent_event_pump(
                         session_id,
                         clipboard_transport_ready,
                     );
+                }
+            }
+            event = bulk_events.recv(), if bulk_events_open => {
+                match event {
+                    Some(event) => {
+                        let effects = drag_drop.handle_bulk_event(event);
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    }
+                    None => bulk_events_open = false,
+                }
+            }
+            event = target_resolution_rx.recv() => {
+                if let Some(event) = event {
+                    let effects = finish_drag_target_resolution(
+                        &mut drag_drop,
+                        &drop_authorizations,
+                        event,
+                    );
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
                 }
             }
             command = session_commands.recv() => {
@@ -1634,14 +1747,7 @@ async fn run_agent_event_pump(
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
                     let effects = drag_drop.handle_peer_message(message.clone());
-                    apply_drag_effects(
-                        effects,
-                        &mut drag_runtime,
-                        &connection_commands,
-                        &bulk_commands,
-                        &updates,
-                        session_id,
-                    );
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
                 }
                 if matches!(
                     event,
@@ -2655,6 +2761,192 @@ fn apply_clipboard_error_status(
 
 const DRAG_DROP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+#[cfg(test)]
+mod drag_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn drag_manifest_contains_only_the_authorization_token() {
+        let root = std::env::temp_dir().join(format!("borderless-drag-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("report.txt");
+        std::fs::write(&source, b"report").unwrap();
+        let session_id = Uuid::from_u128(1);
+        let transfer_id = Uuid::from_u128(2);
+        let authorization = Uuid::from_u128(3);
+
+        let manifest = prepare_drag_manifest(
+            transfer_id,
+            &[source.to_string_lossy().into_owned()],
+            session_id,
+            authorization,
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.destination,
+            FileTransferDestination::AuthorizedDrop {
+                session_id,
+                authorization,
+            }
+        );
+        assert!(!format!("{manifest:?}").contains(&root.to_string_lossy().to_string()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_directory_readonly_attribute_does_not_override_write_probe() {
+        let root = std::env::temp_dir().join(format!("borderless-drop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let original_permissions = std::fs::metadata(&root).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&root, permissions).unwrap();
+        let target = ResolvedDropTarget {
+            destination_dir: root.clone(),
+            display_name: "drop".to_string(),
+            resolution_kind: borderless_core::drag_drop::DropResolutionKind::ExplorerDirectory,
+        };
+
+        assert!(validate_local_drop_target(target).is_ok());
+
+        std::fs::set_permissions(&root, original_permissions).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+const DROP_AUTHORIZATION_TTL: Duration = Duration::from_secs(30);
+
+enum DragTargetResolutionEvent {
+    Resolved {
+        session_id: Uuid,
+        transfer_id: Uuid,
+        target: ResolvedDropTarget,
+    },
+    Failed {
+        session_id: Uuid,
+        transfer_id: Uuid,
+        reason: String,
+    },
+}
+
+fn resolve_drag_target_async(
+    session_id: Uuid,
+    transfer_id: Uuid,
+    point: Point,
+    results: mpsc::UnboundedSender<DragTargetResolutionEvent>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let event = match resolve_drop_target(point).and_then(validate_local_drop_target) {
+            Ok(target) => DragTargetResolutionEvent::Resolved {
+                session_id,
+                transfer_id,
+                target,
+            },
+            Err(error) => DragTargetResolutionEvent::Failed {
+                session_id,
+                transfer_id,
+                reason: error.to_string(),
+            },
+        };
+        let _ = results.send(event);
+    });
+}
+
+fn validate_local_drop_target(target: ResolvedDropTarget) -> anyhow::Result<ResolvedDropTarget> {
+    let metadata = std::fs::metadata(&target.destination_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot access drop directory {}: {error}",
+            target.destination_dir.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "drop destination is not a directory: {}",
+            target.destination_dir.display()
+        );
+    }
+    let probe = target
+        .destination_dir
+        .join(format!(".borderless-write-test-{}", Uuid::new_v4()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "drop directory is not writable {}: {error}",
+                target.destination_dir.display()
+            )
+        })?;
+    drop(file);
+    std::fs::remove_file(&probe).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot remove drop write probe {}: {error}",
+            probe.display()
+        )
+    })?;
+    Ok(target)
+}
+
+fn finish_drag_target_resolution(
+    coordinator: &mut DragDropCoordinator,
+    drop_authorizations: &DropAuthorizationRegistry,
+    event: DragTargetResolutionEvent,
+) -> Vec<DragEffect> {
+    match event {
+        DragTargetResolutionEvent::Resolved {
+            session_id,
+            transfer_id,
+            target,
+        } => {
+            let authorization = drop_authorizations.register(
+                session_id,
+                transfer_id,
+                target.destination_dir.clone(),
+                DROP_AUTHORIZATION_TTL,
+            );
+            let effects = coordinator.complete_target_resolution(
+                session_id,
+                transfer_id,
+                Ok(target.summary(authorization)),
+            );
+            if effects.is_empty() {
+                drop_authorizations.revoke_session(session_id);
+            }
+            effects
+        }
+        DragTargetResolutionEvent::Failed {
+            session_id,
+            transfer_id,
+            reason,
+        } => coordinator.complete_target_resolution(session_id, transfer_id, Err(reason)),
+    }
+}
+
+fn prepare_drag_manifest(
+    transfer_id: Uuid,
+    source_paths: &[String],
+    session_id: Uuid,
+    authorization: Uuid,
+    max_bytes: u64,
+) -> anyhow::Result<FileTransferManifest> {
+    let mut manifest = manifest_from_source_paths(transfer_id, source_paths)?;
+    if manifest.total_bytes > max_bytes {
+        anyhow::bail!(
+            "{} bytes exceeds the {} byte transfer limit",
+            manifest.total_bytes,
+            max_bytes
+        );
+    }
+    manifest.destination = FileTransferDestination::AuthorizedDrop {
+        session_id,
+        authorization,
+    };
+    Ok(manifest)
+}
+
 struct DragDropRuntime {
     target: Option<EdgeDropTarget>,
     installed_edge: Option<Edge>,
@@ -2693,13 +2985,21 @@ fn start_drag_drop_runtime(config: &AppConfig) -> Option<DragDropRuntime> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct DragEffectContext<'a> {
+    config: &'a AppConfig,
+    drop_authorizations: &'a DropAuthorizationRegistry,
+    target_resolution_results: &'a mpsc::UnboundedSender<DragTargetResolutionEvent>,
+    connection_commands: &'a mpsc::UnboundedSender<ConnectionCommand>,
+    bulk_commands: &'a [mpsc::UnboundedSender<BulkTransferCommand>],
+    updates: &'a Sender<TaggedSessionUpdate>,
+    runtime_session_id: u64,
+}
+
 fn drain_local_drag_events(
     coordinator: &mut DragDropCoordinator,
     drag_runtime: &mut Option<DragDropRuntime>,
-    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
-    updates: &Sender<TaggedSessionUpdate>,
-    runtime_session_id: u64,
+    context: DragEffectContext<'_>,
 ) {
     let events = drag_runtime
         .as_ref()
@@ -2724,24 +3024,14 @@ fn drain_local_drag_events(
                 destination: None,
             }],
         };
-        apply_drag_effects(
-            effects,
-            drag_runtime,
-            connection_commands,
-            bulk_commands,
-            updates,
-            runtime_session_id,
-        );
+        apply_drag_effects(effects, drag_runtime, context);
     }
 }
 
 fn apply_drag_effects(
     effects: Vec<DragEffect>,
     drag_runtime: &mut Option<DragDropRuntime>,
-    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
-    updates: &Sender<TaggedSessionUpdate>,
-    runtime_session_id: u64,
+    context: DragEffectContext<'_>,
 ) {
     for effect in effects {
         match effect {
@@ -2751,8 +3041,8 @@ fn apply_drag_effects(
                 };
                 if let Err(error) = runtime.install_edge(edge) {
                     send_drag_drop_status(
-                        updates,
-                        runtime_session_id,
+                        context.updates,
+                        context.runtime_session_id,
                         format!("拖放边缘监听失败：{error}"),
                         None,
                     );
@@ -2764,23 +3054,106 @@ fn apply_drag_effects(
                 }
             }
             DragEffect::Send(message) => {
-                let _ = connection_commands.send(ConnectionCommand::Send(message));
+                let _ = context
+                    .connection_commands
+                    .send(ConnectionCommand::Send(message));
             }
             DragEffect::CancelBulk { transfer_id } => {
-                for commands in bulk_commands {
+                for commands in context.bulk_commands {
                     let _ = commands.send(BulkTransferCommand::Cancel(transfer_id));
                 }
             }
             DragEffect::Status { state, destination } => {
-                send_drag_drop_status(updates, runtime_session_id, state, destination);
+                send_drag_drop_status(
+                    context.updates,
+                    context.runtime_session_id,
+                    state,
+                    destination,
+                );
             }
             DragEffect::AwaitLocalRelease { .. } => {
-                send_drag_drop_status(updates, runtime_session_id, "请在目标位置松开鼠标", None);
+                send_drag_drop_status(
+                    context.updates,
+                    context.runtime_session_id,
+                    "请在目标位置松开鼠标",
+                    None,
+                );
             }
-            DragEffect::ResolveTarget { .. }
-            | DragEffect::BeginTransfer { .. }
-            | DragEffect::RevokeAuthorization { .. }
-            | DragEffect::RestoreLocalInput => {}
+            DragEffect::ResolveTarget {
+                session_id,
+                transfer_id,
+                point,
+            } => resolve_drag_target_async(
+                session_id,
+                transfer_id,
+                point,
+                context.target_resolution_results.clone(),
+            ),
+            DragEffect::BeginTransfer {
+                session_id,
+                transfer_id,
+                authorization,
+                source_paths,
+                destination: _,
+            } => {
+                let Some(commands) = context.bulk_commands.last() else {
+                    send_drag_drop_status(
+                        context.updates,
+                        context.runtime_session_id,
+                        "拖放失败：文件传输连接不可用",
+                        None,
+                    );
+                    continue;
+                };
+                match prepare_drag_manifest(
+                    transfer_id,
+                    &source_paths,
+                    session_id,
+                    authorization,
+                    context.config.sharing.max_file_transfer_bytes,
+                ) {
+                    Ok(manifest) => {
+                        let _ = context.connection_commands.send(ConnectionCommand::Send(
+                            WireMessage::DragDropTransferStarted {
+                                session_id,
+                                transfer_id,
+                            },
+                        ));
+                        if commands
+                            .send(BulkTransferCommand::SendFiles {
+                                manifest,
+                                source_paths,
+                            })
+                            .is_err()
+                        {
+                            send_drag_drop_status(
+                                context.updates,
+                                context.runtime_session_id,
+                                "拖放失败：文件传输通道已关闭",
+                                None,
+                            );
+                        }
+                    }
+                    Err(error) => send_drag_drop_status(
+                        context.updates,
+                        context.runtime_session_id,
+                        format!("拖放失败：{error}"),
+                        None,
+                    ),
+                }
+            }
+            DragEffect::RevokeAuthorization { session_id } => {
+                context.drop_authorizations.revoke_session(session_id);
+            }
+            DragEffect::RestoreLocalInput => {
+                if let Err(error) = release_local_left_button() {
+                    send_session_update(
+                        context.updates,
+                        context.runtime_session_id,
+                        SessionUpdate::Log(format!("结束本机拖拽失败：{error}")),
+                    );
+                }
+            }
         }
     }
 }
