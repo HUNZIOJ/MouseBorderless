@@ -130,7 +130,8 @@ impl DragDropCoordinator {
             Role::Agent => DragDirection::AgentToController,
         };
         let mut session = DragDropSession::new(session_id, transfer_id, direction, source_paths);
-        if self.role == Role::Agent {
+        let target_selecting = self.role == Role::Agent || self.control_mode == ControlMode::Remote;
+        if target_selecting {
             let _ = session.begin_remote_target_selection();
         }
         self.active = Some(session);
@@ -147,7 +148,7 @@ impl DragDropCoordinator {
                 destination: None,
             },
         ];
-        if self.role == Role::Agent {
+        if target_selecting {
             effects.push(DragEffect::Status {
                 state: "正在选择目标目录".to_string(),
                 destination: None,
@@ -790,6 +791,27 @@ mod tests {
         );
 
         let effects = coordinator.set_control_mode(ControlMode::Remote);
+
+        assert_eq!(
+            coordinator.active_session().unwrap().phase(),
+            &DragDropPhase::RemoteTargetSelecting
+        );
+        assert!(effects.contains(&DragEffect::Status {
+            state: "正在选择目标目录".to_string(),
+            destination: None,
+        }));
+    }
+
+    #[test]
+    fn controller_drag_detected_after_edge_crossing_starts_remote_selection_immediately() {
+        let mut coordinator = DragDropCoordinator::new(Role::Controller);
+        coordinator.set_control_mode(ControlMode::Remote);
+
+        let effects = coordinator.begin_local_drag(
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            vec!["C:\\src\\report.pdf".to_string()],
+        );
 
         assert_eq!(
             coordinator.active_session().unwrap().phase(),
