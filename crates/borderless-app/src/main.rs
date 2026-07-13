@@ -26,4 +26,19 @@ mod ui_compile_tests {
         fn accepts_window(_: Option<crate::ui::AppWindow>) {}
         accepts_window(None);
     }
+
+    #[test]
+    fn generated_slint_window_exposes_control_desk_contract() {
+        fn accepts_contract(window: &crate::ui::AppWindow) {
+            window.set_controller_role(true);
+            window.set_target_host("192.168.1.2".into());
+            window.set_target_port(24800);
+            window.set_connection_label("已停止".into());
+            window.set_transfer_active(false);
+            window.on_start_requested(|| {});
+            window.on_stop_requested(|| {});
+        }
+
+        let _ = accepts_contract;
+    }
 }

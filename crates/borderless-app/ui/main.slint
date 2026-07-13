@@ -1,16 +1,385 @@
-import { Button, VerticalBox } from "std-widgets.slint";
+import {
+    Button, CheckBox, ComboBox, LineEdit, ListView, ProgressIndicator,
+    SpinBox, Switch
+} from "std-widgets.slint";
+
+export struct ActivityRow {
+    time: string,
+    kind: string,
+    message: string,
+}
 
 export component AppWindow inherits Window {
     title: "Borderless";
     preferred-width: 1080px;
     preferred-height: 660px;
+    min-width: 920px;
+    min-height: 600px;
+    background: #f3f5f6;
 
-    VerticalBox {
-        Text {
-            text: "Borderless";
-            font-size: 20px;
-            font-weight: 700;
+    in-out property <bool> controller-role: true;
+    in-out property <string> target-host: "192.168.1.2";
+    in-out property <int> target-port: 24800;
+    in-out property <string> listen-host: "0.0.0.0";
+    in-out property <int> listen-port: 24800;
+    in-out property <int> remote-position-index: 1;
+    in-out property <bool> clipboard-text: true;
+    in-out property <bool> clipboard-html: true;
+    in-out property <bool> clipboard-images: true;
+    in-out property <bool> file-copy-paste: true;
+    in-out property <bool> file-drag-drop: true;
+
+    in property <string> connection-label: "已停止";
+    in property <string> latency-label: "-";
+    in property <string> control-label: "本机";
+    in property <bool> connected: false;
+    in property <bool> running: false;
+    in property <bool> transfer-active: false;
+    in property <float> transfer-progress: 0;
+    in property <string> transfer-file: "";
+    in property <string> transfer-detail: "";
+    in property <string> transfer-destination: "";
+    in-out property <string> config-error-message: "";
+    in property <string> runtime-error-message: "";
+    in property <[ActivityRow]> activities: [];
+
+    in-out property <bool> advanced-visible: false;
+    in-out property <int> bulk-port: 24802;
+    in-out property <string> cache-directory: "";
+    in-out property <string> max-clipboard-bytes: "33554432";
+    in-out property <string> max-file-bytes: "21474836480";
+    in-out property <int> edge-trigger-px: 2;
+    in-out property <bool> debug-logging: false;
+
+    callback save-requested();
+    callback start-requested();
+    callback stop-requested();
+    callback reconnect-requested();
+    callback cancel-transfer-requested();
+    callback advanced-save-requested();
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 58px;
+            background: #172126;
+
+            HorizontalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                alignment: space-between;
+
+                Text {
+                    text: "Borderless";
+                    color: white;
+                    font-size: 18px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+
+                    Text {
+                        text: root.connection-label + " · TCP · " + root.latency-label;
+                        color: root.connected ? #bdebd8 : #d7dde0;
+                        vertical-alignment: center;
+                    }
+
+                    Button {
+                        width: 38px;
+                        height: 34px;
+                        icon: @image-url("../assets/icons/settings.svg");
+                        accessible-label: "高级设置";
+                        clicked => { root.advanced-visible = true; }
+                    }
+
+                    Button {
+                        visible: root.running;
+                        width: 38px;
+                        height: 34px;
+                        icon: @image-url("../assets/icons/refresh-cw.svg");
+                        accessible-label: "重新连接";
+                        clicked => { root.reconnect-requested(); }
+                    }
+
+                    Button {
+                        min-width: 126px;
+                        height: 34px;
+                        text: root.running ? "停止共享" : "开始共享";
+                        icon: root.running
+                            ? @image-url("../assets/icons/square.svg")
+                            : @image-url("../assets/icons/play.svg");
+                        clicked => {
+                            if root.running { root.stop-requested(); }
+                            else { root.start-requested(); }
+                        }
+                    }
+                }
+            }
         }
-        Button { text: "界面加载成功"; }
+
+        HorizontalLayout {
+            spacing: 0px;
+
+            Rectangle {
+                width: 370px;
+                background: white;
+
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "连接设置";
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: "控制端";
+                            enabled: !root.controller-role;
+                            clicked => { root.controller-role = true; }
+                        }
+                        Button {
+                            text: "被控端";
+                            enabled: root.controller-role;
+                            clicked => { root.controller-role = false; }
+                        }
+                    }
+
+                    Text {
+                        text: root.controller-role ? "目标电脑" : "监听地址";
+                        color: #55646b;
+                    }
+                    if root.controller-role : LineEdit { text <=> root.target-host; }
+                    if !root.controller-role : LineEdit { text <=> root.listen-host; }
+
+                    Text { text: "TCP 端口"; color: #55646b; }
+                    if root.controller-role : SpinBox {
+                        value <=> root.target-port;
+                        minimum: 1;
+                        maximum: 65535;
+                    }
+                    if !root.controller-role : SpinBox {
+                        value <=> root.listen-port;
+                        minimum: 1;
+                        maximum: 65535;
+                    }
+
+                    if root.controller-role : VerticalLayout {
+                        spacing: 8px;
+                        Text { text: "目标电脑的位置"; color: #55646b; }
+                        ComboBox {
+                            model: ["左侧", "右侧", "上方", "下方"];
+                            current-index <=> root.remote-position-index;
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #e2e6e8; }
+
+                    Text {
+                        text: "共享内容";
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Switch { text: "文本"; checked <=> root.clipboard-text; }
+                    Switch { text: "富文本"; checked <=> root.clipboard-html; }
+                    Switch { text: "图片"; checked <=> root.clipboard-images; }
+                    Switch { text: "复制文件"; checked <=> root.file-copy-paste; }
+                    Switch { text: "文件拖放"; checked <=> root.file-drag-drop; }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    Button {
+                        height: 36px;
+                        text: "保存设置";
+                        icon: @image-url("../assets/icons/save.svg");
+                        clicked => { root.save-requested(); }
+                    }
+                }
+            }
+
+            Rectangle { width: 1px; background: #d4dade; }
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        text: "实时状态";
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.connected ? "两台电脑运行正常" : root.connection-label;
+                        color: #68777e;
+                    }
+                }
+
+                Rectangle {
+                    height: 118px;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d2d9dc;
+                    border-radius: 6px;
+
+                    HorizontalLayout {
+                        padding: 16px;
+                        alignment: space-between;
+                        Text {
+                            text: "本机\n" + (root.controller-role ? "控制端" : "被控端");
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "TCP";
+                            color: #137d66;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "远程电脑\n" + root.control-label;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    visible: root.transfer-active;
+                    height: 104px;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d7dddf;
+                    border-radius: 6px;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            alignment: space-between;
+                            Text {
+                                text: root.transfer-file;
+                                font-weight: 700;
+                                overflow: elide;
+                            }
+                            Button {
+                                width: 64px;
+                                text: "取消";
+                                clicked => { root.cancel-transfer-requested(); }
+                            }
+                        }
+                        ProgressIndicator { progress: root.transfer-progress; }
+                        Text {
+                            text: root.transfer-detail + " · " + root.transfer-destination;
+                            color: #68777e;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d2d9dc;
+                    border-radius: 6px;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        Text { text: "最近活动"; font-weight: 700; }
+                        ListView {
+                            vertical-stretch: 1;
+                            for row in root.activities : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { width: 52px; text: row.time; color: #68777e; }
+                                Text { width: 64px; text: row.kind; color: #137d66; }
+                                Text { text: row.message; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    visible: root.config-error-message != "" || root.runtime-error-message != "";
+                    text: root.config-error-message != ""
+                        ? root.config-error-message
+                        : root.runtime-error-message;
+                    color: #b43e3e;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    if root.advanced-visible : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #17212699;
+
+        Rectangle {
+            width: 430px;
+            height: 500px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: white;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        text: "高级设置";
+                        font-size: 18px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        width: 36px;
+                        height: 34px;
+                        icon: @image-url("../assets/icons/x.svg");
+                        accessible-label: "关闭高级设置";
+                        clicked => { root.advanced-visible = false; }
+                    }
+                }
+
+                Text { text: "批量传输 TCP 端口"; color: #55646b; }
+                SpinBox { value <=> root.bulk-port; minimum: 1; maximum: 65535; }
+                Text { text: "接收缓存目录"; color: #55646b; }
+                LineEdit { text <=> root.cache-directory; }
+                Text { text: "最大剪贴板字节数"; color: #55646b; }
+                LineEdit { text <=> root.max-clipboard-bytes; input-type: number; }
+                Text { text: "最大文件字节数"; color: #55646b; }
+                LineEdit { text <=> root.max-file-bytes; input-type: number; }
+                Text { text: "边缘触发宽度"; color: #55646b; }
+                SpinBox { value <=> root.edge-trigger-px; minimum: 1; maximum: 32; }
+                CheckBox { text: "调试日志"; checked <=> root.debug-logging; }
+
+                Rectangle { vertical-stretch: 1; }
+
+                Button {
+                    height: 36px;
+                    text: "保存高级设置";
+                    icon: @image-url("../assets/icons/save.svg");
+                    clicked => {
+                        root.advanced-save-requested();
+                        root.advanced-visible = false;
+                    }
+                }
+            }
+        }
     }
 }
