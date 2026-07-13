@@ -20,7 +20,6 @@ bincode = "1"
 crossbeam-channel = "0.5"
 eframe = "0.28"
 egui = "0.28"
-kcp-tokio = "0.7"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }

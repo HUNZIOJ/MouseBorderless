@@ -1,17 +1,10 @@
 use crate::{
-    kcp_transport::{KcpFramedReader, KcpFramedTransport, KcpFramedWriter},
-    latest_pointer::{send_pointer, source_matches_peer, LatestPointerSession, PointerPacket},
     tcp_transport::{TcpFramedReader, TcpFramedTransport, TcpFramedWriter},
-    transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
+    transport::{ConnectionCommand, ConnectionEvent, TcpConnectionSettings},
 };
-use borderless_core::{
-    config::TransportMode,
-    input_event::{InputEvent, MouseMoveAbsEvent},
-    protocol::WireMessage,
-};
-use std::net::SocketAddr;
+use borderless_core::protocol::WireMessage;
 use tokio::{
-    net::{TcpListener, UdpSocket},
+    net::TcpListener,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
     time::{sleep, Duration},
@@ -29,27 +22,18 @@ enum ReliableDriverEvent {
     Error(String),
 }
 
-struct KcpPointerEndpoint {
-    socket: UdpSocket,
-    peer: SocketAddr,
-    target: String,
-}
-
 pub async fn run_agent_server(
-    settings: TransportSettings,
+    settings: TcpConnectionSettings,
     events: UnboundedSender<ConnectionEvent>,
     mut commands: UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<()> {
     emit(&events, ConnectionEvent::Waiting);
 
-    match settings.mode {
-        TransportMode::Tcp => run_tcp_server(settings, events, &mut commands).await,
-        TransportMode::Kcp => run_kcp_server(settings, events, &mut commands).await,
-    }
+    run_tcp_server(settings, events, &mut commands).await
 }
 
 async fn run_tcp_server(
-    settings: TransportSettings,
+    settings: TcpConnectionSettings,
     events: UnboundedSender<ConnectionEvent>,
     commands: &mut UnboundedReceiver<ConnectionCommand>,
 ) -> anyhow::Result<()> {
@@ -65,7 +49,6 @@ async fn run_tcp_server(
                     &events,
                     ConnectionEvent::Connected {
                         peer: peer.to_string(),
-                        mode: settings.mode,
                     },
                 );
                 if run_tcp_connection(transport, &events, commands).await? {
@@ -79,71 +62,9 @@ async fn run_tcp_server(
                 emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
             }
             command = commands.recv() => {
-                if matches!(command, Some(ConnectionCommand::Stop) | None) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn run_kcp_server(
-    settings: TransportSettings,
-    events: UnboundedSender<ConnectionEvent>,
-    commands: &mut UnboundedReceiver<ConnectionCommand>,
-) -> anyhow::Result<()> {
-    emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
-    let listener = KcpFramedTransport::bind(&settings.peer_addr()).await?;
-    let mut pointer_session = LatestPointerSession::default();
-
-    loop {
-        tokio::select! {
-            accepted = KcpFramedTransport::accept(&listener) => {
-                let accepted = accepted?;
-                let peer = accepted.peer;
-                let peer_display = peer.to_string();
-                let pointer_endpoint = match prepare_kcp_pointer_endpoint(peer, &settings).await {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
-                        emit(&events, ConnectionEvent::Error(err.to_string()));
-                        emit(&events, ConnectionEvent::Disconnected(peer_display));
-                        if wait_after_disconnect_backoff(commands, Duration::from_millis(500)).await {
-                            return Ok(());
-                        }
-                        emit(&events, ConnectionEvent::Waiting);
-                        emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
-                        continue;
-                    }
-                };
-                pointer_session.begin_reliable_session();
-                emit(
-                    &events,
-                    ConnectionEvent::Connected {
-                        peer: peer_display.clone(),
-                        mode: settings.mode,
-                    },
-                );
-                if run_kcp_connection(
-                    accepted.transport,
-                    &events,
-                    commands,
-                    &mut pointer_session,
-                    pointer_endpoint,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                emit(&events, ConnectionEvent::Disconnected(peer_display));
-                if wait_after_disconnect_backoff(commands, Duration::from_millis(500)).await {
-                    return Ok(());
-                }
-                emit(&events, ConnectionEvent::Waiting);
-                emit(&events, ConnectionEvent::Connecting(settings.peer_addr()));
-            }
-            command = commands.recv() => {
-                if matches!(command, Some(ConnectionCommand::Stop) | None) {
-                    return Ok(());
+                match command {
+                    Some(ConnectionCommand::Stop) | None => return Ok(()),
+                    Some(ConnectionCommand::Send(_)) => {}
                 }
             }
         }
@@ -161,16 +82,9 @@ async fn run_tcp_connection(
         tokio::select! {
             command = commands.recv() => {
                 match command {
-                    Some(ConnectionCommand::SendReliable(message)) => {
+                    Some(ConnectionCommand::Send(message)) => {
                         if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
-                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
-                            return Ok(false);
-                        }
-                    }
-                    Some(ConnectionCommand::SendLatestPointer { x, y }) => {
-                        let message = latest_pointer_as_reliable(x, y);
-                        if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
-                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
+                            emit(events, ConnectionEvent::Error("TCP control channel closed".to_string()));
                             return Ok(false);
                         }
                     }
@@ -195,113 +109,6 @@ async fn run_tcp_connection(
             }
         }
     }
-}
-
-async fn run_kcp_connection(
-    transport: KcpFramedTransport,
-    events: &UnboundedSender<ConnectionEvent>,
-    commands: &mut UnboundedReceiver<ConnectionCommand>,
-    pointer_session: &mut LatestPointerSession,
-    pointer_endpoint: KcpPointerEndpoint,
-) -> anyhow::Result<bool> {
-    let pointer_socket = pointer_endpoint.socket;
-    let pointer_peer = pointer_endpoint.peer;
-    let pointer_target = pointer_endpoint.target;
-    let mut pointer_buf = [0u8; 64];
-    let (driver_tx, driver, mut driver_events) = spawn_kcp_driver(transport);
-
-    loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(ConnectionCommand::SendReliable(message)) => {
-                        if driver_tx.send(ReliableDriverCommand::Send(message)).is_err() {
-                            emit(events, ConnectionEvent::Error("reliable transport closed".to_string()));
-                            return Ok(false);
-                        }
-                    }
-                    Some(ConnectionCommand::SendLatestPointer { x, y }) => {
-                        let packet = pointer_session.next_packet(x, y);
-                        if let Err(err) = send_pointer(&pointer_socket, &pointer_target, packet).await {
-                            emit(events, ConnectionEvent::Error(err.to_string()));
-                        }
-                    }
-                    Some(ConnectionCommand::Stop) | None => {
-                        stop_driver(driver_tx, driver).await;
-                        return Ok(true);
-                    }
-                }
-            }
-            received = pointer_socket.recv_from(&mut pointer_buf) => {
-                match received {
-                    Ok((len, source)) => {
-                        if source_matches_peer(source, pointer_peer) {
-                            match PointerPacket::decode(&pointer_buf[..len]) {
-                                Ok(packet) => {
-                                    let stale_before = pointer_session.stale_pointer_packets();
-                                    if let Some((x, y)) = pointer_session.accept(packet) {
-                                        emit(
-                                            events,
-                                            ConnectionEvent::LatestPointer {
-                                                x,
-                                                y,
-                                                sequence: packet.sequence,
-                                            },
-                                        );
-                                    } else {
-                                        let stale_after = pointer_session.stale_pointer_packets();
-                                        if stale_after > stale_before {
-                                            emit(
-                                                events,
-                                                ConnectionEvent::StalePointerPackets {
-                                                    count: stale_after,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
-                            }
-                        }
-                    }
-                    Err(err) => emit(events, ConnectionEvent::Error(err.to_string())),
-                }
-            }
-            driver_event = driver_events.recv() => {
-                match driver_event {
-                    Some(ReliableDriverEvent::Frame(message)) => {
-                        emit(events, ConnectionEvent::Message(message));
-                    }
-                    Some(ReliableDriverEvent::Error(error)) => {
-                        emit(events, ConnectionEvent::Error(error));
-                        stop_driver(driver_tx, driver).await;
-                        return Ok(false);
-                    }
-                    None => return Ok(false),
-                }
-            }
-        }
-    }
-}
-
-fn latest_pointer_as_reliable(x: i32, y: i32) -> WireMessage {
-    WireMessage::Input(InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x, y }))
-}
-
-fn kcp_pointer_peer(peer: SocketAddr, settings: &TransportSettings) -> SocketAddr {
-    SocketAddr::new(peer.ip(), settings.pointer_port)
-}
-
-async fn prepare_kcp_pointer_endpoint(
-    peer: SocketAddr,
-    settings: &TransportSettings,
-) -> anyhow::Result<KcpPointerEndpoint> {
-    let pointer_peer = kcp_pointer_peer(peer, settings);
-    Ok(KcpPointerEndpoint {
-        socket: UdpSocket::bind(settings.pointer_addr()?).await?,
-        peer: pointer_peer,
-        target: pointer_peer.to_string(),
-    })
 }
 
 async fn wait_after_disconnect_backoff(
@@ -317,8 +124,7 @@ async fn wait_after_disconnect_backoff(
             command = commands.recv() => {
                 match command {
                     Some(ConnectionCommand::Stop) | None => return true,
-                    Some(ConnectionCommand::SendReliable(_))
-                    | Some(ConnectionCommand::SendLatestPointer { .. }) => {}
+                    Some(ConnectionCommand::Send(_)) => {}
                 }
             }
         }
@@ -327,17 +133,6 @@ async fn wait_after_disconnect_backoff(
 
 fn spawn_tcp_driver(
     transport: TcpFramedTransport,
-) -> (
-    UnboundedSender<ReliableDriverCommand>,
-    JoinHandle<()>,
-    UnboundedReceiver<ReliableDriverEvent>,
-) {
-    let (reader, writer) = transport.split();
-    spawn_driver(reader, writer)
-}
-
-fn spawn_kcp_driver(
-    transport: KcpFramedTransport,
 ) -> (
     UnboundedSender<ReliableDriverCommand>,
     JoinHandle<()>,
@@ -429,16 +224,6 @@ impl ReliableReader for TcpFramedReader {
     }
 }
 
-impl ReliableReader for KcpFramedReader {
-    fn read_frame(
-        &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<borderless_core::protocol::DecodedFrame>>
-           + Send
-           + '_ {
-        KcpFramedReader::read_frame(self)
-    }
-}
-
 trait ReliableWriter {
     fn send<'a>(
         &'a mut self,
@@ -455,15 +240,6 @@ impl ReliableWriter for TcpFramedWriter {
     }
 }
 
-impl ReliableWriter for KcpFramedWriter {
-    fn send<'a>(
-        &'a mut self,
-        message: &'a WireMessage,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
-        KcpFramedWriter::send(self, message)
-    }
-}
-
 fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {
     let _ = events.send(event);
 }
@@ -471,12 +247,6 @@ fn emit(events: &UnboundedSender<ConnectionEvent>, event: ConnectionEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borderless_core::{
-        config::TransportMode,
-        geometry::Rect,
-        protocol::{Hello, PROTOCOL_VERSION},
-    };
-    use std::net::{IpAddr, Ipv4Addr};
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
@@ -485,7 +255,7 @@ mod tests {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
 
         command_tx
-            .send(ConnectionCommand::SendLatestPointer { x: 1, y: 2 })
+            .send(ConnectionCommand::Send(WireMessage::ReleaseAll))
             .unwrap();
 
         let delayed = timeout(
@@ -525,22 +295,19 @@ mod tests {
     #[tokio::test]
     async fn agent_reports_disconnect_when_reliable_channel_is_idle() {
         let reliable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let reliable_port = reliable_listener.local_addr().unwrap().port();
+        let port = reliable_listener.local_addr().unwrap().port();
         drop(reliable_listener);
-        let pointer_port = unused_udp_port().await;
 
-        let settings = TransportSettings {
-            mode: TransportMode::Tcp,
+        let settings = TcpConnectionSettings {
             host: "127.0.0.1".to_string(),
-            reliable_port,
-            pointer_port,
+            port,
         };
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let agent = tokio::spawn(run_agent_server(settings, event_tx, command_rx));
 
         wait_for_connecting(&mut event_rx).await;
-        let client = tokio::net::TcpStream::connect(format!("127.0.0.1:{reliable_port}"))
+        let client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let _client = client;
@@ -559,62 +326,6 @@ mod tests {
     #[test]
     fn reliable_read_timeout_allows_drag_handoff_and_bulk_transfer_jitter() {
         assert!(RELIABLE_READ_TIMEOUT >= Duration::from_secs(5));
-    }
-
-    #[test]
-    fn kcp_pointer_peer_uses_reliable_peer_ip_and_configured_pointer_port() {
-        let settings = TransportSettings {
-            mode: TransportMode::Kcp,
-            host: "127.0.0.1".to_string(),
-            reliable_port: 24800,
-            pointer_port: 24801,
-        };
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 49152);
-
-        assert_eq!(
-            kcp_pointer_peer(peer, &settings),
-            SocketAddr::new(peer.ip(), settings.pointer_port)
-        );
-    }
-
-    #[tokio::test]
-    async fn kcp_agent_reports_pointer_setup_error_before_connected() {
-        let reliable_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let reliable_port = reliable_listener.local_addr().unwrap().port();
-        drop(reliable_listener);
-        let occupied_pointer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pointer_port = occupied_pointer.local_addr().unwrap().port();
-
-        let settings = TransportSettings {
-            mode: TransportMode::Kcp,
-            host: "127.0.0.1".to_string(),
-            reliable_port,
-            pointer_port,
-        };
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let agent = tokio::spawn(run_agent_server(settings, event_tx, command_rx));
-
-        wait_for_connecting(&mut event_rx).await;
-        let mut client = KcpFramedTransport::connect(&format!("127.0.0.1:{reliable_port}"))
-            .await
-            .unwrap();
-        client
-            .send(&WireMessage::Hello(Hello {
-                protocol_version: PROTOCOL_VERSION,
-                desktop: Rect::new(0, 0, 1920, 1080),
-            }))
-            .await
-            .unwrap();
-
-        let first_setup_event = next_connected_or_error(&mut event_rx).await;
-        assert!(
-            matches!(first_setup_event, ConnectionEvent::Error(_)),
-            "expected pointer setup error before Connected, got {first_setup_event:?}"
-        );
-
-        command_tx.send(ConnectionCommand::Stop).unwrap();
-        agent.await.unwrap().unwrap();
     }
 
     async fn wait_for_connecting(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
@@ -637,7 +348,7 @@ mod tests {
 
     async fn wait_for_disconnected(event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>) {
         loop {
-            match timeout(
+            if let ConnectionEvent::Disconnected(_) = timeout(
                 RELIABLE_READ_TIMEOUT + Duration::from_secs(1),
                 event_rx.recv(),
             )
@@ -645,34 +356,7 @@ mod tests {
             .unwrap()
             .unwrap()
             {
-                ConnectionEvent::Disconnected(_) => return,
-                _ => {}
-            }
-        }
-    }
-
-    async fn unused_udp_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    async fn next_connected_or_error(
-        event_rx: &mut mpsc::UnboundedReceiver<ConnectionEvent>,
-    ) -> ConnectionEvent {
-        loop {
-            match timeout(Duration::from_secs(2), event_rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                event @ (ConnectionEvent::Connected { .. } | ConnectionEvent::Error(_)) => {
-                    return event
-                }
-                _ => {}
+                return;
             }
         }
     }

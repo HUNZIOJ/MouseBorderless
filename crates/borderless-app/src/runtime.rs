@@ -28,7 +28,7 @@ use borderless_net::{
         BulkTransferCommand, BulkTransferEvent,
     },
     controller_client::run_controller_client,
-    transport::{ConnectionCommand, ConnectionEvent, TransportSettings},
+    transport::{ConnectionCommand, ConnectionEvent, TcpConnectionSettings},
 };
 use borderless_win::{
     clipboard::{write_clipboard, ClipboardEvent, ClipboardMonitor, ClipboardReadOptions},
@@ -143,7 +143,7 @@ impl ActiveRuntime {
         {
             let _ = self
                 .connection_commands
-                .send(ConnectionCommand::SendReliable(WireMessage::ReleaseAll));
+                .send(ConnectionCommand::Send(WireMessage::ReleaseAll));
         }
         let _ = self.session_commands.send(SessionCommand::Stop);
         let _ = self.connection_commands.send(ConnectionCommand::Stop);
@@ -373,7 +373,7 @@ fn start_controller_session(
     updates: Sender<TaggedSessionUpdate>,
 ) -> Result<ActiveRuntime, String> {
     let local_desktop = virtual_desktop_rect();
-    let settings = controller_transport_settings(&config);
+    let settings = controller_connection_settings(&config);
     let (connection_events_tx, connection_events_rx) = mpsc::unbounded_channel();
     let (connection_commands_tx, connection_commands_rx) = mpsc::unbounded_channel();
     let (session_commands_tx, session_commands_rx) = mpsc::unbounded_channel();
@@ -444,7 +444,7 @@ fn start_agent_session(
     updates: Sender<TaggedSessionUpdate>,
 ) -> Result<ActiveRuntime, String> {
     let local_desktop = virtual_desktop_rect();
-    let settings = agent_transport_settings(&config);
+    let settings = agent_connection_settings(&config);
     let (connection_events_tx, connection_events_rx) = mpsc::unbounded_channel();
     let (connection_commands_tx, connection_commands_rx) = mpsc::unbounded_channel();
     let (session_commands_tx, session_commands_rx) = mpsc::unbounded_channel();
@@ -837,7 +837,7 @@ fn handle_controller_connection_event(
                     "protocol version mismatch: expected {}, got {}",
                     PROTOCOL_VERSION, hello.protocol_version
                 );
-                let _ = connection_commands.send(ConnectionCommand::SendReliable(
+                let _ = connection_commands.send(ConnectionCommand::Send(
                     WireMessage::Error(error.clone()),
                 ));
                 send_session_update(updates, session_id, SessionUpdate::Error(error));
@@ -1028,7 +1028,7 @@ impl RemoteInputSendBuffer {
 
     fn send_reliable_input(&mut self, event: InputEvent) -> Vec<RemoteSendAction> {
         let mut actions = self.flush_pending_move();
-        actions.push(RemoteSendAction::Command(ConnectionCommand::SendReliable(
+        actions.push(RemoteSendAction::Command(ConnectionCommand::Send(
             WireMessage::Input(event),
         )));
         actions
@@ -1036,7 +1036,7 @@ impl RemoteInputSendBuffer {
 
     fn send_release_all(&mut self) -> Vec<RemoteSendAction> {
         let mut actions = self.flush_pending_move();
-        actions.push(RemoteSendAction::Command(ConnectionCommand::SendReliable(
+        actions.push(RemoteSendAction::Command(ConnectionCommand::Send(
             WireMessage::ReleaseAll,
         )));
         actions
@@ -1136,10 +1136,12 @@ fn emit_before_clearing_remote_control(
 }
 
 fn latest_pointer_command(point: Point) -> ConnectionCommand {
-    ConnectionCommand::SendLatestPointer {
-        x: point.x,
-        y: point.y,
-    }
+    ConnectionCommand::Send(WireMessage::Input(InputEvent::MouseMoveAbs(
+        MouseMoveAbsEvent {
+            x: point.x,
+            y: point.y,
+        },
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1668,7 +1670,7 @@ fn handle_agent_connection_event(
     match event {
         ConnectionEvent::Connected { .. } => {
             *injector = Some(InputInjector::new(local_desktop));
-            let _ = connection_commands.send(ConnectionCommand::SendReliable(WireMessage::Hello(
+            let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::Hello(
                 Hello {
                     protocol_version: PROTOCOL_VERSION,
                     desktop: local_desktop,
@@ -1818,9 +1820,7 @@ fn handle_heartbeat_message(
     if let Some(rtt) = heartbeat.receive(message.sent_millis, now) {
         send_session_update(updates, session_id, SessionUpdate::Rtt(rtt));
     } else {
-        let _ = connection_commands.send(ConnectionCommand::SendReliable(WireMessage::Heartbeat(
-            message,
-        )));
+        let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::Heartbeat(message)));
     }
 }
 
@@ -1830,13 +1830,13 @@ fn send_heartbeat(
 ) {
     let sent_millis = now_millis();
     heartbeat.sent(sent_millis);
-    let _ = connection_commands.send(ConnectionCommand::SendReliable(WireMessage::Heartbeat(
-        Heartbeat { sent_millis },
-    )));
+    let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::Heartbeat(Heartbeat {
+        sent_millis,
+    })));
 }
 
 fn send_release_all(connection_commands: &mpsc::UnboundedSender<ConnectionCommand>) {
-    let _ = connection_commands.send(ConnectionCommand::SendReliable(WireMessage::ReleaseAll));
+    let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::ReleaseAll));
 }
 
 fn set_hook_suppression(hook_manager: &Arc<Mutex<HookManager>>, suppression_mode: SuppressionMode) {
@@ -2206,7 +2206,7 @@ fn handle_clipboard_event(
                     }
 
                     if connection_commands
-                        .send(ConnectionCommand::SendReliable(WireMessage::ClipboardData(
+                        .send(ConnectionCommand::Send(WireMessage::ClipboardData(
                             envelope,
                         )))
                         .is_ok()
@@ -2282,9 +2282,9 @@ fn handle_local_clipboard_file_offer(
                 return;
             }
             if connection_commands
-                .send(ConnectionCommand::SendReliable(
-                    WireMessage::FileTransferOffer(manifest.clone()),
-                ))
+                .send(ConnectionCommand::Send(WireMessage::FileTransferOffer(
+                    manifest.clone(),
+                )))
                 .is_err()
             {
                 send_session_update(
@@ -2708,9 +2708,9 @@ fn send_drag_drop_cancel(
     connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
     session_id: Uuid,
 ) {
-    let _ = connection_commands.send(ConnectionCommand::SendReliable(
-        WireMessage::DragDropCancel { session_id },
-    ));
+    let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::DragDropCancel {
+        session_id,
+    }));
 }
 
 /// Resolve the release point into a directory off the async pump thread and
@@ -2730,7 +2730,7 @@ fn resolve_drop_target_and_reply(
                 "destination resolved for remote drop",
                 Some(target.destination_dir.clone()),
             );
-            let _ = connection_commands.send(ConnectionCommand::SendReliable(
+            let _ = connection_commands.send(ConnectionCommand::Send(
                 WireMessage::DragDropTargetResolved {
                     session_id: dd_session_id,
                     target,
@@ -2744,7 +2744,7 @@ fn resolve_drop_target_and_reply(
                 format!("destination resolution failed: {error}"),
                 None,
             );
-            let _ = connection_commands.send(ConnectionCommand::SendReliable(
+            let _ = connection_commands.send(ConnectionCommand::Send(
                 WireMessage::DragDropTargetFailed {
                     session_id: dd_session_id,
                     reason: error.to_string(),
@@ -2992,12 +2992,11 @@ impl ControllerDragDrop {
                 return;
             };
             source.phase = DragSourcePhase::AwaitingResolution;
-            let _ = connection_commands.send(ConnectionCommand::SendReliable(
-                WireMessage::DragDropReleased {
+            let _ =
+                connection_commands.send(ConnectionCommand::Send(WireMessage::DragDropReleased {
                     session_id: source.session_id,
                     point: state.remote_point(),
-                },
-            ));
+                }));
             // End the parked native drag so Explorer stops owning the mouse.
             if let Err(error) = release_local_left_button() {
                 send_session_update(
@@ -3142,7 +3141,7 @@ impl AgentDragDrop {
                         paths,
                         phase: DragSourcePhase::LocalDetected,
                     });
-                    let _ = connection_commands.send(ConnectionCommand::SendReliable(
+                    let _ = connection_commands.send(ConnectionCommand::Send(
                         WireMessage::DragDropEntered {
                             session_id: dd_session,
                         },
@@ -3287,7 +3286,6 @@ fn send_session_update(
 fn prepare_running_status(status: &mut AppStatus, config: &AppConfig, run_state: RunState) {
     status.reset_runtime_fields();
     status.run_state = run_state;
-    status.transport_mode = Some(runtime_transport_mode(config));
     status.clipboard_enabled = clipboard_enabled(config);
 }
 
@@ -3680,9 +3678,8 @@ fn apply_connection_event_to_status(status: &mut AppStatus, event: &ConnectionEv
     match event {
         ConnectionEvent::Waiting => status.run_state = RunState::Waiting,
         ConnectionEvent::Connecting(_) => status.run_state = RunState::Connecting,
-        ConnectionEvent::Connected { mode, .. } => {
+        ConnectionEvent::Connected { .. } => {
             status.run_state = RunState::Connected;
-            status.transport_mode = Some(*mode);
             status.last_error = None;
         }
         ConnectionEvent::Disconnected(_) => status.run_state = RunState::Reconnecting,
@@ -3721,7 +3718,7 @@ fn connection_event_log(event: &ConnectionEvent) -> Option<String> {
     match event {
         ConnectionEvent::Waiting => Some("waiting for connection".to_string()),
         ConnectionEvent::Connecting(peer) => Some(format!("connection endpoint {peer}")),
-        ConnectionEvent::Connected { peer, mode } => Some(format!("connected {peer} via {mode:?}")),
+        ConnectionEvent::Connected { peer } => Some(format!("connected {peer} via TCP")),
         ConnectionEvent::Disconnected(peer) => Some(format!("disconnected {peer}")),
         ConnectionEvent::Error(error) => Some(format!("connection error: {error}")),
         ConnectionEvent::Message(WireMessage::Error(error)) => Some(format!("peer error: {error}")),
@@ -3762,28 +3759,17 @@ fn log_stop_task_outcome(
     }
 }
 
-fn runtime_transport_mode(config: &AppConfig) -> TransportMode {
-    match &config.role {
-        Role::Controller => config.controller.transport_mode,
-        Role::Agent => config.agent.transport_mode,
-    }
-}
-
-fn controller_transport_settings(config: &AppConfig) -> TransportSettings {
-    TransportSettings {
-        mode: config.controller.transport_mode,
+fn controller_connection_settings(config: &AppConfig) -> TcpConnectionSettings {
+    TcpConnectionSettings {
         host: config.controller.agent_host.clone(),
-        reliable_port: config.controller.agent_port,
-        pointer_port: config.controller.pointer_port,
+        port: config.controller.agent_port,
     }
 }
 
-fn agent_transport_settings(config: &AppConfig) -> TransportSettings {
-    TransportSettings {
-        mode: config.agent.transport_mode,
+fn agent_connection_settings(config: &AppConfig) -> TcpConnectionSettings {
+    TcpConnectionSettings {
         host: config.agent.listen_host.clone(),
-        reliable_port: config.agent.listen_port,
-        pointer_port: config.agent.pointer_port,
+        port: config.agent.listen_port,
     }
 }
 
@@ -3873,7 +3859,7 @@ fn now_millis() -> u64 {
 mod tests {
     use std::{
         fs,
-        net::{TcpListener, UdpSocket},
+        net::TcpListener,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -3893,37 +3879,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controller_transport_settings_map_controller_config() {
-        let mut config = AppConfig::default();
-        config.role = Role::Controller;
+    fn controller_connection_settings_map_controller_config() {
+        let mut config = AppConfig {
+            role: Role::Controller,
+            ..AppConfig::default()
+        };
         config.controller.agent_host = "agent.local".to_string();
         config.controller.agent_port = 34567;
         config.controller.transport_mode = TransportMode::Kcp;
         config.controller.pointer_port = 34568;
 
-        let settings = controller_transport_settings(&config);
+        let settings = controller_connection_settings(&config);
 
-        assert_eq!(settings.mode, TransportMode::Kcp);
         assert_eq!(settings.host, "agent.local");
-        assert_eq!(settings.reliable_port, 34567);
-        assert_eq!(settings.pointer_port, 34568);
+        assert_eq!(settings.port, 34567);
     }
 
     #[test]
-    fn agent_transport_settings_map_agent_config() {
-        let mut config = AppConfig::default();
-        config.role = Role::Agent;
+    fn agent_connection_settings_map_agent_config() {
+        let mut config = AppConfig {
+            role: Role::Agent,
+            ..AppConfig::default()
+        };
         config.agent.listen_host = "127.0.0.1".to_string();
         config.agent.listen_port = 45678;
         config.agent.transport_mode = TransportMode::Kcp;
         config.agent.pointer_port = 45679;
 
-        let settings = agent_transport_settings(&config);
+        let settings = agent_connection_settings(&config);
 
-        assert_eq!(settings.mode, TransportMode::Kcp);
         assert_eq!(settings.host, "127.0.0.1");
-        assert_eq!(settings.reliable_port, 45678);
-        assert_eq!(settings.pointer_port, 45679);
+        assert_eq!(settings.port, 45678);
     }
 
     #[test]
@@ -3934,11 +3920,9 @@ mod tests {
             &mut status,
             &ConnectionEvent::Connected {
                 peer: "127.0.0.1:24800".to_string(),
-                mode: TransportMode::Kcp,
             },
         );
         assert_eq!(status.run_state, RunState::Connected);
-        assert_eq!(status.transport_mode, Some(TransportMode::Kcp));
 
         apply_connection_event_to_status(
             &mut status,
@@ -4183,7 +4167,7 @@ mod tests {
 
         assert_eq!(
             connection_commands_rx.try_recv(),
-            Ok(ConnectionCommand::SendReliable(WireMessage::ClipboardData(
+            Ok(ConnectionCommand::Send(WireMessage::ClipboardData(
                 envelope
             )))
         );
@@ -4241,7 +4225,7 @@ mod tests {
             ClipboardEvent::Changed(envelope),
             &config,
             &connection_commands_tx,
-            &[bulk_commands_tx.clone()],
+            std::slice::from_ref(&bulk_commands_tx),
             &updates_tx,
             7,
             true,
@@ -4249,7 +4233,7 @@ mod tests {
 
         assert!(matches!(
             connection_commands_rx.try_recv(),
-            Ok(ConnectionCommand::SendReliable(WireMessage::FileTransferOffer(manifest)))
+            Ok(ConnectionCommand::Send(WireMessage::FileTransferOffer(manifest)))
                 if manifest.files.iter().all(|entry| !entry.relative_path.contains(':'))
                     && manifest.files.iter().any(|entry| entry.relative_path == "source.txt")
         ));
@@ -4473,7 +4457,6 @@ mod tests {
             false,
             &ConnectionEvent::Connected {
                 peer: "controller".to_string(),
-                mode: TransportMode::Tcp,
             },
         ));
         assert!(agent_clipboard_transport_ready_after_event(
@@ -4665,24 +4648,22 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 20, y: 20 }),
-                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
-                    key_down
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
+                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 20, y: 20 })
                 ))),
-                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 40, y: 40 }),
-                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
-                    left_down
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(key_down))),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
+                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 40, y: 40 })
                 ))),
-                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::Input(
-                    wheel
-                ))),
-                RemoteSendAction::Command(ConnectionCommand::SendReliable(WireMessage::ReleaseAll)),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(left_down))),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(wheel))),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::ReleaseAll)),
             ]
         );
     }
 
     #[test]
-    fn remote_input_send_buffer_keeps_kcp_pointer_moves_on_latest_pointer_path() {
+    fn configured_kcp_pointer_moves_use_the_tcp_control_connection() {
         let mut buffer = RemoteInputSendBuffer::new(TransportMode::Kcp);
         let mut actions = Vec::new();
 
@@ -4692,8 +4673,12 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 10, y: 10 }),
-                RemoteSendAction::Command(ConnectionCommand::SendLatestPointer { x: 20, y: 20 }),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
+                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 10, y: 10 })
+                ))),
+                RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
+                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 20, y: 20 })
+                ))),
             ]
         );
     }
@@ -4983,7 +4968,7 @@ mod tests {
     #[test]
     fn runtime_emits_log_and_status_for_start_stop_and_reconnect() {
         let runtime = RuntimeHandle::spawn();
-        let config = safe_agent_config(TransportMode::Tcp);
+        let config = safe_agent_config();
 
         runtime.send(RuntimeCommand::Start(config.clone()));
         let events = wait_for_events(&runtime, 2);
@@ -5054,7 +5039,7 @@ mod tests {
         );
         assert_eq!(
             connection_commands_rx.recv().await,
-            Some(ConnectionCommand::SendReliable(WireMessage::ReleaseAll))
+            Some(ConnectionCommand::Send(WireMessage::ReleaseAll))
         );
         assert_eq!(
             connection_commands_rx.recv().await,
@@ -5140,7 +5125,7 @@ mod tests {
             observed,
             Some((
                 true,
-                vec![RemoteSendAction::Command(ConnectionCommand::SendReliable(
+                vec![RemoteSendAction::Command(ConnectionCommand::Send(
                     WireMessage::ReleaseAll
                 ))],
             ))
@@ -5188,9 +5173,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_start_and_reconnect_report_agent_transport_mode() {
+    fn agent_start_and_reconnect_report_connection_states() {
         let runtime = RuntimeHandle::spawn();
-        let config = safe_agent_config(TransportMode::Tcp);
+        let config = safe_agent_config();
 
         runtime.send(RuntimeCommand::Start(config.clone()));
         let events = wait_for_events(&runtime, 2);
@@ -5199,7 +5184,6 @@ mod tests {
                 event,
                 RuntimeEvent::Status(status)
                     if status.run_state == RunState::Connecting
-                        && status.transport_mode == Some(TransportMode::Tcp)
             )
         }));
 
@@ -5210,23 +5194,19 @@ mod tests {
                 event,
                 RuntimeEvent::Status(status)
                     if status.run_state == RunState::Reconnecting
-                        && status.transport_mode == Some(TransportMode::Tcp)
             )
         }));
 
         runtime.send(RuntimeCommand::Stop);
     }
 
-    fn safe_agent_config(transport_mode: TransportMode) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.role = Role::Agent;
-        config.agent.listen_host = "127.0.0.1".to_string();
-        config.agent.transport_mode = transport_mode;
-        config.agent.listen_port = match transport_mode {
-            TransportMode::Tcp => unused_tcp_port(),
-            TransportMode::Kcp => unused_udp_port(),
+    fn safe_agent_config() -> AppConfig {
+        let mut config = AppConfig {
+            role: Role::Agent,
+            ..AppConfig::default()
         };
-        config.agent.pointer_port = unused_udp_port();
+        config.agent.listen_host = "127.0.0.1".to_string();
+        config.agent.listen_port = unused_tcp_port();
         config.sharing.clipboard_text = false;
         config.sharing.clipboard_html = false;
         config.sharing.clipboard_images = false;
@@ -5256,14 +5236,6 @@ mod tests {
 
     fn unused_tcp_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    fn unused_udp_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
