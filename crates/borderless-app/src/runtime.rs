@@ -1,3 +1,5 @@
+mod drag_drop;
+
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
@@ -12,10 +14,9 @@ use borderless_core::{
     clipboard::{ClipboardEnvelope, ClipboardPayload, RemoteFileOffer},
     config::{AppConfig, Role},
     control::{ControlMode, ControlOutput, ControlState},
-    drag_drop::DropTarget,
-    file_transfer::FileManifestEntry,
-    geometry::{edge_for_position, Edge, Point, Rect},
-    input_event::{InputEvent, MouseButton, MouseMoveAbsEvent},
+    file_transfer::{FileManifestEntry, FileTransferDestination},
+    geometry::{Edge, Point, Rect},
+    input_event::{InputEvent, MouseMoveAbsEvent},
     protocol::{
         encode_frame, Heartbeat, Hello, ProtocolError, WireMessage, MAX_PAYLOAD_LEN,
         PROTOCOL_VERSION,
@@ -28,14 +29,14 @@ use borderless_net::{
         BulkTransferCommand, BulkTransferEvent,
     },
     controller_client::run_controller_client,
+    drop_authorization::DropAuthorizationRegistry,
     transport::{ConnectionCommand, ConnectionEvent, TcpConnectionSettings},
 };
 use borderless_win::{
     clipboard::{write_clipboard, ClipboardEvent, ClipboardMonitor, ClipboardReadOptions},
     drag_drop::{DragDropEvent, EdgeDropTarget},
-    drop_resolver::resolve_drop_target,
     hooks::{HookEvent, HookManager, SuppressionMode},
-    inject::{move_local_pointer_to, release_local_left_button, InputInjector},
+    inject::{move_local_pointer_to, InputInjector},
     monitor::virtual_desktop_rect,
 };
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -47,6 +48,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::status::{AppStatus, RunState};
+use drag_drop::{DragDropCoordinator, DragEffect};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(4);
@@ -503,6 +505,7 @@ fn start_configured_bulk_runtime(
     updates: Sender<TaggedSessionUpdate>,
     client_peer: BulkClientPeer,
 ) -> Result<BulkRuntime, String> {
+    let drop_authorizations = DropAuthorizationRegistry::default();
     let cache_dir = config
         .resolved_incoming_cache_dir()
         .map_err(|error| error.to_string())?
@@ -523,6 +526,7 @@ fn start_configured_bulk_runtime(
         server_host,
         config.sharing.bulk_transfer_port,
         cache_dir.clone(),
+        drop_authorizations.clone(),
         updates.clone(),
     );
 
@@ -533,6 +537,7 @@ fn start_configured_bulk_runtime(
             host,
             config.sharing.bulk_transfer_port,
             cache_dir,
+            drop_authorizations,
             updates,
         );
     }
@@ -546,6 +551,7 @@ fn push_bulk_server(
     listen_host: String,
     port: u16,
     cache_dir: String,
+    drop_authorizations: DropAuthorizationRegistry,
     updates: Sender<TaggedSessionUpdate>,
 ) {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -554,8 +560,15 @@ fn push_bulk_server(
 
     runtime.commands.push(commands_tx);
     runtime.tasks.push(tokio::spawn(async move {
-        if let Err(error) =
-            run_bulk_transfer_server(listen_host, port, cache_dir, events_tx, commands_rx).await
+        if let Err(error) = run_bulk_transfer_server(
+            listen_host,
+            port,
+            cache_dir,
+            drop_authorizations,
+            events_tx,
+            commands_rx,
+        )
+        .await
         {
             send_session_update(
                 &server_updates,
@@ -577,6 +590,7 @@ fn push_bulk_client(
     host: String,
     port: u16,
     cache_dir: String,
+    drop_authorizations: DropAuthorizationRegistry,
     updates: Sender<TaggedSessionUpdate>,
 ) {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -585,8 +599,15 @@ fn push_bulk_client(
 
     runtime.commands.push(commands_tx);
     runtime.tasks.push(tokio::spawn(async move {
-        if let Err(error) =
-            run_bulk_transfer_client(host, port, cache_dir, events_tx, commands_rx).await
+        if let Err(error) = run_bulk_transfer_client(
+            host,
+            port,
+            cache_dir,
+            drop_authorizations,
+            events_tx,
+            commands_rx,
+        )
+        .await
         {
             send_session_update(
                 &client_updates,
@@ -638,11 +659,8 @@ async fn run_controller_event_pump(
     let mut clipboard_interval = interval(CLIPBOARD_POLL_INTERVAL);
     let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
     let mut clipboard_transport_ready = false;
-    let drag_runtime = start_drag_drop_runtime(
-        &config,
-        &[edge_for_position(config.controller.remote_position.clone())],
-    );
-    let mut drag_drop = ControllerDragDrop::default();
+    let mut drag_runtime = start_drag_drop_runtime(&config);
+    let mut drag_drop = DragDropCoordinator::new(Role::Controller);
     let mut drag_was_remote = false;
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     hook_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -669,16 +687,6 @@ async fn run_controller_event_pump(
                     session_id,
                 );
                 while let Ok(event) = hook_events.try_recv() {
-                    if let HookEvent::Input(input) = &event {
-                        drag_drop.on_hook_input(
-                            input,
-                            &control_state,
-                            &last_pointer,
-                            &connection_commands,
-                            &updates,
-                            session_id,
-                        );
-                    }
                     handle_controller_hook_event(
                         event,
                         local_desktop,
@@ -695,17 +703,29 @@ async fn run_controller_event_pump(
                         session_id,
                     );
                 }
-                if let Some(drag) = &drag_runtime {
-                    drag_drop.drain_local_events(drag, &connection_commands, &updates, session_id);
-                }
+                drain_local_drag_events(
+                    &mut drag_drop,
+                    &mut drag_runtime,
+                    &connection_commands,
+                    &bulk_commands,
+                    &updates,
+                    session_id,
+                );
                 let drag_now_remote = control_state
                     .as_ref()
                     .is_some_and(|state| state.mode() == ControlMode::Remote);
                 if drag_now_remote != drag_was_remote {
                     drag_was_remote = drag_now_remote;
-                    drag_drop.on_control_mode_change(
-                        drag_now_remote,
+                    let effects = drag_drop.set_control_mode(if drag_now_remote {
+                        ControlMode::Remote
+                    } else {
+                        ControlMode::Local
+                    });
+                    apply_drag_effects(
+                        effects,
+                        &mut drag_runtime,
                         &connection_commands,
+                        &bulk_commands,
                         &updates,
                         session_id,
                     );
@@ -762,13 +782,30 @@ async fn run_controller_event_pump(
 
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
-                    drag_drop.on_wire_message(
-                        message,
-                        &config,
+                    let effects = drag_drop.handle_peer_message(message.clone());
+                    apply_drag_effects(
+                        effects,
+                        &mut drag_runtime,
+                        &connection_commands,
                         &bulk_commands,
                         &updates,
                         session_id,
                     );
+                    if matches!(message, WireMessage::Hello(hello) if hello.protocol_version == PROTOCOL_VERSION) {
+                        let layout = WireMessage::PeerLayout {
+                            controller_remote_position: config.controller.remote_position.clone(),
+                        };
+                        let _ = connection_commands.send(ConnectionCommand::Send(layout.clone()));
+                        let effects = drag_drop.handle_peer_message(layout);
+                        apply_drag_effects(
+                            effects,
+                            &mut drag_runtime,
+                            &connection_commands,
+                            &bulk_commands,
+                            &updates,
+                            session_id,
+                        );
+                    }
                 }
                 if matches!(
                     event,
@@ -904,11 +941,13 @@ fn handle_controller_connection_event(
         | ConnectionEvent::Message(WireMessage::ReleaseAll)
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
         | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
-        // Drag-drop messages are consumed by ControllerDragDrop in the pump.
+        // Drag-drop messages are consumed by DragDropCoordinator in the pump.
+        | ConnectionEvent::Message(WireMessage::PeerLayout { .. })
         | ConnectionEvent::Message(WireMessage::DragDropReleased { .. })
         | ConnectionEvent::Message(WireMessage::DragDropTargetResolved { .. })
         | ConnectionEvent::Message(WireMessage::DragDropTargetFailed { .. })
-        | ConnectionEvent::Message(WireMessage::DragDropTransferStart { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropTransferStarted { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropTransferResult { .. })
         | ConnectionEvent::Message(WireMessage::DragDropCancel { .. })
         | ConnectionEvent::Message(WireMessage::DragDropEntered { .. }) => {}
     }
@@ -1547,11 +1586,8 @@ async fn run_agent_event_pump(
     let mut clipboard_interval = interval(CLIPBOARD_POLL_INTERVAL);
     let mut clipboard_runtime = start_clipboard_runtime(&config, &updates, session_id);
     let mut clipboard_transport_ready = false;
-    // The agent does not know which of its edges faces the controller, so
-    // watch all four; a drag only becomes a session when it reaches one.
-    let drag_runtime =
-        start_drag_drop_runtime(&config, &[Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]);
-    let mut drag_drop = AgentDragDrop::default();
+    let mut drag_runtime = start_drag_drop_runtime(&config);
+    let mut drag_drop = DragDropCoordinator::new(Role::Agent);
     let mut drag_interval = interval(DRAG_DROP_POLL_INTERVAL);
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     drag_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1559,9 +1595,14 @@ async fn run_agent_event_pump(
     loop {
         tokio::select! {
             _ = drag_interval.tick(), if drag_runtime.is_some() => {
-                if let Some(drag) = &drag_runtime {
-                    drag_drop.drain_local_events(drag, &connection_commands, &updates, session_id);
-                }
+                drain_local_drag_events(
+                    &mut drag_drop,
+                    &mut drag_runtime,
+                    &connection_commands,
+                    &bulk_commands,
+                    &updates,
+                    session_id,
+                );
             }
             _ = clipboard_interval.tick(), if clipboard_runtime.is_some() => {
                 if let Some(clipboard) = &clipboard_runtime {
@@ -1592,11 +1633,12 @@ async fn run_agent_event_pump(
 
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
-                    drag_drop.on_wire_message(
-                        message,
-                        &config,
-                        &bulk_commands,
+                    let effects = drag_drop.handle_peer_message(message.clone());
+                    apply_drag_effects(
+                        effects,
+                        &mut drag_runtime,
                         &connection_commands,
+                        &bulk_commands,
                         &updates,
                         session_id,
                     );
@@ -1704,11 +1746,13 @@ fn handle_agent_connection_event(
         | ConnectionEvent::Message(WireMessage::Hello(_))
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
         | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
-        // Drag-drop messages are consumed by AgentDragDrop in the pump.
+        // Drag-drop messages are consumed by DragDropCoordinator in the pump.
+        | ConnectionEvent::Message(WireMessage::PeerLayout { .. })
         | ConnectionEvent::Message(WireMessage::DragDropReleased { .. })
         | ConnectionEvent::Message(WireMessage::DragDropTargetResolved { .. })
         | ConnectionEvent::Message(WireMessage::DragDropTargetFailed { .. })
-        | ConnectionEvent::Message(WireMessage::DragDropTransferStart { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropTransferStarted { .. })
+        | ConnectionEvent::Message(WireMessage::DragDropTransferResult { .. })
         | ConnectionEvent::Message(WireMessage::DragDropCancel { .. })
         | ConnectionEvent::Message(WireMessage::DragDropEntered { .. })
          => {}
@@ -2612,50 +2656,133 @@ fn apply_clipboard_error_status(
 const DRAG_DROP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct DragDropRuntime {
-    _targets: Vec<EdgeDropTarget>,
+    target: Option<EdgeDropTarget>,
+    installed_edge: Option<Edge>,
     events: Receiver<DragDropEvent>,
+    sender: Sender<DragDropEvent>,
 }
 
-fn start_drag_drop_runtime(config: &AppConfig, edges: &[Edge]) -> Option<DragDropRuntime> {
+impl DragDropRuntime {
+    fn install_edge(&mut self, edge: Edge) -> anyhow::Result<()> {
+        if self.installed_edge == Some(edge) {
+            return Ok(());
+        }
+        self.target = None;
+        self.installed_edge = None;
+        self.target = Some(EdgeDropTarget::install(edge, self.sender.clone())?);
+        self.installed_edge = Some(edge);
+        Ok(())
+    }
+
+    fn uninstall_edge(&mut self) {
+        self.target = None;
+        self.installed_edge = None;
+    }
+}
+
+fn start_drag_drop_runtime(config: &AppConfig) -> Option<DragDropRuntime> {
     if !config.sharing.file_drag_drop {
         return None;
     }
-    let (tx, rx) = unbounded();
-    let mut targets = Vec::new();
-    for edge in edges {
-        match EdgeDropTarget::install(*edge, tx.clone()) {
-            Ok(target) => targets.push(target),
-            Err(error) => {
-                tracing::warn!(?error, ?edge, "failed to install edge drop target");
-            }
-        }
-    }
-    if targets.is_empty() {
-        return None;
-    }
+    let (sender, events) = unbounded();
     Some(DragDropRuntime {
-        _targets: targets,
-        events: rx,
+        target: None,
+        installed_edge: None,
+        events,
+        sender,
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DragSourcePhase {
-    LocalDetected,
-    Selecting,
-    AwaitingResolution,
+fn drain_local_drag_events(
+    coordinator: &mut DragDropCoordinator,
+    drag_runtime: &mut Option<DragDropRuntime>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
+    updates: &Sender<TaggedSessionUpdate>,
+    runtime_session_id: u64,
+) {
+    let events = drag_runtime
+        .as_ref()
+        .map(|runtime| runtime.events.try_iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    for event in events {
+        let effects = match event {
+            DragDropEvent::LocalFileDragEntered {
+                session_id,
+                transfer_id,
+                paths,
+            } => coordinator.begin_local_drag(session_id, transfer_id, paths),
+            DragDropEvent::LocalDragCancelled { session_id } => {
+                coordinator.cancel_local_drag(session_id, "本机拖拽已取消")
+            }
+            DragDropEvent::LocalDropReleased { session_id } => {
+                coordinator.native_drop_released(session_id)
+            }
+            DragDropEvent::Error { message, .. } => vec![DragEffect::Status {
+                state: format!("拖放失败：{message}"),
+                destination: None,
+            }],
+        };
+        apply_drag_effects(
+            effects,
+            drag_runtime,
+            connection_commands,
+            bulk_commands,
+            updates,
+            runtime_session_id,
+        );
+    }
 }
 
-struct DragSourceSession {
-    session_id: Uuid,
-    transfer_id: Uuid,
-    paths: Vec<String>,
-    phase: DragSourcePhase,
-}
-
-struct IncomingDragSession {
-    session_id: Uuid,
-    handed_off: bool,
+fn apply_drag_effects(
+    effects: Vec<DragEffect>,
+    drag_runtime: &mut Option<DragDropRuntime>,
+    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
+    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
+    updates: &Sender<TaggedSessionUpdate>,
+    runtime_session_id: u64,
+) {
+    for effect in effects {
+        match effect {
+            DragEffect::InstallEdge(edge) => {
+                let Some(runtime) = drag_runtime.as_mut() else {
+                    continue;
+                };
+                if let Err(error) = runtime.install_edge(edge) {
+                    send_drag_drop_status(
+                        updates,
+                        runtime_session_id,
+                        format!("拖放边缘监听失败：{error}"),
+                        None,
+                    );
+                }
+            }
+            DragEffect::UninstallEdge => {
+                if let Some(runtime) = drag_runtime.as_mut() {
+                    runtime.uninstall_edge();
+                }
+            }
+            DragEffect::Send(message) => {
+                let _ = connection_commands.send(ConnectionCommand::Send(message));
+            }
+            DragEffect::CancelBulk { transfer_id } => {
+                for commands in bulk_commands {
+                    let _ = commands.send(BulkTransferCommand::Cancel(transfer_id));
+                }
+            }
+            DragEffect::Status { state, destination } => {
+                send_drag_drop_status(updates, runtime_session_id, state, destination);
+            }
+            DragEffect::AwaitLocalRelease { .. } => {
+                send_drag_drop_status(updates, runtime_session_id, "请在目标位置松开鼠标", None);
+            }
+            DragEffect::ResolveTarget { .. }
+            | DragEffect::BeginTransfer { .. }
+            | DragEffect::RevokeAuthorization { .. }
+            | DragEffect::RestoreLocalInput => {}
+        }
+    }
 }
 
 fn send_drag_drop_status(
@@ -2673,578 +2800,6 @@ fn send_drag_drop_status(
         },
     );
 }
-
-fn send_drag_drop_cancel(
-    connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-    session_id: Uuid,
-) {
-    let _ = connection_commands.send(ConnectionCommand::Send(WireMessage::DragDropCancel {
-        session_id,
-    }));
-}
-
-/// Resolve the release point into a directory off the async pump thread and
-/// answer the peer with `DragDropTargetResolved` / `DragDropTargetFailed`.
-fn resolve_drop_target_and_reply(
-    dd_session_id: Uuid,
-    point: Point,
-    connection_commands: mpsc::UnboundedSender<ConnectionCommand>,
-    updates: Sender<TaggedSessionUpdate>,
-    session_id: u64,
-) {
-    tokio::task::spawn_blocking(move || match resolve_drop_target(point) {
-        Ok(target) => {
-            send_drag_drop_status(
-                &updates,
-                session_id,
-                "destination resolved for remote drop",
-                Some(target.destination_dir.clone()),
-            );
-            let _ = connection_commands.send(ConnectionCommand::Send(
-                WireMessage::DragDropTargetResolved {
-                    session_id: dd_session_id,
-                    target,
-                },
-            ));
-        }
-        Err(error) => {
-            send_drag_drop_status(
-                &updates,
-                session_id,
-                format!("destination resolution failed: {error}"),
-                None,
-            );
-            let _ = connection_commands.send(ConnectionCommand::Send(
-                WireMessage::DragDropTargetFailed {
-                    session_id: dd_session_id,
-                    reason: error.to_string(),
-                },
-            ));
-        }
-    });
-}
-
-/// Build the manifest for a resolved drag session and start the targeted
-/// bulk transfer into the destination directory.
-fn start_drag_transfer(
-    transfer_id: Uuid,
-    paths: &[String],
-    target: &DropTarget,
-    config: &AppConfig,
-    bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
-    updates: &Sender<TaggedSessionUpdate>,
-    session_id: u64,
-) {
-    let Some(commands) = bulk_commands.last() else {
-        send_drag_drop_status(
-            updates,
-            session_id,
-            "drag transfer failed: bulk transfer channel is not available",
-            None,
-        );
-        return;
-    };
-
-    match manifest_from_source_paths(transfer_id, paths) {
-        Ok(mut manifest) => {
-            if manifest.total_bytes > config.sharing.max_file_transfer_bytes {
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    format!(
-                        "drag transfer skipped: {} bytes exceeds the {} byte limit",
-                        manifest.total_bytes, config.sharing.max_file_transfer_bytes
-                    ),
-                    None,
-                );
-                return;
-            }
-            manifest.destination_directory = Some(target.destination_dir.clone());
-            let sent = commands.send(BulkTransferCommand::SendFiles {
-                manifest,
-                source_paths: paths.to_vec(),
-            });
-            if sent.is_ok() {
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    "transferring dropped files",
-                    Some(target.destination_dir.clone()),
-                );
-            } else {
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    "drag transfer failed: bulk transfer command channel closed",
-                    None,
-                );
-            }
-        }
-        Err(error) => {
-            send_drag_drop_status(
-                updates,
-                session_id,
-                format!("drag transfer failed: {error}"),
-                None,
-            );
-        }
-    }
-}
-
-#[derive(Default)]
-struct ControllerDragDrop {
-    source: Option<DragSourceSession>,
-    incoming: Option<IncomingDragSession>,
-}
-
-impl ControllerDragDrop {
-    fn reset(&mut self) {
-        self.source = None;
-        self.incoming = None;
-    }
-
-    fn drain_local_events(
-        &mut self,
-        drag_runtime: &DragDropRuntime,
-        connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) {
-        while let Ok(event) = drag_runtime.events.try_recv() {
-            match event {
-                DragDropEvent::LocalFileDragEntered {
-                    session_id: dd_session,
-                    transfer_id,
-                    paths,
-                } => {
-                    self.source = Some(DragSourceSession {
-                        session_id: dd_session,
-                        transfer_id,
-                        paths,
-                        phase: DragSourcePhase::LocalDetected,
-                    });
-                    send_drag_drop_status(
-                        updates,
-                        session_id,
-                        "file drag reached the shared edge",
-                        None,
-                    );
-                }
-                DragDropEvent::LocalDragCancelled {
-                    session_id: dd_session,
-                } => {
-                    if self
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| source.session_id == dd_session)
-                    {
-                        let awaiting = self
-                            .source
-                            .as_ref()
-                            .is_some_and(|s| s.phase == DragSourcePhase::AwaitingResolution);
-                        if !awaiting {
-                            send_drag_drop_cancel(connection_commands, dd_session);
-                            self.source = None;
-                            send_drag_drop_status(updates, session_id, "drag cancelled", None);
-                        }
-                    }
-                }
-                DragDropEvent::LocalDropReleased {
-                    session_id: dd_session,
-                } => {
-                    let Some(source) = self.source.as_ref() else {
-                        continue;
-                    };
-                    if source.session_id != dd_session {
-                        continue;
-                    }
-                    // Expected after our injected release ends the parked
-                    // OLE drag; a release before remote selection started
-                    // means the user dropped on the edge strip itself.
-                    if source.phase == DragSourcePhase::LocalDetected {
-                        send_drag_drop_cancel(connection_commands, dd_session);
-                        self.source = None;
-                        send_drag_drop_status(
-                            updates,
-                            session_id,
-                            "drag released before crossing to the remote side",
-                            None,
-                        );
-                    }
-                }
-                DragDropEvent::Error {
-                    session_id: _,
-                    message,
-                } => {
-                    send_session_update(
-                        updates,
-                        session_id,
-                        SessionUpdate::Log(format!("drag-drop error: {message}")),
-                    );
-                }
-            }
-        }
-    }
-
-    fn on_control_mode_change(
-        &mut self,
-        now_remote: bool,
-        connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) {
-        if now_remote {
-            if let Some(source) = self.source.as_mut() {
-                if source.phase == DragSourcePhase::LocalDetected {
-                    source.phase = DragSourcePhase::Selecting;
-                    send_drag_drop_status(
-                        updates,
-                        session_id,
-                        "selecting drop target on the remote side",
-                        None,
-                    );
-                }
-            }
-        } else {
-            // Returned to local control mid-selection: the drag went back.
-            if let Some(source) = self
-                .source
-                .take_if(|s| s.phase == DragSourcePhase::Selecting)
-            {
-                send_drag_drop_cancel(connection_commands, source.session_id);
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    "drag returned to the local side; cancelled",
-                    None,
-                );
-            }
-            if let Some(incoming) = self.incoming.as_mut() {
-                incoming.handed_off = true;
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    "remote drag handed off; release to choose the destination",
-                    None,
-                );
-            }
-        }
-    }
-
-    fn on_hook_input(
-        &mut self,
-        input: &InputEvent,
-        control_state: &Option<ControlState>,
-        last_pointer: &Option<Point>,
-        connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) {
-        let InputEvent::MouseButton(button) = input else {
-            return;
-        };
-        if button.button != MouseButton::Left || button.pressed {
-            return;
-        }
-
-        let remote_mode = control_state
-            .as_ref()
-            .is_some_and(|state| state.mode() == ControlMode::Remote);
-
-        if remote_mode {
-            let Some(source) = self.source.as_mut() else {
-                return;
-            };
-            if source.phase != DragSourcePhase::Selecting {
-                return;
-            }
-            let Some(state) = control_state.as_ref() else {
-                return;
-            };
-            source.phase = DragSourcePhase::AwaitingResolution;
-            let _ =
-                connection_commands.send(ConnectionCommand::Send(WireMessage::DragDropReleased {
-                    session_id: source.session_id,
-                    point: state.remote_point(),
-                }));
-            // End the parked native drag so Explorer stops owning the mouse.
-            if let Err(error) = release_local_left_button() {
-                send_session_update(
-                    updates,
-                    session_id,
-                    SessionUpdate::Log(format!("failed to end local drag: {error}")),
-                );
-            }
-            send_drag_drop_status(
-                updates,
-                session_id,
-                "released; resolving destination on the remote side",
-                None,
-            );
-        } else if let Some(incoming) = self.incoming.take_if(|incoming| incoming.handed_off) {
-            let Some(point) = *last_pointer else {
-                self.incoming = Some(incoming);
-                return;
-            };
-            resolve_drop_target_and_reply(
-                incoming.session_id,
-                point,
-                connection_commands.clone(),
-                updates.clone(),
-                session_id,
-            );
-        }
-    }
-
-    /// Returns true when the message belongs to the drag-drop flow.
-    #[allow(clippy::too_many_arguments)]
-    fn on_wire_message(
-        &mut self,
-        message: &WireMessage,
-        config: &AppConfig,
-        bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) -> bool {
-        match message {
-            WireMessage::DragDropTargetResolved {
-                session_id: dd_session,
-                target,
-            } => {
-                if let Some(source) = self.source.take_if(|s| s.session_id == *dd_session) {
-                    start_drag_transfer(
-                        source.transfer_id,
-                        &source.paths,
-                        target,
-                        config,
-                        bulk_commands,
-                        updates,
-                        session_id,
-                    );
-                }
-                true
-            }
-            WireMessage::DragDropTargetFailed {
-                session_id: dd_session,
-                reason,
-            } => {
-                if self
-                    .source
-                    .take_if(|s| s.session_id == *dd_session)
-                    .is_some()
-                {
-                    send_drag_drop_status(
-                        updates,
-                        session_id,
-                        format!("drop failed: {reason}"),
-                        None,
-                    );
-                }
-                true
-            }
-            WireMessage::DragDropEntered {
-                session_id: dd_session,
-            } => {
-                self.incoming = Some(IncomingDragSession {
-                    session_id: *dd_session,
-                    handed_off: false,
-                });
-                send_drag_drop_status(
-                    updates,
-                    session_id,
-                    "remote file drag approaching the shared edge",
-                    None,
-                );
-                true
-            }
-            WireMessage::DragDropCancel {
-                session_id: dd_session,
-            } => {
-                let cancelled_source = self
-                    .source
-                    .take_if(|s| s.session_id == *dd_session)
-                    .is_some();
-                let cancelled_incoming = self
-                    .incoming
-                    .take_if(|incoming| incoming.session_id == *dd_session)
-                    .is_some();
-                if cancelled_source || cancelled_incoming {
-                    send_drag_drop_status(updates, session_id, "drag cancelled by peer", None);
-                }
-                true
-            }
-            WireMessage::DragDropReleased { .. } | WireMessage::DragDropTransferStart { .. } => {
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-#[derive(Default)]
-struct AgentDragDrop {
-    source: Option<DragSourceSession>,
-}
-
-impl AgentDragDrop {
-    fn reset(&mut self) {
-        self.source = None;
-    }
-
-    fn drain_local_events(
-        &mut self,
-        drag_runtime: &DragDropRuntime,
-        connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) {
-        while let Ok(event) = drag_runtime.events.try_recv() {
-            match event {
-                DragDropEvent::LocalFileDragEntered {
-                    session_id: dd_session,
-                    transfer_id,
-                    paths,
-                } => {
-                    self.source = Some(DragSourceSession {
-                        session_id: dd_session,
-                        transfer_id,
-                        paths,
-                        phase: DragSourcePhase::LocalDetected,
-                    });
-                    let _ = connection_commands.send(ConnectionCommand::Send(
-                        WireMessage::DragDropEntered {
-                            session_id: dd_session,
-                        },
-                    ));
-                    send_drag_drop_status(
-                        updates,
-                        session_id,
-                        "file drag reached the shared edge",
-                        None,
-                    );
-                }
-                DragDropEvent::LocalDropReleased {
-                    session_id: dd_session,
-                } => {
-                    // The controller's return-to-local ReleaseAll ended our
-                    // native drag on the edge window: the drag is now handed
-                    // off and awaits the controller-side release/resolution.
-                    if let Some(source) = self.source.as_mut() {
-                        if source.session_id == dd_session {
-                            source.phase = DragSourcePhase::AwaitingResolution;
-                            send_drag_drop_status(
-                                updates,
-                                session_id,
-                                "drag handed off to the controller side",
-                                None,
-                            );
-                        }
-                    }
-                }
-                DragDropEvent::LocalDragCancelled {
-                    session_id: dd_session,
-                } => {
-                    if self
-                        .source
-                        .take_if(|s| s.session_id == dd_session)
-                        .is_some()
-                    {
-                        send_drag_drop_cancel(connection_commands, dd_session);
-                        send_drag_drop_status(updates, session_id, "drag cancelled", None);
-                    }
-                }
-                DragDropEvent::Error {
-                    session_id: _,
-                    message,
-                } => {
-                    send_session_update(
-                        updates,
-                        session_id,
-                        SessionUpdate::Log(format!("drag-drop error: {message}")),
-                    );
-                }
-            }
-        }
-    }
-
-    /// Returns true when the message belongs to the drag-drop flow.
-    #[allow(clippy::too_many_arguments)]
-    fn on_wire_message(
-        &mut self,
-        message: &WireMessage,
-        config: &AppConfig,
-        bulk_commands: &[mpsc::UnboundedSender<BulkTransferCommand>],
-        connection_commands: &mpsc::UnboundedSender<ConnectionCommand>,
-        updates: &Sender<TaggedSessionUpdate>,
-        session_id: u64,
-    ) -> bool {
-        match message {
-            WireMessage::DragDropReleased {
-                session_id: dd_session,
-                point,
-            } => {
-                resolve_drop_target_and_reply(
-                    *dd_session,
-                    *point,
-                    connection_commands.clone(),
-                    updates.clone(),
-                    session_id,
-                );
-                true
-            }
-            WireMessage::DragDropTargetResolved {
-                session_id: dd_session,
-                target,
-            } => {
-                if let Some(source) = self.source.take_if(|s| s.session_id == *dd_session) {
-                    start_drag_transfer(
-                        source.transfer_id,
-                        &source.paths,
-                        target,
-                        config,
-                        bulk_commands,
-                        updates,
-                        session_id,
-                    );
-                }
-                true
-            }
-            WireMessage::DragDropTargetFailed {
-                session_id: dd_session,
-                reason,
-            } => {
-                if self
-                    .source
-                    .take_if(|s| s.session_id == *dd_session)
-                    .is_some()
-                {
-                    send_drag_drop_status(
-                        updates,
-                        session_id,
-                        format!("drop failed: {reason}"),
-                        None,
-                    );
-                }
-                true
-            }
-            WireMessage::DragDropCancel {
-                session_id: dd_session,
-            } => {
-                if self
-                    .source
-                    .take_if(|s| s.session_id == *dd_session)
-                    .is_some()
-                {
-                    send_drag_drop_status(updates, session_id, "drag cancelled by peer", None);
-                }
-                true
-            }
-            WireMessage::DragDropEntered { .. } | WireMessage::DragDropTransferStart { .. } => true,
-            _ => false,
-        }
-    }
-}
-
 fn send_session_update(
     sender: &Sender<TaggedSessionUpdate>,
     session_id: u64,
@@ -3378,10 +2933,12 @@ fn apply_session_update(
         }
         SessionUpdate::BulkTransfer(event) => {
             if let BulkTransferEvent::Offered(manifest) = &event {
-                if let Some(destination) = &manifest.destination_directory {
+                if matches!(
+                    &manifest.destination,
+                    FileTransferDestination::AuthorizedDrop { .. }
+                ) {
                     transfer_purposes.remember_drag(manifest.transfer_id);
                     status.drag_drop_state = Some("receiving dropped files".to_string());
-                    status.drag_drop_destination = Some(destination.clone());
                 }
             }
             match event {
