@@ -5,6 +5,7 @@ mod logging;
 mod runtime;
 mod status;
 mod ui;
+mod ui_bridge;
 mod ui_model;
 
 fn main() -> eframe::Result<()> {
@@ -40,5 +41,10 @@ mod ui_compile_tests {
         }
 
         let _ = accepts_contract;
+    }
+
+    #[test]
+    fn slint_bridge_entry_point_is_available() {
+        let _ = crate::ui_bridge::run_app as fn() -> Result<(), slint::PlatformError>;
     }
 }
