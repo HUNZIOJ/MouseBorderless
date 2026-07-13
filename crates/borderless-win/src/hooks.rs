@@ -34,6 +34,8 @@ use windows::{
     },
 };
 
+use crate::inject::BORDERLESS_INPUT_MARKER;
+
 const HOOK_EVENT_QUEUE_CAPACITY: usize = 1024;
 const EXTERNAL_EVENT_BACKLOG_LIMIT: usize = 1024;
 const RAW_INPUT_WINDOW_CLASS: &str = "BorderlessRawInputWindow";
@@ -515,11 +517,13 @@ unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LP
         let mut injected = false;
         if let Some(data) = data {
             injected = injected_mouse_event(data);
-            HOOK_THREAD_STATE.with(|state| {
-                if let Some(state) = state.borrow_mut().as_mut() {
-                    state.emit_mouse_events(wparam.0 as u32, data);
-                }
-            });
+            if !is_borderless_injected_mouse_event(data) {
+                HOOK_THREAD_STATE.with(|state| {
+                    if let Some(state) = state.borrow_mut().as_mut() {
+                        state.emit_mouse_events(wparam.0 as u32, data);
+                    }
+                });
+            }
         }
 
         // Injected events are our own (pointer parking, ending a native
@@ -604,6 +608,10 @@ fn mouse_hook_events(message: u32, data: &MSLLHOOKSTRUCT) -> Vec<HookEvent> {
 
 fn injected_mouse_event(data: &MSLLHOOKSTRUCT) -> bool {
     data.flags & LLMHF_INJECTED != 0
+}
+
+fn is_borderless_injected_mouse_event(data: &MSLLHOOKSTRUCT) -> bool {
+    data.dwExtraInfo == BORDERLESS_INPUT_MARKER
 }
 
 fn raw_mouse_delta_event(mouse: &RAWMOUSE) -> Option<HookEvent> {
@@ -709,6 +717,15 @@ mod tests {
             WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
     };
+
+    #[test]
+    fn borderless_injected_mouse_events_are_not_reemitted_to_runtime() {
+        let data = MSLLHOOKSTRUCT {
+            dwExtraInfo: crate::inject::BORDERLESS_INPUT_MARKER,
+            ..Default::default()
+        };
+        assert!(is_borderless_injected_mouse_event(&data));
+    }
 
     #[test]
     fn mouse_move_produces_pointer_position_and_absolute_input() {

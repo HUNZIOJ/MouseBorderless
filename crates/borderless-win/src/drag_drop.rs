@@ -4,6 +4,7 @@ use crossbeam_channel::Sender;
 use std::{
     ffi::{OsStr, OsString},
     os::windows::ffi::{OsStrExt, OsStringExt},
+    path::Path,
     ptr,
     sync::Mutex,
     thread::{self, JoinHandle},
@@ -174,6 +175,23 @@ struct LocalDropTarget {
     active_session: Mutex<Option<Uuid>>,
 }
 
+#[derive(Clone, Copy)]
+enum LocalDragFinish {
+    Released,
+    Cancelled,
+}
+
+fn finish_local_drag(
+    active: &Mutex<Option<Uuid>>,
+    finish: LocalDragFinish,
+) -> Option<DragDropEvent> {
+    let session_id = active.lock().ok()?.take()?;
+    Some(match finish {
+        LocalDragFinish::Released => DragDropEvent::LocalDropReleased { session_id },
+        LocalDragFinish::Cancelled => DragDropEvent::LocalDragCancelled { session_id },
+    })
+}
+
 #[allow(non_snake_case)]
 impl IDropTarget_Impl for LocalDropTarget_Impl {
     fn DragEnter(
@@ -189,19 +207,32 @@ impl IDropTarget_Impl for LocalDropTarget_Impl {
         };
 
         match extract_hdrop_paths(data_object) {
-            Ok(paths) if !paths.is_empty() => {
-                let session_id = Uuid::new_v4();
-                if let Ok(mut active) = self.active_session.lock() {
-                    *active = Some(session_id);
+            Ok(paths) => {
+                let paths = paths
+                    .into_iter()
+                    .filter(|path| Path::new(path).exists())
+                    .collect::<Vec<_>>();
+                if paths.is_empty() {
+                    set_drop_effect(pdweffect, DROPEFFECT_NONE);
+                    return Ok(());
                 }
-                let _ = self.sender.send(DragDropEvent::LocalFileDragEntered {
-                    session_id,
-                    transfer_id: Uuid::new_v4(),
-                    paths,
-                });
+
+                let Ok(mut active) = self.active_session.lock() else {
+                    set_drop_effect(pdweffect, DROPEFFECT_NONE);
+                    return Ok(());
+                };
+                if active.is_none() {
+                    let session_id = Uuid::new_v4();
+                    *active = Some(session_id);
+                    let _ = self.sender.send(DragDropEvent::LocalFileDragEntered {
+                        session_id,
+                        transfer_id: Uuid::new_v4(),
+                        paths,
+                    });
+                }
                 set_drop_effect(pdweffect, DROPEFFECT_COPY);
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 set_drop_effect(pdweffect, DROPEFFECT_NONE);
             }
         }
@@ -232,12 +263,8 @@ impl IDropTarget_Impl for LocalDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
-        if let Ok(mut active) = self.active_session.lock() {
-            if let Some(session_id) = active.take() {
-                let _ = self
-                    .sender
-                    .send(DragDropEvent::LocalDragCancelled { session_id });
-            }
+        if let Some(event) = finish_local_drag(&self.active_session, LocalDragFinish::Cancelled) {
+            let _ = self.sender.send(event);
         }
         Ok(())
     }
@@ -249,14 +276,12 @@ impl IDropTarget_Impl for LocalDropTarget_Impl {
         _pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        if let Ok(mut active) = self.active_session.lock() {
-            if let Some(session_id) = active.take() {
-                let _ = self
-                    .sender
-                    .send(DragDropEvent::LocalDropReleased { session_id });
-            }
+        if let Some(event) = finish_local_drag(&self.active_session, LocalDragFinish::Released) {
+            let _ = self.sender.send(event);
+            set_drop_effect(pdweffect, DROPEFFECT_COPY);
+        } else {
+            set_drop_effect(pdweffect, DROPEFFECT_NONE);
         }
-        set_drop_effect(pdweffect, DROPEFFECT_COPY);
         Ok(())
     }
 }
@@ -477,6 +502,18 @@ mod tests {
             edge_window_rect(Edge::Top, desktop, 3),
             Rect::new(-100, 50, 1920, 3)
         );
+    }
+
+    #[test]
+    fn native_drag_emits_one_terminal_event() {
+        let session_id = Uuid::from_u128(42);
+        let active = Mutex::new(Some(session_id));
+
+        assert_eq!(
+            finish_local_drag(&active, LocalDragFinish::Released),
+            Some(DragDropEvent::LocalDropReleased { session_id })
+        );
+        assert_eq!(finish_local_drag(&active, LocalDragFinish::Cancelled), None);
     }
 
     #[test]

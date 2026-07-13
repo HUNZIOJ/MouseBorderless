@@ -18,6 +18,8 @@ use windows::Win32::UI::{
     WindowsAndMessaging::{XBUTTON1, XBUTTON2},
 };
 
+pub const BORDERLESS_INPUT_MARKER: usize = 0x4244_524C;
+
 pub struct InputInjector {
     desktop: Rect,
     pressed: PressedState,
@@ -70,11 +72,15 @@ pub fn move_local_pointer_to(desktop: Rect, point: Point) -> anyhow::Result<()> 
 /// Used when the drag release is detected via the hook while local input
 /// is suppressed for remote control.
 pub fn release_local_left_button() -> anyhow::Result<()> {
-    let inputs = [mouse_button_input(&MouseButtonEvent {
+    let inputs = [local_left_button_release_input()];
+    send_inputs(&inputs).context("release local left mouse button")
+}
+
+fn local_left_button_release_input() -> INPUT {
+    tag_borderless_mouse_input(mouse_button_input(&MouseButtonEvent {
         button: MouseButton::Left,
         pressed: false,
-    })];
-    send_inputs(&inputs).context("release local left mouse button")
+    }))
 }
 
 fn local_pointer_move_inputs(desktop: Rect, point: Point) -> Vec<INPUT> {
@@ -87,6 +93,14 @@ fn local_pointer_move_inputs(desktop: Rect, point: Point) -> Vec<INPUT> {
         &mut pressed,
         desktop,
     )
+    .into_iter()
+    .map(tag_borderless_mouse_input)
+    .collect()
+}
+
+fn tag_borderless_mouse_input(mut input: INPUT) -> INPUT {
+    input.Anonymous.mi.dwExtraInfo = BORDERLESS_INPUT_MARKER;
+    input
 }
 
 fn build_inputs(event: &InputEvent, pressed: &mut PressedState, desktop: Rect) -> Vec<INPUT> {
@@ -329,6 +343,16 @@ mod tests {
         );
         assert_eq!(mouse.dx, normalize_axis(-10, desktop.left, desktop.width));
         assert_eq!(mouse.dy, normalize_axis(10, desktop.top, desktop.height));
+        assert_eq!(mouse.dwExtraInfo, BORDERLESS_INPUT_MARKER);
+    }
+
+    #[test]
+    fn local_left_button_release_is_tagged() {
+        let input = local_left_button_release_input();
+        let mouse = unsafe { input.Anonymous.mi };
+
+        assert_eq!(mouse.dwFlags, MOUSEEVENTF_LEFTUP);
+        assert_eq!(mouse.dwExtraInfo, BORDERLESS_INPUT_MARKER);
     }
 
     #[test]
