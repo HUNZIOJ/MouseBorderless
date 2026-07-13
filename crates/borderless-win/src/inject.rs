@@ -65,6 +65,18 @@ pub fn move_local_pointer_to(desktop: Rect, point: Point) -> anyhow::Result<()> 
     send_inputs(&inputs).with_context(|| format!("move local pointer to {point:?}"))
 }
 
+/// Release the physical left button locally so an in-progress native OLE
+/// drag ends (dropping on whatever window is under the parked pointer).
+/// Used when the drag release is detected via the hook while local input
+/// is suppressed for remote control.
+pub fn release_local_left_button() -> anyhow::Result<()> {
+    let inputs = [mouse_button_input(&MouseButtonEvent {
+        button: MouseButton::Left,
+        pressed: false,
+    })];
+    send_inputs(&inputs).context("release local left mouse button")
+}
+
 fn local_pointer_move_inputs(desktop: Rect, point: Point) -> Vec<INPUT> {
     let mut pressed = PressedState::default();
     build_inputs(

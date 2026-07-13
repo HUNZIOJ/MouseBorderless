@@ -26,6 +26,9 @@ pub struct FileTransferManifest {
     pub root_name: String,
     pub files: Vec<FileManifestEntry>,
     pub total_bytes: u64,
+    /// Drag-drop transfers write directly into this directory on the
+    /// receiving side; `None` keeps the incoming cache directory behavior.
+    pub destination_directory: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -20,6 +20,7 @@ clipboard_text = true
 clipboard_html = true
 clipboard_images = true
 file_copy_paste = true
+file_drag_drop = true
 max_clipboard_bytes = 33554432
 max_file_transfer_bytes = 21474836480
 bulk_transfer_port = 24802

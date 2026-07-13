@@ -162,6 +162,7 @@ impl BorderlessApp {
                         "Clipboard images",
                     );
                     ui.checkbox(&mut self.config.sharing.file_copy_paste, "File copy paste");
+                    ui.checkbox(&mut self.config.sharing.file_drag_drop, "File drag drop");
                 });
 
                 ui.separator();
@@ -266,6 +267,14 @@ impl BorderlessApp {
 
                         ui.label("Transfer file");
                         ui.label(option_text(self.status.transfer_current_file.as_deref()));
+                        ui.end_row();
+
+                        ui.label("Drag drop");
+                        ui.label(option_text(self.status.drag_drop_state.as_deref()));
+                        ui.end_row();
+
+                        ui.label("Drop destination");
+                        ui.label(option_text(self.status.drag_drop_destination.as_deref()));
                         ui.end_row();
 
                         ui.label("Mouse diagnostics");

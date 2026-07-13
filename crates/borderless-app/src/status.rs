@@ -33,6 +33,8 @@ pub struct AppStatus {
     pub transfer_bytes_done: u64,
     pub transfer_bytes_total: u64,
     pub transfer_current_file: Option<String>,
+    pub drag_drop_state: Option<String>,
+    pub drag_drop_destination: Option<String>,
     pub mouse_diagnostics: Option<String>,
     pub events: VecDeque<String>,
 }
@@ -54,6 +56,8 @@ impl AppStatus {
         self.transfer_bytes_done = 0;
         self.transfer_bytes_total = 0;
         self.transfer_current_file = None;
+        self.drag_drop_state = None;
+        self.drag_drop_destination = None;
         self.mouse_diagnostics = None;
     }
 

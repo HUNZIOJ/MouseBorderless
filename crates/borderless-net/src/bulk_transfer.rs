@@ -147,6 +147,7 @@ pub fn manifest_from_source_paths(
         root_name,
         files: entries,
         total_bytes,
+        destination_directory: None,
     })
 }
 
@@ -535,7 +536,8 @@ async fn read_incoming(
         match message {
             BulkWireMessage::Manifest(manifest) => {
                 let transfer_id = manifest.transfer_id;
-                if let Err(error) = handle_manifest(&cache_dir, &events, &mut book, manifest).await
+                if let Err(error) =
+                    handle_manifest(&cache_dir, &events, &cancelled, &mut book, manifest).await
                 {
                     emit_bulk_failed(&events, transfer_id, &error);
                     return Err(error);
@@ -619,13 +621,30 @@ async fn read_incoming(
 async fn handle_manifest(
     cache_dir: &Path,
     events: &mpsc::UnboundedSender<BulkTransferEvent>,
+    cancelled: &Arc<Mutex<HashSet<Uuid>>>,
     book: &mut ReceiveBook,
     manifest: FileTransferManifest,
 ) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(cache_dir)
-        .await
-        .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
-    let resolved_roots = resolve_manifest_roots(cache_dir, &manifest)?;
+    let destination_dir = match manifest.destination_directory.as_deref() {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            // A bad drop destination fails this transfer only; the bulk
+            // session stays alive and later frames for it are ignored.
+            if let Err(error) = validate_destination_dir(&dir).await {
+                mark_cancelled(cancelled, manifest.transfer_id);
+                emit_bulk_failed(events, manifest.transfer_id, &error);
+                return Ok(());
+            }
+            dir
+        }
+        None => {
+            tokio::fs::create_dir_all(cache_dir)
+                .await
+                .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
+            cache_dir.to_path_buf()
+        }
+    };
+    let resolved_roots = resolve_manifest_roots(&destination_dir, &manifest)?;
     let cache_paths = top_level_cache_paths(&manifest, &resolved_roots)?;
 
     book.transfers
@@ -1036,6 +1055,23 @@ fn emit_bulk_failed(
         transfer_id,
         error: error.to_string(),
     });
+}
+
+async fn validate_destination_dir(dir: &Path) -> anyhow::Result<()> {
+    let metadata = tokio::fs::metadata(dir)
+        .await
+        .with_context(|| format!("destination directory missing: {}", dir.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "destination is not a directory: {}",
+        dir.display()
+    );
+    let probe = dir.join(format!(".borderless-probe-{}", Uuid::new_v4()));
+    tokio::fs::File::create(&probe)
+        .await
+        .with_context(|| format!("destination not writable: {}", dir.display()))?;
+    let _ = tokio::fs::remove_file(&probe).await;
+    Ok(())
 }
 
 fn resolve_manifest_roots(
@@ -1502,6 +1538,7 @@ mod tests {
             root_name: "note.txt".to_string(),
             files: vec![FileManifestEntry::file("note.txt", 21)],
             total_bytes: 21,
+            destination_directory: None,
         };
         let port = unused_tcp_port();
         let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
@@ -1588,8 +1625,9 @@ is_dir = false
         .unwrap();
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let mut book = ReceiveBook::default();
+        let cancelled = Arc::new(Mutex::new(HashSet::new()));
 
-        handle_manifest(&cache_dir, &events_tx, &mut book, manifest)
+        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
             .await
             .unwrap();
 
@@ -1600,6 +1638,70 @@ is_dir = false
         );
         assert!(!stale_target.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manifest_destination_directory_receives_files_directly() {
+        let root = temp_dir("manifest_destination_directory_receives_files_directly");
+        let cache_dir = root.join("server-cache");
+        let destination = root.join("drop-target");
+        fs::create_dir_all(&destination).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let manifest = FileTransferManifest {
+            transfer_id,
+            root_name: "note.txt".to_string(),
+            files: vec![FileManifestEntry::file("note.txt", 4)],
+            total_bytes: 4,
+            destination_directory: Some(destination.to_string_lossy().to_string()),
+        };
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let mut book = ReceiveBook::default();
+        let cancelled = Arc::new(Mutex::new(HashSet::new()));
+
+        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
+            .await
+            .unwrap();
+
+        let transfer = book.transfers.get(&transfer_id).unwrap();
+        assert_eq!(
+            transfer.cache_paths,
+            vec![destination.join("note.txt").to_string_lossy().to_string()]
+        );
+        assert!(!cache_dir.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_destination_directory_fails_transfer_without_killing_session() {
+        let root = temp_dir("missing_destination_directory_fails_transfer");
+        let cache_dir = root.join("server-cache");
+        let missing = root.join("does-not-exist");
+        let transfer_id = Uuid::new_v4();
+        let manifest = FileTransferManifest {
+            transfer_id,
+            root_name: "note.txt".to_string(),
+            files: vec![FileManifestEntry::file("note.txt", 4)],
+            total_bytes: 4,
+            destination_directory: Some(missing.to_string_lossy().to_string()),
+        };
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut book = ReceiveBook::default();
+        let cancelled = Arc::new(Mutex::new(HashSet::new()));
+
+        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
+            .await
+            .unwrap();
+
+        assert!(book.transfers.is_empty());
+        assert!(is_cancelled(&cancelled, transfer_id));
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            BulkTransferEvent::Failed { transfer_id: id, .. } if id == transfer_id
+        ));
+        assert!(!missing.exists());
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {

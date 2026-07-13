@@ -51,6 +51,11 @@ impl ControlState {
         self.mode
     }
 
+    /// Last pointer position on the remote desktop while in remote mode.
+    pub fn remote_point(&self) -> Point {
+        self.remote_point
+    }
+
     pub fn force_local(&mut self) {
         self.mode = ControlMode::Local;
     }

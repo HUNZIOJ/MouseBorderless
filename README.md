@@ -1,6 +1,6 @@
 # Borderless
 
-Borderless shares one keyboard, mouse, clipboard, and copied files between two Windows computers on the same LAN.
+Borderless shares one keyboard, mouse, clipboard, and files (copy/paste and drag/drop) between two Windows computers on the same LAN.
 
 ## Requirements
 
@@ -52,6 +52,13 @@ Allow the app to listen on the configured port on the agent computer. In KCP mod
 - Copied files and folders are transferred to the peer cache folder, then written to the peer clipboard as local paths.
 - `incoming_cache_dir` is used for copy/paste file cache and clipboard-backed file offers.
 - Large transfer progress, cancellation, and errors appear in the GUI.
+
+## Drag and Drop
+
+- Drag files toward the shared edge on either computer; the pointer hands off to the other side for choosing a destination.
+- No data is transferred until you release the mouse; files are then written directly into the folder you released over.
+- Supported drop destinations: the desktop and Explorer folder windows. If the exact release target cannot be resolved, the current Explorer window's directory is used; otherwise the drop fails with a clear error (nothing is silently written to the cache folder).
+- Toggle with `file_drag_drop` in the sharing settings; it uses the same bulk transfer port as copy/paste.
 
 ## Permissions
 

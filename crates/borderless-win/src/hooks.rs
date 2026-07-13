@@ -512,7 +512,9 @@ fn read_raw_input(lparam: LPARAM) -> anyhow::Result<RAWINPUT> {
 unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode == HC_ACTION as i32 {
         let data = unsafe { (lparam.0 as *const MSLLHOOKSTRUCT).as_ref() };
+        let mut injected = false;
         if let Some(data) = data {
+            injected = injected_mouse_event(data);
             HOOK_THREAD_STATE.with(|state| {
                 if let Some(state) = state.borrow_mut().as_mut() {
                     state.emit_mouse_events(wparam.0 as u32, data);
@@ -520,7 +522,10 @@ unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LP
             });
         }
 
-        if hook_should_suppress() {
+        // Injected events are our own (pointer parking, ending a native
+        // drag on release) — they must reach the system even while
+        // physical input is suppressed for remote control.
+        if !injected && hook_should_suppress() {
             return LRESULT(1);
         }
     }
