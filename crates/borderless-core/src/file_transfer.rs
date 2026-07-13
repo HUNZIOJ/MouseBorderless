@@ -20,8 +20,9 @@ impl FileManifestEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileTransferDestination {
+    #[default]
     IncomingCache,
     AuthorizedDrop {
         session_id: Uuid,
@@ -35,6 +36,7 @@ pub struct FileTransferManifest {
     pub root_name: String,
     pub files: Vec<FileManifestEntry>,
     pub total_bytes: u64,
+    #[serde(default)]
     pub destination: FileTransferDestination,
 }
 

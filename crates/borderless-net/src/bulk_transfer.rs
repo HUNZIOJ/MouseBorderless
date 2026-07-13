@@ -21,6 +21,8 @@ use tokio::{
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::drop_authorization::DropAuthorizationRegistry;
+
 const CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_BULK_FRAME_LEN: usize = CHUNK_SIZE + 64 * 1024;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -103,6 +105,19 @@ struct ReceiveTransfer {
     cache_paths: Vec<String>,
     resolved_roots: HashMap<String, PathBuf>,
     completed_files: HashSet<String>,
+    temp_paths: HashSet<PathBuf>,
+}
+
+impl Drop for ReceiveTransfer {
+    fn drop(&mut self) {
+        for path in self.temp_paths.drain() {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?error, path = %path.display(), "remove partial drop file");
+                }
+            }
+        }
+    }
 }
 
 struct ActiveReceiveFile {
@@ -155,6 +170,7 @@ pub async fn run_bulk_transfer_server(
     listen_host: String,
     port: u16,
     incoming_cache_dir: String,
+    authorizations: DropAuthorizationRegistry,
     events: mpsc::UnboundedSender<BulkTransferEvent>,
     mut commands: mpsc::UnboundedReceiver<BulkTransferCommand>,
 ) -> anyhow::Result<()> {
@@ -168,6 +184,7 @@ pub async fn run_bulk_transfer_server(
                 if run_connected_session(
                     stream,
                     incoming_cache_dir.clone(),
+                    authorizations.clone(),
                     events.clone(),
                     &mut commands,
                     &mut pending,
@@ -191,6 +208,7 @@ pub async fn run_bulk_transfer_client(
     host: String,
     port: u16,
     incoming_cache_dir: String,
+    authorizations: DropAuthorizationRegistry,
     events: mpsc::UnboundedSender<BulkTransferEvent>,
     mut commands: mpsc::UnboundedReceiver<BulkTransferCommand>,
 ) -> anyhow::Result<()> {
@@ -226,6 +244,7 @@ pub async fn run_bulk_transfer_client(
         if run_connected_session(
             stream,
             incoming_cache_dir.clone(),
+            authorizations.clone(),
             events.clone(),
             &mut commands,
             &mut pending,
@@ -260,6 +279,7 @@ async fn wait_before_retry(
 async fn run_connected_session(
     stream: TcpStream,
     incoming_cache_dir: String,
+    authorizations: DropAuthorizationRegistry,
     events: mpsc::UnboundedSender<BulkTransferEvent>,
     commands: &mut mpsc::UnboundedReceiver<BulkTransferCommand>,
     pending: &mut VecDeque<BulkTransferCommand>,
@@ -272,6 +292,7 @@ async fn run_connected_session(
     let reader_task = tokio::spawn(read_incoming(
         reader,
         incoming_cache_dir,
+        authorizations,
         events.clone(),
         Arc::clone(&cancelled),
     ));
@@ -521,6 +542,7 @@ where
 async fn read_incoming(
     mut reader: OwnedReadHalf,
     incoming_cache_dir: String,
+    authorizations: DropAuthorizationRegistry,
     events: mpsc::UnboundedSender<BulkTransferEvent>,
     cancelled: Arc<Mutex<HashSet<Uuid>>>,
 ) -> anyhow::Result<()> {
@@ -532,14 +554,30 @@ async fn read_incoming(
     let mut active_file: Option<ActiveReceiveFile> = None;
 
     loop {
-        let message = read_wire(&mut reader).await?;
+        let message = match read_wire(&mut reader).await {
+            Ok(message) => message,
+            Err(error) => {
+                drop(active_file.take());
+                cleanup_receive_book(&mut book).await;
+                return Err(error);
+            }
+        };
         match message {
             BulkWireMessage::Manifest(manifest) => {
                 let transfer_id = manifest.transfer_id;
-                if let Err(error) =
-                    handle_manifest(&cache_dir, &events, &cancelled, &mut book, manifest).await
+                if let Err(error) = handle_manifest(
+                    &cache_dir,
+                    &authorizations,
+                    &events,
+                    &cancelled,
+                    &mut book,
+                    manifest,
+                )
+                .await
                 {
                     emit_bulk_failed(&events, transfer_id, &error);
+                    drop(active_file.take());
+                    cleanup_receive_book(&mut book).await;
                     return Err(error);
                 }
             }
@@ -549,8 +587,9 @@ async fn read_incoming(
                 size_bytes,
                 blake3_hex,
             } => {
+                drop(active_file.take());
                 active_file = match prepare_receive_file(
-                    &book,
+                    &mut book,
                     &cancelled,
                     transfer_id,
                     relative_path,
@@ -562,6 +601,7 @@ async fn read_incoming(
                     Ok(file) => file,
                     Err(error) => {
                         emit_bulk_failed(&events, transfer_id, &error);
+                        cleanup_receive_book(&mut book).await;
                         return Err(error);
                     }
                 };
@@ -570,12 +610,20 @@ async fn read_incoming(
                 if is_cancelled(&cancelled, chunk.transfer_id) {
                     continue;
                 }
-                if let Some(file) = active_file.as_mut() {
+                let receive_error = if let Some(file) = active_file.as_mut() {
                     let transfer_id = chunk.transfer_id;
-                    if let Err(error) = receive_chunk(&events, &mut book, file, chunk).await {
-                        emit_bulk_failed(&events, transfer_id, &error);
-                        return Err(error);
-                    }
+                    receive_chunk(&events, &mut book, file, chunk)
+                        .await
+                        .err()
+                        .map(|error| (transfer_id, error))
+                } else {
+                    None
+                };
+                if let Some((transfer_id, error)) = receive_error {
+                    emit_bulk_failed(&events, transfer_id, &error);
+                    drop(active_file.take());
+                    cleanup_receive_book(&mut book).await;
+                    return Err(error);
                 }
             }
             BulkWireMessage::FileComplete {
@@ -599,6 +647,7 @@ async fn read_incoming(
                     .await
                     {
                         emit_bulk_failed(&events, transfer_id, &error);
+                        cleanup_receive_book(&mut book).await;
                         return Err(error);
                     }
                 }
@@ -609,9 +658,13 @@ async fn read_incoming(
             BulkWireMessage::Cancel { transfer_id } => {
                 mark_cancelled(&cancelled, transfer_id);
                 active_file = None;
-                if let Some(transfer) = book.transfers.get_mut(&transfer_id) {
+                let temp_paths = if let Some(transfer) = book.transfers.get_mut(&transfer_id) {
                     transfer.state = FileTransferState::Cancelled;
-                }
+                    std::mem::take(&mut transfer.temp_paths)
+                } else {
+                    HashSet::new()
+                };
+                cleanup_temp_paths(&temp_paths).await;
                 let _ = events.send(BulkTransferEvent::Cancelled(transfer_id));
             }
         }
@@ -620,25 +673,21 @@ async fn read_incoming(
 
 async fn handle_manifest(
     cache_dir: &Path,
+    authorizations: &DropAuthorizationRegistry,
     events: &mpsc::UnboundedSender<BulkTransferEvent>,
     cancelled: &Arc<Mutex<HashSet<Uuid>>>,
     book: &mut ReceiveBook,
     manifest: FileTransferManifest,
 ) -> anyhow::Result<()> {
-    let destination_dir = match &manifest.destination {
-        FileTransferDestination::IncomingCache => {
-            tokio::fs::create_dir_all(cache_dir)
-                .await
-                .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
-            cache_dir.to_path_buf()
-        }
-        FileTransferDestination::AuthorizedDrop { .. } => {
-            let error = anyhow::anyhow!("drop destination authorization is not available");
-            mark_cancelled(cancelled, manifest.transfer_id);
-            emit_bulk_failed(events, manifest.transfer_id, &error);
-            return Ok(());
-        }
-    };
+    let destination_dir =
+        match resolve_receive_destination(cache_dir, authorizations, &manifest).await {
+            Ok(destination) => destination,
+            Err(error) => {
+                mark_cancelled(cancelled, manifest.transfer_id);
+                emit_bulk_failed(events, manifest.transfer_id, &error);
+                return Ok(());
+            }
+        };
     let resolved_roots = resolve_manifest_roots(&destination_dir, &manifest)?;
     let cache_paths = top_level_cache_paths(&manifest, &resolved_roots)?;
 
@@ -659,6 +708,7 @@ async fn handle_manifest(
             cache_paths: cache_paths.clone(),
             resolved_roots: resolved_roots.clone(),
             completed_files: HashSet::new(),
+            temp_paths: HashSet::new(),
         });
     let transfer = book
         .transfers
@@ -675,8 +725,67 @@ async fn handle_manifest(
     Ok(())
 }
 
+async fn resolve_receive_destination(
+    cache_dir: &Path,
+    registry: &DropAuthorizationRegistry,
+    manifest: &FileTransferManifest,
+) -> anyhow::Result<PathBuf> {
+    match &manifest.destination {
+        FileTransferDestination::IncomingCache => {
+            tokio::fs::create_dir_all(cache_dir)
+                .await
+                .with_context(|| format!("create cache directory {}", cache_dir.display()))?;
+            Ok(cache_dir.to_path_buf())
+        }
+        FileTransferDestination::AuthorizedDrop {
+            session_id,
+            authorization,
+        } => {
+            let destination =
+                registry.consume(*session_id, manifest.transfer_id, *authorization)?;
+            validate_destination_dir(&destination).await?;
+            Ok(destination)
+        }
+    }
+}
+
+async fn validate_destination_dir(dir: &Path) -> anyhow::Result<()> {
+    let metadata = tokio::fs::metadata(dir)
+        .await
+        .with_context(|| format!("destination directory missing: {}", dir.display()))?;
+    ensure!(
+        metadata.is_dir(),
+        "destination is not a directory: {}",
+        dir.display()
+    );
+    let probe = dir.join(format!(".borderless-probe-{}", Uuid::new_v4()));
+    tokio::fs::File::create(&probe)
+        .await
+        .with_context(|| format!("destination not writable: {}", dir.display()))?;
+    let _ = tokio::fs::remove_file(&probe).await;
+    Ok(())
+}
+
+async fn cleanup_temp_paths(temp_paths: &HashSet<PathBuf>) {
+    for path in temp_paths {
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?error, path = %path.display(), "remove partial drop file");
+            }
+        }
+    }
+}
+
+async fn cleanup_receive_book(book: &mut ReceiveBook) {
+    let mut temp_paths = HashSet::new();
+    for transfer in book.transfers.values_mut() {
+        temp_paths.extend(std::mem::take(&mut transfer.temp_paths));
+    }
+    cleanup_temp_paths(&temp_paths).await;
+}
+
 async fn prepare_receive_file(
-    book: &ReceiveBook,
+    book: &mut ReceiveBook,
     cancelled: &Arc<Mutex<HashSet<Uuid>>>,
     transfer_id: Uuid,
     relative_path: String,
@@ -711,6 +820,11 @@ async fn prepare_receive_file(
     let file = tokio::fs::File::create(&temp_path)
         .await
         .with_context(|| format!("create temporary file {}", temp_path.display()))?;
+    book.transfers
+        .get_mut(&transfer_id)
+        .context("transfer disappeared before temporary file registration")?
+        .temp_paths
+        .insert(temp_path.clone());
 
     Ok(Some(ActiveReceiveFile {
         transfer_id,
@@ -799,6 +913,7 @@ async fn complete_receive_file(
         .with_context(|| format!("rename {}", active.final_path.display()))?;
 
     if let Some(transfer) = book.transfers.get_mut(&transfer_id) {
+        transfer.temp_paths.remove(&active.temp_path);
         transfer.completed_files.insert(relative_path.to_string());
         maybe_emit_completed(events, book, transfer_id);
     }
@@ -1194,6 +1309,7 @@ fn is_cancelled(cancelled: &Arc<Mutex<HashSet<Uuid>>>, transfer_id: Uuid) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drop_authorization::DropAuthorizationRegistry;
     use borderless_core::file_transfer::{FileManifestEntry, FileTransferManifest};
     use std::{
         fs,
@@ -1214,6 +1330,77 @@ mod tests {
             "report (Borderless 1).txt"
         );
         assert_eq!(rename_conflict("archive", 2), "archive (Borderless 2)");
+    }
+
+    #[tokio::test]
+    async fn authorized_drop_receives_files_directly() {
+        let root = temp_dir("authorized_drop_receives_files_directly");
+        let cache = root.join("cache");
+        let destination = root.join("drop");
+        fs::create_dir_all(&destination).unwrap();
+        let registry = DropAuthorizationRegistry::default();
+        let session_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let token = registry.register(
+            session_id,
+            transfer_id,
+            destination.clone(),
+            Duration::from_secs(30),
+        );
+        let manifest = FileTransferManifest {
+            transfer_id,
+            root_name: "note.txt".to_string(),
+            files: vec![FileManifestEntry::file("note.txt", 4)],
+            total_bytes: 4,
+            destination: FileTransferDestination::AuthorizedDrop {
+                session_id,
+                authorization: token,
+            },
+        };
+
+        let resolved = resolve_receive_destination(&cache, &registry, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(resolved, destination);
+        assert!(registry.consume(session_id, transfer_id, token).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forged_or_missing_drop_authorization_is_rejected() {
+        let manifest = FileTransferManifest {
+            transfer_id: Uuid::from_u128(2),
+            root_name: "note.txt".to_string(),
+            files: vec![FileManifestEntry::file("note.txt", 4)],
+            total_bytes: 4,
+            destination: FileTransferDestination::AuthorizedDrop {
+                session_id: Uuid::from_u128(1),
+                authorization: Uuid::from_u128(99),
+            },
+        };
+        let registry = DropAuthorizationRegistry::default();
+        assert!(
+            resolve_receive_destination(Path::new("cache"), &registry, &manifest)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_cleanup_removes_only_partial_files() {
+        let root = temp_dir("disconnect_cleanup_removes_only_partial_files");
+        fs::create_dir_all(&root).unwrap();
+        let partial = root.join("report.pdf.borderless-part");
+        let existing = root.join("existing.pdf");
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(&existing, b"keep").unwrap();
+        let paths = HashSet::from([partial.clone()]);
+
+        cleanup_temp_paths(&paths).await;
+
+        assert!(!partial.exists());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1289,6 +1476,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             server_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             server_events_tx,
             server_commands_rx,
         ));
@@ -1296,6 +1484,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             client_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             client_events_tx,
             client_commands_rx,
         ));
@@ -1363,6 +1552,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             server_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             server_events_tx,
             server_commands_rx,
         ));
@@ -1370,6 +1560,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             client_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             client_events_tx,
             client_commands_rx,
         ));
@@ -1448,6 +1639,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             server_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             server_events_tx,
             server_commands_rx,
         ));
@@ -1455,6 +1647,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             client_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             client_events_tx,
             client_commands_rx,
         ));
@@ -1528,6 +1721,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             server_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             server_events_tx,
             server_commands_rx,
         ));
@@ -1535,6 +1729,7 @@ mod tests {
             "127.0.0.1".to_string(),
             port,
             client_cache.to_string_lossy().to_string(),
+            DropAuthorizationRegistry::default(),
             client_events_tx,
             client_commands_rx,
         ));
@@ -1605,9 +1800,16 @@ is_dir = false
         let mut book = ReceiveBook::default();
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
 
-        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
-            .await
-            .unwrap();
+        handle_manifest(
+            &cache_dir,
+            &DropAuthorizationRegistry::default(),
+            &events_tx,
+            &cancelled,
+            &mut book,
+            manifest,
+        )
+        .await
+        .unwrap();
 
         let transfer = book.transfers.get(&transfer_id).unwrap();
         assert_eq!(
@@ -1634,9 +1836,16 @@ is_dir = false
         let mut book = ReceiveBook::default();
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
 
-        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
-            .await
-            .unwrap();
+        handle_manifest(
+            &cache_dir,
+            &DropAuthorizationRegistry::default(),
+            &events_tx,
+            &cancelled,
+            &mut book,
+            manifest,
+        )
+        .await
+        .unwrap();
 
         let transfer = book.transfers.get(&transfer_id).unwrap();
         assert_eq!(
@@ -1666,9 +1875,16 @@ is_dir = false
         let mut book = ReceiveBook::default();
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
 
-        handle_manifest(&cache_dir, &events_tx, &cancelled, &mut book, manifest)
-            .await
-            .unwrap();
+        handle_manifest(
+            &cache_dir,
+            &DropAuthorizationRegistry::default(),
+            &events_tx,
+            &cancelled,
+            &mut book,
+            manifest,
+        )
+        .await
+        .unwrap();
 
         assert!(book.transfers.is_empty());
         assert!(is_cancelled(&cancelled, transfer_id));
