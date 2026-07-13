@@ -14,6 +14,7 @@ pub struct UiSnapshot {
     pub transfer_file: String,
     pub transfer_detail: String,
     pub transfer_destination: String,
+    pub drag_state: String,
     pub last_error: String,
 }
 
@@ -95,6 +96,7 @@ impl UiSnapshot {
                 status.transfer_bytes_done, status.transfer_bytes_total
             ),
             transfer_destination: status.drag_drop_destination.clone().unwrap_or_default(),
+            drag_state: status.drag_drop_state.clone().unwrap_or_default(),
             last_error: status.last_error.clone().unwrap_or_default(),
         }
     }
@@ -155,6 +157,20 @@ mod tests {
         assert_eq!(view.latency_label, "3 ms");
         assert_eq!(view.transfer_progress, 0.62);
         assert_eq!(view.transfer_file, "design.pdf");
+    }
+
+    #[test]
+    fn drag_status_projects_destination_and_failure() {
+        let status = AppStatus {
+            drag_drop_state: Some("拖放失败：目标目录不可写".to_string()),
+            drag_drop_destination: Some("桌面\\Reports".to_string()),
+            ..AppStatus::default()
+        };
+
+        let view = UiSnapshot::from_status(&status);
+
+        assert_eq!(view.drag_state, "拖放失败：目标目录不可写");
+        assert_eq!(view.transfer_destination, "桌面\\Reports");
     }
 
     #[test]

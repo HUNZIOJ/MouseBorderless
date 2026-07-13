@@ -107,6 +107,8 @@ mod tests {
             transfer_bytes_done: 1,
             transfer_bytes_total: 2,
             transfer_current_file: Some("a.txt".to_string()),
+            drag_drop_state: Some("正在解析目标目录".to_string()),
+            drag_drop_destination: Some("桌面\\Reports".to_string()),
             mouse_diagnostics: Some("raw=1".to_string()),
             ..AppStatus::default()
         };
@@ -125,6 +127,8 @@ mod tests {
         assert_eq!(status.transfer_bytes_done, 0);
         assert_eq!(status.transfer_bytes_total, 0);
         assert_eq!(status.transfer_current_file, None);
+        assert_eq!(status.drag_drop_state, None);
+        assert_eq!(status.drag_drop_destination, None);
         assert_eq!(status.mouse_diagnostics, None);
     }
 

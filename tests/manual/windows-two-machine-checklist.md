@@ -7,6 +7,14 @@
 - Agent firewall allows the control TCP port and bulk transfer TCP port.
 - Both apps are running at the same privilege level.
 
+## Test Record
+
+- Date: Not run
+- Controller OS/build and scaling: Not recorded
+- Agent OS/build and scaling: Not recorded
+- Borderless build/commit: Not recorded
+- Network/firewall notes: Not recorded
+
 ## Connection
 
 - [ ] Agent shows waiting or connected state.
@@ -57,13 +65,31 @@
 - [ ] Transfer progress appears in GUI.
 - [ ] Cancel leaves only temporary partial files.
 
-## Real File Drag/Drop
+## Drag/Drop: Controller to Agent
 
-- [ ] Single file dragged across the configured edge drops into remote Explorer.
-- [ ] Folder dragged across the configured edge drops with contents preserved.
-- [ ] Multiple files dragged across the edge drop into a remote file-drop target.
-- [ ] Drag cancel returns both GUIs and input state to normal.
-- [ ] Disconnect during drag cleans session state and leaves partial files temporary.
+| Scenario | Status | Notes |
+| --- | --- | --- |
+| Single file to desktop | Not run | Confirm source remains and target contents match. |
+| Multiple files to Explorer current directory | Not run | Release over empty Explorer space. |
+| Folder to a filesystem folder icon | Not run | Confirm exact icon directory and nested contents. |
+| Same-name target conflict | Not run | Confirm automatic rename and no overwrite. |
+| Cancel before release | Not run | Confirm no payload starts and input returns locally. |
+| Disconnect during transfer | Not run | Confirm partial files are removed and input recovers. |
+| Unwritable destination | Not run | Confirm clear failure and no cache/desktop fallback. |
+| Large file progress | Not run | Confirm progress, destination, and verified completion. |
+
+## Drag/Drop: Agent to Controller
+
+| Scenario | Status | Notes |
+| --- | --- | --- |
+| Single file to desktop | Not run | Confirm source remains and target contents match. |
+| Multiple files to Explorer current directory | Not run | Release over empty Explorer space. |
+| Folder to a filesystem folder icon | Not run | Confirm exact icon directory and nested contents. |
+| Same-name target conflict | Not run | Confirm automatic rename and no overwrite. |
+| Cancel before release | Not run | Confirm no payload starts and input returns locally. |
+| Disconnect during transfer | Not run | Confirm partial files are removed and input recovers. |
+| Unwritable destination | Not run | Confirm clear failure and no cache/desktop fallback. |
+| Large file progress | Not run | Confirm progress, destination, and verified completion. |
 
 ## Recovery
 

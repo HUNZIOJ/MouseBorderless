@@ -39,6 +39,7 @@ export component AppWindow inherits Window {
     in property <string> transfer-file: "";
     in property <string> transfer-detail: "";
     in property <string> transfer-destination: "";
+    in property <string> drag-state: "";
     in-out property <string> config-error-message: "";
     in property <string> runtime-error-message: "";
     in property <[ActivityRow]> activities: [];
@@ -290,7 +291,7 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    visible: root.transfer-active;
+                    visible: root.transfer-active || root.drag-state != "";
                     height: 104px;
                     background: white;
                     border-width: 1px;
@@ -303,19 +304,26 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             alignment: space-between;
                             Text {
-                                text: root.transfer-file;
+                                text: root.transfer-active ? root.transfer-file : root.drag-state;
                                 font-weight: 700;
                                 overflow: elide;
                             }
                             Button {
+                                visible: root.transfer-active;
                                 width: 64px;
                                 text: "取消";
                                 clicked => { root.cancel-transfer-requested(); }
                             }
                         }
-                        ProgressIndicator { progress: root.transfer-progress; }
+                        if root.transfer-active : ProgressIndicator {
+                            progress: root.transfer-progress;
+                        }
                         Text {
-                            text: root.transfer-detail + " · " + root.transfer-destination;
+                            text: root.transfer-active
+                                ? root.transfer-detail + (root.transfer-destination != ""
+                                    ? " · " + root.transfer-destination
+                                    : "")
+                                : root.transfer-destination;
                             color: #68777e;
                             overflow: elide;
                         }

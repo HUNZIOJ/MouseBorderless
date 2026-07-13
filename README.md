@@ -39,7 +39,7 @@ cargo run -p borderless-app
 
 ## Firewall
 
-Allow the app on the agent computer to listen on the control TCP port (`24800` by default) and the bulk transfer TCP port (`24802` by default).
+Allow Borderless through Windows Firewall on both computers. Control and pointer traffic use the control TCP port (`24800` by default); clipboard files and drag/drop payloads use the bulk TCP port (`24802` by default). No UDP or KCP ports are used.
 
 ## Clipboard and Files
 
@@ -50,9 +50,12 @@ Allow the app on the agent computer to listen on the control TCP port (`24800` b
 
 ## Drag and Drop
 
-- Drag files toward the shared edge on either computer; the pointer hands off to the other side for choosing a destination.
-- No data is transferred until you release the mouse; files are then written directly into the folder you released over.
-- Supported drop destinations: the desktop and Explorer folder windows. If the exact release target cannot be resolved, the current Explorer window's directory is used; otherwise the drop fails with a clear error (nothing is silently written to the cache folder).
+- Drag files or folders toward the shared edge on either computer. The pointer and left-button state hand off first so the destination can be chosen on the other computer.
+- Drag/drop works in both directions. No file bytes are transferred until the mouse is released and the target computer has authorized the resolved local directory.
+- Supported targets are the desktop, an Explorer window's current filesystem directory, and a filesystem folder icon under the release point.
+- Transfers always copy. Source files and folders are never deleted, and an existing same-name target is preserved by automatically renaming the incoming item.
+- Quick Access, This PC, search results, archives, application windows, and other non-filesystem Shell targets fail with a clear message. A failed resolution is never redirected to the incoming cache or desktop.
+- The source shows success only after the target verifies the received files and confirms final placement.
 - Toggle with `file_drag_drop` in the sharing settings; it uses the same bulk transfer port as copy/paste.
 
 ## Permissions

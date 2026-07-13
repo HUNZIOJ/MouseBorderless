@@ -29,6 +29,7 @@ mod ui_compile_tests {
             window.set_target_port(24800);
             window.set_connection_label("已停止".into());
             window.set_transfer_active(false);
+            window.set_drag_state("".into());
             window.on_start_requested(|| {});
             window.on_stop_requested(|| {});
         }

@@ -202,6 +202,7 @@ fn apply_status_to_window(window: &AppWindow, status: &AppStatus) {
     window.set_transfer_file(view.transfer_file.into());
     window.set_transfer_detail(view.transfer_detail.into());
     window.set_transfer_destination(view.transfer_destination.into());
+    window.set_drag_state(view.drag_state.into());
     window.set_runtime_error_message(view.last_error.into());
 
     let rows = activity_rows(status)
