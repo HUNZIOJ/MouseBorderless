@@ -215,6 +215,10 @@ fn apply_status_to_window(window: &AppWindow, status: &AppStatus) {
     window.set_activities(slint::ModelRc::new(slint::VecModel::from(rows)));
 }
 
+fn request_runtime_stop(send: impl FnOnce(RuntimeCommand)) {
+    send(RuntimeCommand::Stop);
+}
+
 pub fn run_app() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
     let (config, load_error) = match AppConfig::load_from_path(CONFIG_PATH) {
@@ -261,7 +265,9 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
             apply_status_to_window(&window, &status_for_timer.borrow());
         },
     );
-    window.run()
+    let result = window.run();
+    request_runtime_stop(|command| runtime.send(command));
+    result
 }
 
 #[cfg(test)]
@@ -284,5 +290,12 @@ mod tests {
     fn rejects_empty_or_non_numeric_advanced_settings() {
         assert!(parse_u64_setting("", "最大文件大小").is_err());
         assert!(parse_u64_setting("20GB", "最大文件大小").is_err());
+    }
+
+    #[test]
+    fn closing_the_ui_requests_runtime_stop() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        request_runtime_stop(|command| tx.send(command).unwrap());
+        assert!(matches!(rx.recv().unwrap(), RuntimeCommand::Stop));
     }
 }

@@ -1,6 +1,5 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod app;
 mod logging;
 mod runtime;
 mod status;
@@ -8,16 +7,10 @@ mod ui;
 mod ui_bridge;
 mod ui_model;
 
-fn main() -> eframe::Result<()> {
+fn main() -> Result<(), slint::PlatformError> {
     let _logging_guard = logging::init_logging(false).ok();
     let _ = borderless_win::dpi::enable_per_monitor_dpi_awareness();
-
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "Borderless",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(app::BorderlessApp::new()))),
-    )
+    ui_bridge::run_app()
 }
 
 #[cfg(test)]

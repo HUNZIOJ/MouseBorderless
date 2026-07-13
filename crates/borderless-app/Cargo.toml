@@ -14,8 +14,6 @@ borderless-core = { path = "../borderless-core" }
 borderless-net = { path = "../borderless-net" }
 borderless-win = { path = "../borderless-win" }
 crossbeam-channel.workspace = true
-eframe.workspace = true
-egui.workspace = true
 slint.workspace = true
 tokio.workspace = true
 tracing.workspace = true

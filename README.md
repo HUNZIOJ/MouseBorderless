@@ -1,6 +1,6 @@
 # Borderless
 
-Borderless shares one keyboard, mouse, clipboard, and files (copy/paste and drag/drop) between two Windows computers on the same LAN.
+Borderless shares one keyboard, mouse, clipboard, and files (copy/paste and drag/drop) between two Windows computers on the same LAN through a native Chinese control desk.
 
 ## Requirements
 
@@ -19,23 +19,23 @@ cargo run -p borderless-app
 
 ## Controller Setup
 
-1. Choose `Controller`.
+1. Choose `控制端`.
 2. Enter the agent computer IP and port.
 3. Choose the agent position: left, right, top, or bottom.
 4. Enable clipboard text, HTML, image sync, and file copy/paste as needed.
 5. Confirm bulk transfer port, incoming cache folder for copy/paste cache, and transfer limits.
-6. Click `Save`.
-7. Click `Start`.
+6. Click `保存设置`.
+7. Click `开始共享`.
 
 ## Agent Setup
 
-1. Choose `Agent`.
+1. Choose `被控端`.
 2. Set listen IP to `0.0.0.0`.
 3. Set listen port to match the controller.
 4. Enable matching clipboard and file sharing options.
 5. Confirm bulk transfer port and the incoming cache folder for copy/paste cache.
-6. Click `Save`.
-7. Click `Start`.
+6. Click `保存设置`.
+7. Click `开始共享`.
 
 ## Firewall
 
