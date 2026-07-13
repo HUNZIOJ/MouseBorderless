@@ -287,8 +287,10 @@ pointer_port = 24801
 
     #[test]
     fn invalid_edge_width_is_rejected() {
-        let mut config = AppConfig::default();
-        config.edge_trigger_px = 0;
+        let config = AppConfig {
+            edge_trigger_px: 0,
+            ..AppConfig::default()
+        };
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("edge_trigger_px"));
     }

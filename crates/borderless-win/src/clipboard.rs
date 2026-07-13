@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn clipboard_write_open_requires_owner_window() {
-        let owner = HWND(1usize as *mut core::ffi::c_void);
+        let owner = HWND(std::ptr::dangling_mut::<core::ffi::c_void>());
 
         assert_eq!(
             clipboard_open_hwnd(ClipboardOpenMode::Read, None).unwrap(),
@@ -885,8 +885,7 @@ mod tests {
     fn remote_write_suppression_is_active_before_write_operation_runs() {
         clear_local_suppress_window_for_test();
 
-        let active_during_operation =
-            with_remote_write_suppression(|| take_local_suppress_window());
+        let active_during_operation = with_remote_write_suppression(take_local_suppress_window);
 
         assert!(active_during_operation);
     }
