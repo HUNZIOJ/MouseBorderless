@@ -16,8 +16,12 @@ borderless-win = { path = "../borderless-win" }
 crossbeam-channel.workspace = true
 eframe.workspace = true
 egui.workspace = true
+slint.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

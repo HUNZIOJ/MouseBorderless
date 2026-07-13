@@ -1,0 +1,16 @@
+import { Button, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Borderless";
+    preferred-width: 1080px;
+    preferred-height: 660px;
+
+    VerticalBox {
+        Text {
+            text: "Borderless";
+            font-size: 20px;
+            font-weight: 700;
+        }
+        Button { text: "界面加载成功"; }
+    }
+}

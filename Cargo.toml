@@ -21,6 +21,8 @@ crossbeam-channel = "0.5"
 eframe = "0.28"
 egui = "0.28"
 serde = { version = "1", features = ["derive"] }
+slint = "=1.17.1"
+slint-build = "=1.17.1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
 toml = "0.8"
