@@ -5,15 +5,7 @@ mod logging;
 mod runtime;
 mod status;
 mod ui;
-
-#[cfg(test)]
-mod ui_compile_tests {
-    #[test]
-    fn generated_slint_window_type_is_available() {
-        fn accepts_window(_: Option<crate::ui::AppWindow>) {}
-        accepts_window(None);
-    }
-}
+mod ui_model;
 
 fn main() -> eframe::Result<()> {
     let _logging_guard = logging::init_logging(false).ok();
@@ -25,4 +17,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|_cc| Ok(Box::new(app::BorderlessApp::new()))),
     )
+}
+
+#[cfg(test)]
+mod ui_compile_tests {
+    #[test]
+    fn generated_slint_window_type_is_available() {
+        fn accepts_window(_: Option<crate::ui::AppWindow>) {}
+        accepts_window(None);
+    }
 }
