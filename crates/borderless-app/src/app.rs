@@ -214,24 +214,12 @@ impl BorderlessApp {
                         );
                         ui.end_row();
 
-                        ui.label("Transport");
-                        ui.label(option_text(self.status.transport_mode));
-                        ui.end_row();
-
                         ui.label("RTT");
                         ui.label(option_ms(self.status.recent_rtt_ms));
                         ui.end_row();
 
                         ui.label("Average RTT");
                         ui.label(option_ms(self.status.average_rtt_ms));
-                        ui.end_row();
-
-                        ui.label("Latest pointer sequence");
-                        ui.label(option_number(self.status.latest_pointer_sequence));
-                        ui.end_row();
-
-                        ui.label("Stale pointer packets");
-                        ui.label(self.status.stale_pointer_packets.to_string());
                         ui.end_row();
 
                         ui.label("Clipboard enabled");

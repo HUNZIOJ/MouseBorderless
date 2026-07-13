@@ -8,8 +8,6 @@ pub enum ConnectionEvent {
     Connected { peer: String },
     Disconnected(String),
     Message(WireMessage),
-    LatestPointer { x: i32, y: i32, sequence: u64 },
-    StalePointerPackets { count: u64 },
     Error(String),
 }
 

@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use borderless_core::config::TransportMode;
 use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunState {
@@ -18,12 +17,9 @@ pub enum RunState {
 #[derive(Clone, Debug, Default)]
 pub struct AppStatus {
     pub run_state: RunState,
-    pub transport_mode: Option<TransportMode>,
     pub last_error: Option<String>,
     pub recent_rtt_ms: Option<u64>,
     pub average_rtt_ms: Option<u64>,
-    pub stale_pointer_packets: u64,
-    pub latest_pointer_sequence: Option<u64>,
     pub clipboard_enabled: bool,
     pub last_clipboard_format: Option<String>,
     pub last_clipboard_bytes: Option<u64>,
@@ -41,12 +37,9 @@ pub struct AppStatus {
 
 impl AppStatus {
     pub fn reset_runtime_fields(&mut self) {
-        self.transport_mode = None;
         self.last_error = None;
         self.recent_rtt_ms = None;
         self.average_rtt_ms = None;
-        self.stale_pointer_packets = 0;
-        self.latest_pointer_sequence = None;
         self.clipboard_enabled = false;
         self.last_clipboard_format = None;
         self.last_clipboard_bytes = None;
@@ -102,12 +95,9 @@ mod tests {
     #[test]
     fn reset_runtime_fields_clears_live_metrics() {
         let mut status = AppStatus {
-            transport_mode: Some(TransportMode::Kcp),
             last_error: Some("boom".to_string()),
             recent_rtt_ms: Some(10),
             average_rtt_ms: Some(20),
-            stale_pointer_packets: 3,
-            latest_pointer_sequence: Some(99),
             clipboard_enabled: true,
             last_clipboard_format: Some("text".to_string()),
             last_clipboard_bytes: Some(12),
@@ -123,12 +113,9 @@ mod tests {
 
         status.reset_runtime_fields();
 
-        assert_eq!(status.transport_mode, None);
         assert_eq!(status.last_error, None);
         assert_eq!(status.recent_rtt_ms, None);
         assert_eq!(status.average_rtt_ms, None);
-        assert_eq!(status.stale_pointer_packets, 0);
-        assert_eq!(status.latest_pointer_sequence, None);
         assert!(!status.clipboard_enabled);
         assert_eq!(status.last_clipboard_format, None);
         assert_eq!(status.last_clipboard_bytes, None);

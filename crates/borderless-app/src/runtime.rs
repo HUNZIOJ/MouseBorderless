@@ -10,7 +10,7 @@ use std::{
 
 use borderless_core::{
     clipboard::{ClipboardEnvelope, ClipboardPayload, RemoteFileOffer},
-    config::{AppConfig, Role, TransportMode},
+    config::{AppConfig, Role},
     control::{ControlMode, ControlOutput, ControlState},
     drag_drop::DropTarget,
     file_transfer::FileManifestEntry,
@@ -51,7 +51,6 @@ use crate::status::{AppStatus, RunState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const MAX_OUTSTANDING_HEARTBEATS: usize = 8;
-const STALE_POINTER_EMIT_INTERVAL_MILLIS: u64 = 1_000;
 const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_MOVE_COALESCE_LOG_THRESHOLD: u64 = 100;
 const REMOTE_MOVE_COALESCE_LOG_WINDOW_MILLIS: u64 = 1_000;
@@ -240,7 +239,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
     let (updates_tx, updates_rx) = unbounded();
     let mut active: Option<ActiveRuntime> = None;
     let mut status = AppStatus::default();
-    let mut stale_pointer_packet_gate = StalePointerPacketGate::default();
     let mut transfer_purposes = TransferPurposeTracker::default();
     let mut next_session_id: u64 = 1;
 
@@ -258,7 +256,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_packet_gate.reset();
                         transfer_purposes.clear();
                         prepare_running_status(&mut status, &config, RunState::Connecting);
                         emit_log(&mut status, &events_tx, "starting runtime");
@@ -272,7 +269,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
-                                    &mut stale_pointer_packet_gate,
                                     &mut transfer_purposes,
                                 );
                             })
@@ -284,7 +280,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_packet_gate.reset();
                         transfer_purposes.clear();
                         prepare_stopped_status(&mut status);
                         emit_log(&mut status, &events_tx, "runtime stopped");
@@ -296,7 +291,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             log_stop_task_outcome(&mut status, &events_tx, outcome);
                         }
 
-                        stale_pointer_packet_gate.reset();
                         transfer_purposes.clear();
                         prepare_running_status(&mut status, &config, RunState::Reconnecting);
                         emit_log(&mut status, &events_tx, "reconnecting runtime");
@@ -310,7 +304,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                                     &mut status,
                                     &events_tx,
                                     SessionUpdate::Error(error),
-                                    &mut stale_pointer_packet_gate,
                                     &mut transfer_purposes,
                                 );
                             })
@@ -343,7 +336,6 @@ async fn run_runtime_loop(commands_rx: Receiver<RuntimeCommand>, events_tx: Send
                             &mut status,
                             &events_tx,
                             update.update,
-                            &mut stale_pointer_packet_gate,
                             &mut transfer_purposes,
                         );
                 }
@@ -639,7 +631,7 @@ async fn run_controller_event_pump(
     let mut pending_pointer_park: Option<Point> = None;
     let mut pending_remote_pointer_position: Option<PendingRemotePointerPosition> = None;
     let mut mouse_diagnostics = MouseDiagnostics::default();
-    let mut remote_input_send_buffer = RemoteInputSendBuffer::new(config.controller.transport_mode);
+    let mut remote_input_send_buffer = RemoteInputSendBuffer::new();
     let mut heartbeat = HeartbeatTracker::default();
     let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
     let mut hook_interval = interval(HOOK_POLL_INTERVAL);
@@ -908,8 +900,6 @@ fn handle_controller_connection_event(
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
         | ConnectionEvent::Connected { .. }
-        | ConnectionEvent::LatestPointer { .. }
-        | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Input(_))
         | ConnectionEvent::Message(WireMessage::ReleaseAll)
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
@@ -997,33 +987,26 @@ enum RemoteSendAction {
 
 #[derive(Clone, Debug)]
 struct RemoteInputSendBuffer {
-    transport_mode: TransportMode,
-    pending_tcp_move: Option<Point>,
+    pending_move: Option<Point>,
     coalescing_log_gate: RemoteMoveCoalescingLogGate,
 }
 
 impl RemoteInputSendBuffer {
-    fn new(transport_mode: TransportMode) -> Self {
+    fn new() -> Self {
         Self {
-            transport_mode,
-            pending_tcp_move: None,
+            pending_move: None,
             coalescing_log_gate: RemoteMoveCoalescingLogGate::default(),
         }
     }
 
     fn send_pointer(&mut self, point: Point, now_millis: u64) -> Vec<RemoteSendAction> {
-        match self.transport_mode {
-            TransportMode::Kcp => vec![RemoteSendAction::Command(latest_pointer_command(point))],
-            TransportMode::Tcp => {
-                let mut actions = Vec::new();
-                if self.pending_tcp_move.replace(point).is_some() {
-                    if let Some(emission) = self.coalescing_log_gate.record(now_millis) {
-                        actions.push(RemoteSendAction::Log(emission.log_message()));
-                    }
-                }
-                actions
+        let mut actions = Vec::new();
+        if self.pending_move.replace(point).is_some() {
+            if let Some(emission) = self.coalescing_log_gate.record(now_millis) {
+                actions.push(RemoteSendAction::Log(emission.log_message()));
             }
         }
+        actions
     }
 
     fn send_reliable_input(&mut self, event: InputEvent) -> Vec<RemoteSendAction> {
@@ -1043,12 +1026,17 @@ impl RemoteInputSendBuffer {
     }
 
     fn flush_pending_move(&mut self) -> Vec<RemoteSendAction> {
-        self.pending_tcp_move
+        self.pending_move
             .take()
-            .map(latest_pointer_command)
-            .map(RemoteSendAction::Command)
-            .into_iter()
-            .collect()
+            .map(|point| {
+                vec![RemoteSendAction::Command(ConnectionCommand::Send(
+                    WireMessage::Input(InputEvent::MouseMoveAbs(MouseMoveAbsEvent {
+                        x: point.x,
+                        y: point.y,
+                    })),
+                ))]
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -1133,15 +1121,6 @@ fn emit_before_clearing_remote_control(
 ) {
     emit();
     remote_control_active.store(false, Ordering::SeqCst);
-}
-
-fn latest_pointer_command(point: Point) -> ConnectionCommand {
-    ConnectionCommand::Send(WireMessage::Input(InputEvent::MouseMoveAbs(
-        MouseMoveAbsEvent {
-            x: point.x,
-            y: point.y,
-        },
-    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1684,14 +1663,6 @@ fn handle_agent_connection_event(
         ConnectionEvent::Message(WireMessage::Input(input)) => {
             inject_agent_input(injector, input, updates, session_id);
         }
-        ConnectionEvent::LatestPointer { x, y, .. } => {
-            inject_agent_input(
-                injector,
-                InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x, y }),
-                updates,
-                session_id,
-            );
-        }
         ConnectionEvent::Message(WireMessage::ReleaseAll) => {
             release_agent_input(injector, updates, session_id, false);
         }
@@ -1730,7 +1701,6 @@ fn handle_agent_connection_event(
         }
         ConnectionEvent::Waiting
         | ConnectionEvent::Connecting(_)
-        | ConnectionEvent::StalePointerPackets { .. }
         | ConnectionEvent::Message(WireMessage::Hello(_))
         | ConnectionEvent::Message(WireMessage::FileTransferProgress { .. })
         | ConnectionEvent::Message(WireMessage::FileTransferComplete { .. })
@@ -3359,29 +3329,16 @@ fn apply_session_update(
     status: &mut AppStatus,
     events: &Sender<RuntimeEvent>,
     update: SessionUpdate,
-    stale_pointer_packet_gate: &mut StalePointerPacketGate,
     transfer_purposes: &mut TransferPurposeTracker,
 ) {
     let mut status_changed = false;
 
     match update {
         SessionUpdate::Connection(event) => {
-            if let ConnectionEvent::StalePointerPackets { count } = event {
-                if let Some(emission) = apply_stale_pointer_packet_update(
-                    status,
-                    stale_pointer_packet_gate,
-                    count,
-                    now_millis(),
-                ) {
-                    emit_log(status, events, emission.log_message());
-                    status_changed = true;
-                }
-            } else {
-                status_changed = connection_event_updates_status(&event);
-                apply_connection_event_to_status(status, &event);
-                if let Some(message) = connection_event_log(&event) {
-                    emit_log(status, events, message);
-                }
+            status_changed = connection_event_updates_status(&event);
+            apply_connection_event_to_status(status, &event);
+            if let Some(message) = connection_event_log(&event) {
+                emit_log(status, events, message);
             }
         }
         SessionUpdate::Error(error) => {
@@ -3683,12 +3640,6 @@ fn apply_connection_event_to_status(status: &mut AppStatus, event: &ConnectionEv
             status.last_error = None;
         }
         ConnectionEvent::Disconnected(_) => status.run_state = RunState::Reconnecting,
-        ConnectionEvent::LatestPointer { sequence, .. } => {
-            status.latest_pointer_sequence = Some(*sequence);
-        }
-        ConnectionEvent::StalePointerPackets { count } => {
-            status.stale_pointer_packets = *count;
-        }
         ConnectionEvent::Error(error) => {
             status.run_state = RunState::Error;
             status.last_error = Some(error.clone());
@@ -3708,7 +3659,6 @@ fn connection_event_updates_status(event: &ConnectionEvent) -> bool {
             | ConnectionEvent::Connecting(_)
             | ConnectionEvent::Connected { .. }
             | ConnectionEvent::Disconnected(_)
-            | ConnectionEvent::LatestPointer { .. }
             | ConnectionEvent::Error(_)
             | ConnectionEvent::Message(WireMessage::Error(_))
     )
@@ -3722,9 +3672,7 @@ fn connection_event_log(event: &ConnectionEvent) -> Option<String> {
         ConnectionEvent::Disconnected(peer) => Some(format!("disconnected {peer}")),
         ConnectionEvent::Error(error) => Some(format!("connection error: {error}")),
         ConnectionEvent::Message(WireMessage::Error(error)) => Some(format!("peer error: {error}")),
-        ConnectionEvent::Message(_)
-        | ConnectionEvent::LatestPointer { .. }
-        | ConnectionEvent::StalePointerPackets { .. } => None,
+        ConnectionEvent::Message(_) => None,
     }
 }
 
@@ -3794,56 +3742,6 @@ impl HeartbeatTracker {
         self.outstanding.remove(index);
         now_millis.checked_sub(sent_millis)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StalePointerPacketEmission {
-    count: u64,
-}
-
-impl StalePointerPacketEmission {
-    fn log_message(self) -> String {
-        format!("KCP UDP stale pointer packets: {}", self.count)
-    }
-}
-
-#[derive(Debug, Default)]
-struct StalePointerPacketGate {
-    last_emitted_count: u64,
-    last_emitted_at_millis: Option<u64>,
-}
-
-impl StalePointerPacketGate {
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn maybe_emit(&mut self, count: u64, now_millis: u64) -> Option<StalePointerPacketEmission> {
-        if self.last_emitted_at_millis.is_some() && count == self.last_emitted_count {
-            return None;
-        }
-
-        if let Some(last_emitted_at_millis) = self.last_emitted_at_millis {
-            let elapsed = now_millis.saturating_sub(last_emitted_at_millis);
-            if elapsed < STALE_POINTER_EMIT_INTERVAL_MILLIS {
-                return None;
-            }
-        }
-
-        self.last_emitted_count = count;
-        self.last_emitted_at_millis = Some(now_millis);
-        Some(StalePointerPacketEmission { count })
-    }
-}
-
-fn apply_stale_pointer_packet_update(
-    status: &mut AppStatus,
-    gate: &mut StalePointerPacketGate,
-    count: u64,
-    now_millis: u64,
-) -> Option<StalePointerPacketEmission> {
-    status.stale_pointer_packets = count;
-    gate.maybe_emit(count, now_millis)
 }
 
 fn now_millis() -> u64 {
@@ -3923,24 +3821,6 @@ mod tests {
             },
         );
         assert_eq!(status.run_state, RunState::Connected);
-
-        apply_connection_event_to_status(
-            &mut status,
-            &ConnectionEvent::LatestPointer {
-                x: 10,
-                y: 20,
-                sequence: 99,
-            },
-        );
-        assert_eq!(status.latest_pointer_sequence, Some(99));
-        apply_connection_event_to_status(
-            &mut status,
-            &ConnectionEvent::StalePointerPackets { count: 4 },
-        );
-        assert_eq!(status.stale_pointer_packets, 4);
-        assert!(!connection_event_updates_status(
-            &ConnectionEvent::StalePointerPackets { count: 4 }
-        ));
 
         apply_connection_event_to_status(&mut status, &ConnectionEvent::Error("boom".to_string()));
         assert_eq!(status.run_state, RunState::Error);
@@ -4576,51 +4456,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_pointer_log_gate_logs_count_changes_at_most_once_per_second() {
-        let mut gate = StalePointerPacketGate::default();
-
-        assert_eq!(
-            gate.maybe_emit(1, 1_000)
-                .map(StalePointerPacketEmission::log_message),
-            Some("KCP UDP stale pointer packets: 1".to_string())
-        );
-        assert_eq!(gate.maybe_emit(2, 1_500), None);
-        assert_eq!(gate.maybe_emit(2, 1_999), None);
-        assert_eq!(
-            gate.maybe_emit(2, 2_000)
-                .map(StalePointerPacketEmission::log_message),
-            Some("KCP UDP stale pointer packets: 2".to_string())
-        );
-        assert_eq!(gate.maybe_emit(3, 2_500), None);
-        assert_eq!(
-            gate.maybe_emit(3, 3_000)
-                .map(StalePointerPacketEmission::log_message),
-            Some("KCP UDP stale pointer packets: 3".to_string())
-        );
-        assert_eq!(gate.maybe_emit(3, 4_000), None);
-    }
-
-    #[test]
-    fn stale_pointer_packet_updates_emit_latest_count_at_cadence() {
-        let mut status = AppStatus::default();
-        let mut gate = StalePointerPacketGate::default();
-
-        let samples = [(1, 1_000), (2, 1_010), (3, 1_500), (4, 1_999), (5, 2_000)];
-        let emissions = samples
-            .into_iter()
-            .filter_map(|(count, now)| {
-                apply_stale_pointer_packet_update(&mut status, &mut gate, count, now)
-                    .map(|emission| emission.count)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(emissions, vec![1, 5]);
-        assert_eq!(status.stale_pointer_packets, 5);
-    }
-
-    #[test]
     fn remote_input_send_buffer_coalesces_tcp_moves_and_preserves_reliable_order() {
-        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let mut buffer = RemoteInputSendBuffer::new();
         let key_down = InputEvent::Key(KeyEvent {
             vk_code: 0x41,
             pressed: true,
@@ -4663,21 +4500,27 @@ mod tests {
     }
 
     #[test]
-    fn configured_kcp_pointer_moves_use_the_tcp_control_connection() {
-        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Kcp);
-        let mut actions = Vec::new();
+    fn reliable_input_flushes_latest_pointer_before_click() {
+        let mut buffer = RemoteInputSendBuffer::new();
+        assert!(buffer.send_pointer(Point::new(10, 20), 1).is_empty());
+        assert!(buffer.send_pointer(Point::new(30, 40), 2).is_empty());
 
-        actions.extend(buffer.send_pointer(Point::new(10, 10), 1_000));
-        actions.extend(buffer.send_pointer(Point::new(20, 20), 1_001));
+        let actions = buffer.send_reliable_input(InputEvent::MouseButton(MouseButtonEvent {
+            button: MouseButton::Left,
+            pressed: true,
+        }));
 
         assert_eq!(
             actions,
             vec![
                 RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
-                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 10, y: 10 })
+                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 30, y: 40 })
                 ))),
                 RemoteSendAction::Command(ConnectionCommand::Send(WireMessage::Input(
-                    InputEvent::MouseMoveAbs(MouseMoveAbsEvent { x: 20, y: 20 })
+                    InputEvent::MouseButton(MouseButtonEvent {
+                        button: MouseButton::Left,
+                        pressed: true,
+                    })
                 ))),
             ]
         );
@@ -4685,7 +4528,7 @@ mod tests {
 
     #[test]
     fn remote_input_send_buffer_logs_tcp_move_coalescing_once_per_second() {
-        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let mut buffer = RemoteInputSendBuffer::new();
         let mut log_actions = Vec::new();
 
         for i in 0..=102 {
@@ -4990,8 +4833,7 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                RuntimeEvent::Status(status)
-                    if status.run_state == RunState::Stopped && status.transport_mode.is_none()
+                RuntimeEvent::Status(status) if status.run_state == RunState::Stopped
             )
         }));
 
@@ -5114,7 +4956,7 @@ mod tests {
     #[test]
     fn return_local_release_all_keeps_remote_active_until_actions_are_emitted() {
         let remote_control_active = Arc::new(AtomicBool::new(true));
-        let mut buffer = RemoteInputSendBuffer::new(TransportMode::Tcp);
+        let mut buffer = RemoteInputSendBuffer::new();
         let mut observed: Option<(bool, Vec<RemoteSendAction>)> = None;
 
         emit_return_local_release_all(&mut buffer, &remote_control_active, |actions| {
