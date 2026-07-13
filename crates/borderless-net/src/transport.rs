@@ -21,6 +21,22 @@ pub enum ConnectionCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpConnectionSettings {
+    pub host: String,
+    pub port: u16,
+}
+
+impl TcpConnectionSettings {
+    pub fn peer_addr(&self) -> String {
+        addr_string(&self.host, self.port)
+    }
+
+    pub fn socket_addr(&self) -> anyhow::Result<SocketAddr> {
+        Ok(self.peer_addr().parse()?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportSettings {
     pub mode: TransportMode,
     pub host: String,
@@ -58,6 +74,25 @@ mod tests {
     use super::*;
     use borderless_core::config::TransportMode;
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn tcp_settings_format_ipv4_and_ipv6_addresses() {
+        let ipv4 = TcpConnectionSettings {
+            host: "127.0.0.1".to_string(),
+            port: 24800,
+        };
+        let ipv6 = TcpConnectionSettings {
+            host: "::1".to_string(),
+            port: 24800,
+        };
+
+        assert_eq!(ipv4.peer_addr(), "127.0.0.1:24800");
+        assert_eq!(ipv6.peer_addr(), "[::1]:24800");
+        assert_eq!(
+            ipv6.socket_addr().unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 24800)
+        );
+    }
 
     #[test]
     fn reliable_addr_parses_ipv4() {
