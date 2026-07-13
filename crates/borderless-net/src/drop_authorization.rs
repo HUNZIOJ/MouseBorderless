@@ -72,6 +72,24 @@ impl DropAuthorizationRegistry {
             .retain(|(candidate, _), _| *candidate != session_id);
     }
 
+    pub fn purge_expired(&self, now: Instant) -> Vec<Uuid> {
+        let mut entries = self.inner.lock().expect("authorization registry poisoned");
+        let expired = entries
+            .iter()
+            .filter_map(|(&(session_id, token), entry)| {
+                (now > entry.expires_at).then_some((session_id, token))
+            })
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        for (session_id, token) in expired {
+            entries.remove(&(session_id, token));
+            if !sessions.contains(&session_id) {
+                sessions.push(session_id);
+            }
+        }
+        sessions
+    }
+
     pub fn clear(&self) {
         self.inner
             .lock()
@@ -138,5 +156,39 @@ mod tests {
         );
         registry.revoke_session(session_id);
         assert!(registry.consume(session_id, transfer_id, token).is_err());
+    }
+
+    #[test]
+    fn purge_expired_returns_each_affected_session_once() {
+        let registry = DropAuthorizationRegistry::default();
+        let expired_session = Uuid::from_u128(1);
+        let live_session = Uuid::from_u128(2);
+        let transfer_id = Uuid::from_u128(3);
+        let expired = registry.register(
+            expired_session,
+            transfer_id,
+            PathBuf::from("C:\\expired"),
+            Duration::ZERO,
+        );
+        registry.register(
+            expired_session,
+            Uuid::from_u128(4),
+            PathBuf::from("C:\\expired-two"),
+            Duration::ZERO,
+        );
+        let live = registry.register(
+            live_session,
+            transfer_id,
+            PathBuf::from("C:\\live"),
+            Duration::from_secs(60),
+        );
+
+        let sessions = registry.purge_expired(Instant::now() + Duration::from_secs(1));
+
+        assert_eq!(sessions, vec![expired_session]);
+        assert!(registry
+            .consume(expired_session, transfer_id, expired)
+            .is_err());
+        assert!(registry.consume(live_session, transfer_id, live).is_ok());
     }
 }

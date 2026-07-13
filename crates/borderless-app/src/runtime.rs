@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use borderless_core::{
@@ -709,6 +709,7 @@ async fn run_controller_event_pump(
     let mut clipboard_transport_ready = false;
     let mut drag_runtime = start_drag_drop_runtime(&config);
     let mut drag_drop = DragDropCoordinator::new(Role::Controller);
+    drag_drop.begin_connection_generation(session_id);
     let (target_resolution_tx, mut target_resolution_rx) = mpsc::unbounded_channel();
     let mut bulk_events_open = true;
     let drag_context = || DragEffectContext {
@@ -797,6 +798,18 @@ async fn run_controller_event_pump(
                     &mut drag_runtime,
                     drag_context(),
                 );
+                poll_drag_timeouts(
+                    &mut drag_drop,
+                    &mut drag_runtime,
+                    drag_context(),
+                    Instant::now(),
+                );
+                poll_drag_timeouts(
+                    &mut drag_drop,
+                    &mut drag_runtime,
+                    drag_context(),
+                    Instant::now(),
+                );
                 let drag_now_remote = control_state
                     .as_ref()
                     .is_some_and(|state| state.mode() == ControlMode::Remote);
@@ -859,6 +872,9 @@ async fn run_controller_event_pump(
             command = session_commands.recv() => {
                 match command {
                     Some(SessionCommand::Stop) | None => {
+                        let effects = drag_drop.on_stop();
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                        drop_authorizations.clear();
                         set_hook_suppression(&hook_manager, SuppressionMode::PassThrough);
                         if remote_control_active.swap(false, Ordering::SeqCst) {
                             emit_remote_send_actions(
@@ -875,12 +891,16 @@ async fn run_controller_event_pump(
             }
             event = connection_events.recv() => {
                 let Some(event) = event else {
+                    let effects = drag_drop.on_disconnect(session_id);
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    drop_authorizations.clear();
                     break;
                 };
 
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
-                    let effects = drag_drop.handle_peer_message(message.clone());
+                    let effects =
+                        drag_drop.handle_tagged_peer_message(session_id, message.clone());
                     apply_drag_effects(effects, &mut drag_runtime, drag_context());
                     if matches!(message, WireMessage::Hello(hello) if hello.protocol_version == PROTOCOL_VERSION) {
                         let layout = WireMessage::PeerLayout {
@@ -895,7 +915,9 @@ async fn run_controller_event_pump(
                     event,
                     ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_)
                 ) {
-                    drag_drop.reset();
+                    let effects = drag_drop.on_disconnect(session_id);
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    drop_authorizations.clear();
                 }
                 handle_controller_connection_event(
                     event,
@@ -1674,6 +1696,7 @@ async fn run_agent_event_pump(
     let mut clipboard_transport_ready = false;
     let mut drag_runtime = start_drag_drop_runtime(&config);
     let mut drag_drop = DragDropCoordinator::new(Role::Agent);
+    drag_drop.begin_connection_generation(session_id);
     let (target_resolution_tx, mut target_resolution_rx) = mpsc::unbounded_channel();
     let mut bulk_events_open = true;
     let drag_context = || DragEffectContext {
@@ -1733,6 +1756,9 @@ async fn run_agent_event_pump(
             command = session_commands.recv() => {
                 match command {
                     Some(SessionCommand::Stop) | None => {
+                        let effects = drag_drop.on_stop();
+                        apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                        drop_authorizations.clear();
                         release_agent_input(&mut injector, &updates, session_id, false);
                         stop_clipboard_runtime(clipboard_runtime.take(), &updates, session_id);
                         break;
@@ -1741,19 +1767,25 @@ async fn run_agent_event_pump(
             }
             event = connection_events.recv() => {
                 let Some(event) = event else {
+                    let effects = drag_drop.on_disconnect(session_id);
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    drop_authorizations.clear();
                     break;
                 };
 
                 let readiness_event = event.clone();
                 if let ConnectionEvent::Message(message) = &event {
-                    let effects = drag_drop.handle_peer_message(message.clone());
+                    let effects =
+                        drag_drop.handle_tagged_peer_message(session_id, message.clone());
                     apply_drag_effects(effects, &mut drag_runtime, drag_context());
                 }
                 if matches!(
                     event,
                     ConnectionEvent::Disconnected(_) | ConnectionEvent::Error(_)
                 ) {
-                    drag_drop.reset();
+                    let effects = drag_drop.on_disconnect(session_id);
+                    apply_drag_effects(effects, &mut drag_runtime, drag_context());
+                    drop_authorizations.clear();
                 }
                 handle_agent_connection_event(
                     event,
@@ -2994,6 +3026,20 @@ struct DragEffectContext<'a> {
     bulk_commands: &'a [mpsc::UnboundedSender<BulkTransferCommand>],
     updates: &'a Sender<TaggedSessionUpdate>,
     runtime_session_id: u64,
+}
+
+fn poll_drag_timeouts(
+    coordinator: &mut DragDropCoordinator,
+    drag_runtime: &mut Option<DragDropRuntime>,
+    context: DragEffectContext<'_>,
+    now: Instant,
+) {
+    for session_id in context.drop_authorizations.purge_expired(now) {
+        let effects = coordinator.authorization_expired(session_id);
+        apply_drag_effects(effects, drag_runtime, context);
+    }
+    let effects = coordinator.tick(now);
+    apply_drag_effects(effects, drag_runtime, context);
 }
 
 fn drain_local_drag_events(

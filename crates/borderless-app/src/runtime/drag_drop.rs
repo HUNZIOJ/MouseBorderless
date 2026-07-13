@@ -6,10 +6,12 @@ use borderless_core::{
     protocol::WireMessage,
 };
 use borderless_net::bulk_transfer::BulkTransferEvent;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const TARGET_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DragEffect {
     InstallEdge(Edge),
     UninstallEdge,
@@ -56,7 +58,7 @@ pub struct DragDropCoordinator {
     peer_layout: Option<RemotePosition>,
     active: Option<DragDropSession>,
     peer_offer: Option<PeerDragOffer>,
-    #[allow(dead_code)]
+    active_deadline: Option<Instant>,
     connection_generation: u64,
 }
 
@@ -68,6 +70,7 @@ impl DragDropCoordinator {
             peer_layout: None,
             active: None,
             peer_offer: None,
+            active_deadline: None,
             connection_generation: 0,
         }
     }
@@ -89,19 +92,11 @@ impl DragDropCoordinator {
                     });
                 }
                 (ControlMode::Local, Some(DragDropPhase::RemoteTargetSelecting)) => {
-                    if let Some(mut session) = self.active.take() {
-                        let session_id = session.session_id();
-                        let reason = "拖拽已返回本机".to_string();
-                        let _ = session.cancel(reason.clone());
-                        effects.push(DragEffect::Send(WireMessage::DragDropCancel {
-                            session_id,
-                            reason: reason.clone(),
-                        }));
-                        effects.push(DragEffect::Status {
-                            state: format!("拖放已取消：{reason}"),
-                            destination: None,
-                        });
-                    }
+                    effects.extend(self.terminate_active(
+                        "拖拽已返回本机".to_string(),
+                        false,
+                        true,
+                    ));
                 }
                 _ => {}
             }
@@ -139,6 +134,7 @@ impl DragDropCoordinator {
             let _ = session.begin_remote_target_selection();
         }
         self.active = Some(session);
+        self.active_deadline = None;
 
         let mut effects = vec![
             DragEffect::Send(WireMessage::DragDropEntered {
@@ -165,24 +161,14 @@ impl DragDropCoordinator {
         session_id: Uuid,
         reason: impl Into<String>,
     ) -> Vec<DragEffect> {
-        let Some(mut session) = self
+        let matches_session = self
             .active
-            .take_if(|session| session.session_id() == session_id)
-        else {
+            .as_ref()
+            .is_some_and(|session| session.session_id() == session_id);
+        if !matches_session {
             return Vec::new();
-        };
-        let reason = reason.into();
-        let _ = session.cancel(reason.clone());
-        vec![
-            DragEffect::Send(WireMessage::DragDropCancel {
-                session_id,
-                reason: reason.clone(),
-            }),
-            DragEffect::Status {
-                state: format!("拖放已取消：{reason}"),
-                destination: None,
-            },
-        ]
+        }
+        self.terminate_active(reason.into(), false, true)
     }
 
     pub fn native_drop_released(&mut self, session_id: Uuid) -> Vec<DragEffect> {
@@ -220,6 +206,7 @@ impl DragDropCoordinator {
             if session.release_at(point).is_err() {
                 return Vec::new();
             }
+            self.active_deadline = Some(Instant::now() + TARGET_AUTHORIZATION_TIMEOUT);
             return vec![
                 DragEffect::Send(WireMessage::DragDropReleased { session_id, point }),
                 DragEffect::RestoreLocalInput,
@@ -254,9 +241,114 @@ impl DragDropCoordinator {
         ]
     }
 
-    pub fn reset(&mut self) {
-        self.active = None;
-        self.peer_offer = None;
+    pub fn begin_connection_generation(&mut self, generation: u64) {
+        self.connection_generation = generation;
+    }
+
+    pub fn handle_tagged_peer_message(
+        &mut self,
+        generation: u64,
+        message: WireMessage,
+    ) -> Vec<DragEffect> {
+        if generation != self.connection_generation {
+            return Vec::new();
+        }
+        self.handle_peer_message(message)
+    }
+
+    pub fn on_disconnect(&mut self, generation: u64) -> Vec<DragEffect> {
+        if generation != self.connection_generation {
+            return Vec::new();
+        }
+        let mut effects = self.terminate_active("连接中断".to_string(), true, false);
+        if !effects.contains(&DragEffect::Send(WireMessage::ReleaseAll)) {
+            effects.push(DragEffect::Send(WireMessage::ReleaseAll));
+        }
+        effects.push(DragEffect::UninstallEdge);
+        effects
+    }
+
+    pub fn on_stop(&mut self) -> Vec<DragEffect> {
+        let mut effects = self.terminate_active("程序已停止".to_string(), false, true);
+        if !effects.contains(&DragEffect::Send(WireMessage::ReleaseAll)) {
+            effects.push(DragEffect::Send(WireMessage::ReleaseAll));
+        }
+        effects.push(DragEffect::UninstallEdge);
+        effects
+    }
+
+    pub fn tick(&mut self, now: Instant) -> Vec<DragEffect> {
+        if self.active_deadline.is_some_and(|deadline| now > deadline) {
+            return self.terminate_active("等待目标目录授权超时".to_string(), true, true);
+        }
+        Vec::new()
+    }
+
+    pub fn authorization_expired(&mut self, session_id: Uuid) -> Vec<DragEffect> {
+        let matches_offer = self
+            .peer_offer
+            .as_ref()
+            .is_some_and(|offer| offer.session_id == session_id);
+        if !matches_offer {
+            return Vec::new();
+        }
+        let mut effects = self.terminate_active("目标目录授权超时".to_string(), true, false);
+        effects.insert(
+            0,
+            DragEffect::Send(WireMessage::DragDropTargetFailed {
+                session_id,
+                reason: "目标目录授权超时".to_string(),
+            }),
+        );
+        effects
+    }
+
+    fn terminate_active(
+        &mut self,
+        reason: String,
+        failed: bool,
+        notify_peer: bool,
+    ) -> Vec<DragEffect> {
+        let source = self.active.take();
+        let target = self.peer_offer.take();
+        self.active_deadline = None;
+
+        let (session_id, transfer_id) = if let Some(mut session) = source {
+            if failed {
+                let _ = session.fail(reason.clone());
+            } else {
+                let _ = session.cancel(reason.clone());
+            }
+            (session.session_id(), session.transfer_id())
+        } else if let Some(offer) = target {
+            (offer.session_id, offer.transfer_id)
+        } else {
+            return vec![DragEffect::RestoreLocalInput];
+        };
+
+        let mut effects = vec![
+            DragEffect::CancelBulk { transfer_id },
+            DragEffect::RevokeAuthorization { session_id },
+        ];
+        if notify_peer {
+            effects.push(DragEffect::Send(WireMessage::DragDropCancel {
+                session_id,
+                reason: reason.clone(),
+            }));
+        }
+        effects.extend([
+            DragEffect::Send(WireMessage::ReleaseAll),
+            DragEffect::RestoreLocalInput,
+            DragEffect::Status {
+                state: if failed {
+                    format!("拖放失败：{reason}")
+                } else {
+                    format!("拖放已取消：{reason}")
+                },
+                destination: None,
+            },
+        ]);
+        effects
     }
 
     pub fn handle_peer_message(&mut self, message: WireMessage) -> Vec<DragEffect> {
@@ -301,6 +393,7 @@ impl DragDropCoordinator {
                     if session.phase() == &DragDropPhase::RemoteTargetSelecting
                         && session.release_at(point).is_ok()
                     {
+                        self.active_deadline = Some(Instant::now() + TARGET_AUTHORIZATION_TIMEOUT);
                         return vec![DragEffect::Status {
                             state: "正在解析目标目录".to_string(),
                             destination: None,
@@ -342,6 +435,7 @@ impl DragDropCoordinator {
                 {
                     return Vec::new();
                 }
+                self.active_deadline = None;
                 vec![
                     DragEffect::BeginTransfer {
                         session_id,
@@ -357,17 +451,14 @@ impl DragDropCoordinator {
                 ]
             }
             WireMessage::DragDropTargetFailed { session_id, reason } => {
-                let Some(mut session) = self
+                let matches_session = self
                     .active
-                    .take_if(|session| session.session_id() == session_id)
-                else {
+                    .as_ref()
+                    .is_some_and(|session| session.session_id() == session_id);
+                if !matches_session {
                     return Vec::new();
-                };
-                let _ = session.fail(reason.clone());
-                vec![DragEffect::Status {
-                    state: format!("拖放失败：{reason}"),
-                    destination: None,
-                }]
+                }
+                self.terminate_active(reason, true, false)
             }
             WireMessage::DragDropTransferStarted {
                 session_id,
@@ -391,42 +482,41 @@ impl DragDropCoordinator {
                 ok,
                 reason,
             } => {
-                let Some(mut session) = self.active.take_if(|session| {
+                let matches_session = self.active.as_ref().is_some_and(|session| {
                     session.session_id() == session_id
                         && session.transfer_id() == transfer_id
                         && session.phase() == &DragDropPhase::Transferring
-                }) else {
+                });
+                if !matches_session {
                     return Vec::new();
-                };
+                }
                 if ok {
+                    let mut session = self.active.take().expect("matching drag source exists");
                     let _ = session.complete();
-                    vec![DragEffect::Status {
-                        state: "拖放完成".to_string(),
-                        destination: None,
-                    }]
+                    self.active_deadline = None;
+                    vec![
+                        DragEffect::RestoreLocalInput,
+                        DragEffect::Status {
+                            state: "拖放完成".to_string(),
+                            destination: None,
+                        },
+                    ]
                 } else {
                     let reason = reason.unwrap_or_else(|| "接收端未能完成传输".to_string());
-                    let _ = session.fail(reason.clone());
-                    vec![DragEffect::Status {
-                        state: format!("拖放失败：{reason}"),
-                        destination: None,
-                    }]
+                    self.terminate_active(reason, true, false)
                 }
             }
             WireMessage::DragDropCancel { session_id, reason } => {
-                let source_cancelled = self
+                let source_matches = self
                     .active
-                    .take_if(|session| session.session_id() == session_id)
-                    .is_some();
-                let target_cancelled = self
+                    .as_ref()
+                    .is_some_and(|session| session.session_id() == session_id);
+                let target_matches = self
                     .peer_offer
-                    .take_if(|offer| offer.session_id == session_id)
-                    .is_some();
-                if source_cancelled || target_cancelled {
-                    vec![DragEffect::Status {
-                        state: format!("拖放已取消：{reason}"),
-                        destination: None,
-                    }]
+                    .as_ref()
+                    .is_some_and(|offer| offer.session_id == session_id);
+                if source_matches || target_matches {
+                    self.terminate_active(reason, false, false)
                 } else {
                     Vec::new()
                 }
@@ -455,14 +545,10 @@ impl DragDropCoordinator {
                     state: "文件已发送，等待接收端确认".to_string(),
                     destination: None,
                 }],
-                BulkTransferEvent::Failed { error, .. } => vec![DragEffect::Status {
-                    state: format!("拖放失败：{error}"),
-                    destination: None,
-                }],
-                BulkTransferEvent::Cancelled(_) => vec![DragEffect::Status {
-                    state: "拖放已取消".to_string(),
-                    destination: None,
-                }],
+                BulkTransferEvent::Failed { error, .. } => self.terminate_active(error, true, true),
+                BulkTransferEvent::Cancelled(_) => {
+                    self.terminate_active("本机已取消传输".to_string(), false, true)
+                }
                 _ => Vec::new(),
             };
         }
@@ -498,6 +584,8 @@ impl DragDropCoordinator {
                 ok,
                 reason,
             }),
+            DragEffect::RevokeAuthorization { session_id },
+            DragEffect::RestoreLocalInput,
             DragEffect::Status {
                 state,
                 destination: None,
@@ -530,18 +618,12 @@ impl DragDropCoordinator {
                 },
             ],
             Err(reason) => {
-                self.peer_offer = None;
-                vec![
-                    DragEffect::Send(WireMessage::DragDropTargetFailed {
-                        session_id,
-                        reason: reason.clone(),
-                    }),
-                    DragEffect::RevokeAuthorization { session_id },
-                    DragEffect::Status {
-                        state: format!("拖放失败：{reason}"),
-                        destination: None,
-                    },
-                ]
+                let mut effects = self.terminate_active(reason.clone(), true, false);
+                effects.insert(
+                    0,
+                    DragEffect::Send(WireMessage::DragDropTargetFailed { session_id, reason }),
+                );
+                effects
             }
         }
     }
@@ -886,5 +968,63 @@ mod tests {
         assert!(next
             .iter()
             .all(|effect| !matches!(effect, DragEffect::Send(WireMessage::DragDropCancel { .. }))));
+    }
+
+    #[test]
+    fn disconnect_cancels_drag_bulk_and_releases_input() {
+        let (mut coordinator, _session_id, transfer_id) = transferring_source();
+        coordinator.begin_connection_generation(7);
+
+        let effects = coordinator.on_disconnect(7);
+
+        assert!(effects.contains(&DragEffect::CancelBulk { transfer_id }));
+        assert!(effects.contains(&DragEffect::Send(WireMessage::ReleaseAll)));
+        assert!(effects.contains(&DragEffect::RestoreLocalInput));
+        assert!(effects.contains(&DragEffect::UninstallEdge));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            DragEffect::Status { state, .. } if state.contains("连接中断")
+        )));
+        assert!(coordinator.active_session().is_none());
+    }
+
+    #[test]
+    fn stale_connection_generation_messages_are_ignored() {
+        let mut coordinator = DragDropCoordinator::new(Role::Controller);
+        coordinator.begin_connection_generation(8);
+
+        let effects = coordinator.handle_tagged_peer_message(
+            7,
+            WireMessage::DragDropCancel {
+                session_id: Uuid::new_v4(),
+                reason: "old connection".to_string(),
+            },
+        );
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn target_authorization_timeout_fails_without_starting_bulk() {
+        let session_id = Uuid::from_u128(1);
+        let mut coordinator = DragDropCoordinator::new(Role::Controller);
+        coordinator.begin_local_drag(
+            session_id,
+            Uuid::from_u128(2),
+            vec!["C:\\src\\report.pdf".to_string()],
+        );
+        coordinator.set_control_mode(ControlMode::Remote);
+        coordinator.local_left_released(Point::new(20, 30));
+
+        let effects = coordinator.tick(Instant::now() + Duration::from_secs(31));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            DragEffect::Status { state, .. } if state.contains("超时")
+        )));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, DragEffect::BeginTransfer { .. })));
+        assert!(coordinator.active_session().is_none());
     }
 }
